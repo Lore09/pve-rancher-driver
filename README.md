@@ -15,13 +15,25 @@ Rancher UI   ──┐
                 ├─► docker-machine-driver-pve (this binary)
                 │       │
 PVE REST API ◄──┘       ├─ Resolve target node (or first online node)
+                        ├─ Generate the machine's SSH keypair
                         ├─ Clone template VMID -> new VMID
                         ├─ Apply overrides (cores, sockets, memory, onboot,
-                        │   optional cloud-init ipconfig0 / sshkeys)
+                        │   optional cloud-init ipconfig0 / ciuser / sshkeys
+                        │   incl. the generated public key)
+                        ├─ Optionally attach an extra data disk (Longhorn)
                         ├─ Start the VM
-                        └─ Poll QEMU guest agent for the first IPv4 address
+                        └─ Capture the NIC MAC, then poll the QEMU guest
+                            agent for the IPv4 on that exact interface
                             → returns "created" once the agent answers
 ```
+
+Detailed guides live in [`docs/`](docs/):
+
+- **[docs/template-preparation.md](docs/template-preparation.md)** — build a
+  ready-to-clone PVE template from **Debian 13 (trixie)** or
+  **openSUSE Leap Micro 6.2** (immutable), plus template-side Longhorn setup.
+- **[docs/rancher-setup.md](docs/rancher-setup.md)** — register the driver,
+  create the cloud credential, size machine pools, and troubleshoot.
 
 Every flag the driver declares in `GetCreateFlags()` becomes a node-template
 field in the Rancher UI automatically (no separate UI bundle is needed in
@@ -32,8 +44,9 @@ modern Rancher — the `NodeDriver` resource asks the binary for its flags).
 ```
 cmd/docker-machine-driver-pve/   Plugin entrypoint (plugin.RegisterDriver)
 pkg/driver/                      libmachine Driver implementation
-pkg/proxmox/                    go-proxmox wrapper used by the driver
+pkg/proxmox/                     go-proxmox wrapper used by the driver
 deploy/nodedriver.yaml           Rancher NodeDriver CRD to apply
+docs/                            template prep + Rancher integration guides
 Makefile                         build / cross-compile / checksums
 ```
 
@@ -60,31 +73,39 @@ it is not shown again.
 ### VM template
 
 VMs are produced by cloning a template, so the template must be ready before
-you point the driver at it:
+you point the driver at it. The short version of the requirements:
 
 1. `qemu-guest-agent` must be **baked into** the image (the driver polls it
-   the moment the clone boots; installing the agent via a first-boot
-   cloud-init script is too late).
-2. The VM needs a cloud-init drive (e.g. `--ide2 local-lvm:cloudinit`) if you
-   set `--pve-cloudinit`.
-3. The cloud-init user (the `--ssh-user` flag, default `root`) needs
-   passwordless `sudo` plus `curl` and `bash` on `PATH` so Rancher's
-   system-agent bootstrap can finish after `Create` returns.
+   the moment the clone boots; installing it via a first-boot cloud-init
+   script is too late).
+2. The VM needs a cloud-init drive (`--ide2 <storage>:cloudinit`) so the
+   driver can inject network config, the cloud-init user and the machine's
+   SSH public key.
+3. The cloud-init user (`--ssh-user`) needs passwordless `sudo` plus `curl`
+   and `bash` on `PATH` so Rancher's system-agent bootstrap can finish after
+   `Create` returns.
+
+Step-by-step recipes, including a smoke test to run before involving Rancher:
+
+- **[Debian 13 (trixie) genericcloud](docs/template-preparation.md#option-a--debian-13-trixie)** — recommended default
+- **[openSUSE Leap Micro 6.2 Default-qcow](docs/template-preparation.md#option-b--opensuse-leap-micro-62-immutable)** — immutable/transactional base
+
+### Extra data disks (Longhorn etc.)
+
+**Yes — supported since the extra-disk flags were added.** The driver can
+attach an additional blank disk per node:
 
 ```bash
-# on the PVE host
-wget https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
-apt install -y libguestfs-tools
-virt-customize -a ubuntu-24.04-server-cloudimg-amd64.img --install qemu-guest-agent
-
-qm create 9000 --name ubuntu-2404-tmpl --memory 2048 --cores 2 \
-  --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-single \
-  --agent 1 --serial0 socket --vga serial0
-qm importdisk 9000 ubuntu-24.04-server-cloudimg-amd64.img local-lvm
-qm set 9000 --scsi0 local-lvm:vm-9000-disk-0 --boot order=scsi0 \
-  --ide2 local-lvm:cloudinit
-qm template 9000
+--pve-extra-disk-size 100 --pve-extra-disk-storage local-lvm
 ```
+
+The disk lands on the first free SCSI slot (typically `scsi1`, visible in the
+guest as `/dev/sdb`). The driver deliberately does **not** format or mount it
+— the guest should do that on first boot, e.g. with the cloud-config drop-in
+in [docs/template-preparation.md](docs/template-preparation.md#optional-template-side-setup-for-longhorn-or-other-storage-provisioners),
+which mounts it at `/var/lib/longhorn` for Longhorn to pick up. Only attach
+extra disks to pools that run the storage provisioner (workers), not to
+control-plane/etcd pools.
 
 ## Build
 
@@ -111,6 +132,10 @@ release redirect hosts — don't drop any, or the download silently stalls.
 Alternatively, paste the URL and checksum directly through the UI at
 **Cluster Management → Drivers → Node Drivers → Add Node Driver**.
 
+The full walkthrough — cloud credential creation, machine-pool field guide,
+verification commands and a troubleshooting matrix — is in
+**[docs/rancher-setup.md](docs/rancher-setup.md)**.
+
 ## Standalone testing with docker-machine
 
 For local debugging without Rancher, install the plugin on your `PATH` and
@@ -126,7 +151,8 @@ docker-machine create --driver pve \
   --pve-template-vmid 9000 \
   --pve-cores 2 --pve-memory 4096 \
   --pve-cloudinit --pve-ipconfig ip=dhcp \
-  --ssh-user ubuntu \
+  --pve-ciuser debian \
+  --ssh-user debian \
   pve-test-node
 ```
 
@@ -147,15 +173,17 @@ docker-machine create --driver pve \
 | `pve-sockets` | `1` | CPU sockets |
 | `pve-memory` | `2048` | RAM in MB |
 | `pve-disk` | `20` | Disk size in GB (informational; template disk is used as-is) |
+| `pve-extra-disk-size` | `0` | Extra blank disk in GB for storage provisioners (0 = none) |
+| `pve-extra-disk-storage` | *(empty)* | PVE storage for the extra disk (required when size > 0) |
 | `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface name |
 | `pve-net-device` | `net0` | PVE config device (`net0`..`net31`) whose MAC pins down IP discovery |
 | `pve-agent-timeout` | `300` | Seconds to wait for the QEMU guest agent to report an IP |
 | `pve-skip-permission-check` | `false` | Skip the token-permission probe in `PreCreateCheck` |
 | `pve-keep-on-failure` | `false` | Leave the cloned VM in place when Create fails (debugging only) |
-| `pve-disk` | `20` | Disk size in GB (informational; template disk is used as-is) |
-| `pve-cloudinit` | `false` | Push `ipconfig0` / `sshkeys` to the cloned VM |
+| `pve-cloudinit` | `false` | Push `ipconfig0` / `ciuser` / `sshkeys` to the cloned VM |
 | `pve-ipconfig` | `ip=dhcp` | Cloud-init `ipconfig0` value |
-| `pve-sshkeys` | *(empty)* | Cloud-init `sshkeys` value (URL or inline) |
+| `pve-ciuser` | *(empty)* | Cloud-init user to create/configure with the SSH keys (use `rancher` for Leap Micro; empty = image default user, e.g. `debian`) |
+| `pve-sshkeys` | *(empty)* | Extra OpenSSH public keys, one per line (the machine's own generated key is always injected) |
 | `pve-onboot` | `false` | Start the VM automatically on PVE boot |
 | `ssh-user` | `root` | SSH user used to log into the VM |
 | `ssh-port` | `22` | SSH port used to log into the VM |
