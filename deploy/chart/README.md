@@ -66,7 +66,7 @@ nodeDriver:
   whitelistDomains:
     - artifacts.internal
   checksum: "<sha256 of your hosted binary>"
-  checksumFor: "v0.1.3" # must match the version being deployed
+  checksumFor: "v0.2.0" # must match the version being deployed
 ```
 
 The URL is built as

@@ -96,8 +96,8 @@ The release uploads **two distinct artifacts** with very different roles —
 | `checksums.txt` | sha256s of every binary above | Used to fill `<SHA256>` |
 | `nodedriver-v<VERSION>.yaml` | The **rendered NodeDriver CRD** (this manifest, with `<VERSION>`/`<SHA256>` already substituted) | Applied with `kubectl apply -f` — **not** the `url` |
 
-So for any release `v<x>` (≥ v0.1.2 — see the note below about why) the
-correct fields are:
+So for any release later than `v0.1.1` (see the note below about why that one
+is unusable) the correct fields are:
 
 ```yaml
 spec:
@@ -119,7 +119,7 @@ spec:
 >   YAML hashes to `867c3f58…df3f3`), not of the binary
 >   (`26e408680add8f06e9d5c6fe09ddc6f873601aa19a0a122c8a8037d08d255ca4`) —
 >   note the v0.1.1 release binary is **not downloadable** at all because of
->   the workflow bug fixed in v0.1.2+, see the note below.
+>   the workflow bug fixed after v0.1.1, see the note below.
 >
 > Rancher downloads whatever `url` names, computes its sha256, and compares it
 > to `checksum`. When the YAML matches its own checksum, the next stage
@@ -343,9 +343,9 @@ If you already registered the driver through the UI form (or applied the
 manifest with the wrong URL), patch it in place instead of deleting it:
 
 ```bash
-# 1. Get the binary's sha256 from the release (use a release >= v0.1.2).
-#    v0.1.1 shipped no binaries at all — see the note below.
-RELEASE=v0.1.2   # or whatever the latest tag is
+# 1. Get the binary's sha256 from the release. Any release later than v0.1.1
+#    works; v0.1.1 shipped no binaries at all — see the note below.
+RELEASE="$(gh release view --json tagName -q .tagName -R Lore09/pve-rancher-driver)"
 curl -sL "https://github.com/Lore09/pve-rancher-driver/releases/download/${RELEASE}/checksums.txt" \
   | grep docker-machine-driver-pve-linux-amd64
 #   -> <sha256>  docker-machine-driver-pve-linux-amd64
@@ -379,9 +379,14 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 > which writes binaries into subdirs (`dist/docker-machine-driver-pve_<os>_<arch>_vX/`)
 > without creating the flat archive files that `checksums.txt` references.
 > The upload glob `dist/docker-machine-driver-pve-*` matched the subdirs,
-> which `softprops/action-gh-release` silently skips. Use a release **≥ v0.1.2**
-> — the workflow now flattens the binaries before upload, so the
+> which `softprops/action-gh-release` silently skips. **Use any release later
+> than `v0.1.1`** — the workflow now flattens the binaries before upload, so the
 > `docker-machine-driver-pve-linux-amd64` asset actually exists.
+>
+> Note that `v0.1.2` does not exist either: the flatten fix was committed but
+> never tagged, so `v0.1.1` remained the newest published release until the
+> chart-driven release process landed. Always resolve the latest tag rather than
+> hardcoding a version.
 
 ## Troubleshooting
 
