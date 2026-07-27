@@ -1,0 +1,40 @@
+# golangci-lint config for pve-rancher-driver. Kept narrow on purpose:
+# revive + govet + staticcheck + ineffassign + unused + errorlint + gocritic
+# catch most real defects without forcing style churn on a small driver.
+run:
+  timeout: 5m
+  go: "1.22"
+
+linters:
+  disable-all: true
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - errorlint
+    - revive
+    - gocritic
+    - misspell
+    - goprintffuncname
+
+linters-settings:
+  revive:
+    severity: warning
+    rules:
+      - name: exported
+        disabled: true # the driver wraps an upstream-style API, ignore case churn
+  errorlint:
+    errorf: true
+    asserts: true
+    comparison: true
+
+issues:
+  exclude-rules:
+    # driver flags intentionally read from env vars; shadowing is harmless.
+    - path: pkg/driver/driver\.go
+      linters: [gocritic]
+      text: "flagDeref"
+  exclude-dirs:
+    - vendor
+    - dist

@@ -1,0 +1,57 @@
+# goreleaser config for pve-rancher-driver.
+# Produces a docker-machine plugin binary for the four Rancher-relevant
+# platforms plus a checksums.txt that the release workflow abuts to
+# deploy/nodedriver.yaml. The release workflow uploads everything; goreleaser
+# itself runs with --skip=publish to keep that step explicit in GH Actions.
+version: 2
+
+project_name: pve-rancher-driver
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: docker-machine-driver-pve
+    main: ./cmd/docker-machine-driver-pve
+    binary: docker-machine-driver-pve
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.buildDate={{.Date}}
+
+archives:
+  - formats: [binary] # no tarball wrapping; the plugin binary is invoked bare
+    name_template: "{{ .Binary }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Tag }}-dev"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  disable: true # the GH Actions workflow handles uploading to GH Releases
