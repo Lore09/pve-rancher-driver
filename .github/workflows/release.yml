@@ -1,12 +1,25 @@
 name: Release
 
-# Triggered by a tag. goreleaser builds the binaries + checksums and creates
-# the GitHub release; the NodeDriver CRD is templated at release time so
-# users can `kubectl apply -f` a manifest that already carries the right
-# version and SHA-256 for the linux/amd64 binary.
+# goreleaser builds the binaries + checksums and creates the GitHub release;
+# the NodeDriver CRD is templated at release time so users can
+# `kubectl apply -f` a manifest that already carries the right version and
+# SHA-256 for the linux/amd64 binary. The Helm chart's checksum is written back
+# to the default branch at the end, since the digest cannot be known until the
+# binary is built.
+#
+# Two entry points:
+#   - workflow_call from chart-release.yml, which is the normal path: a chart
+#     version bump creates the tag and calls this with `version`.
+#   - a manually pushed `v*` tag, kept as an escape hatch for re-releasing.
 on:
   push:
     tags: ["v*"]
+  workflow_call:
+    inputs:
+      version:
+        description: Tag to release, e.g. v0.1.3. Must already exist.
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -25,6 +38,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # goreleaser needs full history for changelog
+          # When called from chart-release.yml the default ref is the branch the
+          # push landed on, not the new tag. Check the tag out explicitly so
+          # goreleaser derives the right version. `inputs.version` is empty on
+          # the tag-push path, where the default ref is already correct.
+          ref: ${{ inputs.version != '' && inputs.version || github.ref }}
 
       - uses: actions/setup-go@v5
         with:
@@ -81,7 +99,13 @@ jobs:
         shell: bash
         run: |
           set -eu
-          VERSION="${GITHUB_REF_NAME}"
+          # On the workflow_call path GITHUB_REF_NAME is the *branch* the chart
+          # bump landed on, not the tag, so the input wins when present.
+          VERSION="${{ inputs.version != '' && inputs.version || github.ref_name }}"
+          case "$VERSION" in
+            v*) ;;
+            *) echo "::error::resolved version '$VERSION' is not a v-prefixed tag"; exit 1 ;;
+          esac
           SHA256="$(awk '/docker-machine-driver-pve-linux-amd64$/ {print $1; exit}' dist/checksums.txt)"
           if [ -z "$SHA256" ]; then echo "::error::no linux/amd64 checksum"; exit 1; fi
           mkdir -p dist/rendered
@@ -94,7 +118,67 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # Required on the workflow_call path: the run is triggered by a branch
+          # push, so the action cannot infer the tag from the ref.
+          tag_name: ${{ steps.crd.outputs.version }}
           files: |
             dist/docker-machine-driver-pve-*
             dist/checksums.txt
             dist/rendered/nodedriver-${{ steps.crd.outputs.version }}.yaml
+
+      # The chart pins the binary's SHA-256, which cannot exist until the binary
+      # is built — so it is recorded here, after the fact, on the default branch.
+      #
+      # Until this lands, the chart on the default branch has a checksum
+      # belonging to the *previous* version. The chart template detects that
+      # mismatch (nodeDriver.checksumFor vs the version being deployed) and
+      # refuses to render, so the worst case during this window is a loud error
+      # rather than a driver that silently sticks in `Downloading`.
+      #
+      # This writes values.yaml only. chart-release.yml watches Chart.yaml only.
+      # That asymmetry is what makes the loop impossible — keep it.
+      - name: Record checksum in chart values
+        shell: bash
+        env:
+          VERSION: ${{ steps.crd.outputs.version }}
+          SHA256: ${{ steps.crd.outputs.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          VALUES=deploy/chart/values.yaml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The build ran against a detached tag; move to the branch that serves
+          # the Rancher git-backed repository.
+          git fetch --depth=1 origin "$DEFAULT_BRANCH"
+          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+
+          if [ ! -f "$VALUES" ]; then
+            echo "::warning::$VALUES not present on $DEFAULT_BRANCH; skipping"; exit 0
+          fi
+
+          # Edited with sed rather than `yq -i` on purpose: yq round-trips the
+          # document and strips blank lines, reflowing the whole file on every
+          # release. sed touches exactly the two lines, so the commit diff stays
+          # readable. yq is then used to *verify* the result parsed correctly,
+          # which catches a silently non-matching pattern.
+          sed -i -E "s|^([[:space:]]*checksum:).*|\1 \"$SHA256\"|" "$VALUES"
+          sed -i -E "s|^([[:space:]]*checksumFor:).*|\1 \"$VERSION\"|" "$VALUES"
+
+          GOT_SUM="$(yq -r '.nodeDriver.checksum' "$VALUES")"
+          GOT_FOR="$(yq -r '.nodeDriver.checksumFor' "$VALUES")"
+          if [ "$GOT_SUM" != "$SHA256" ] || [ "$GOT_FOR" != "$VERSION" ]; then
+            echo "::error::failed to write checksum into $VALUES (got sum='$GOT_SUM' for='$GOT_FOR')"; exit 1
+          fi
+
+          if git diff --quiet -- "$VALUES"; then
+            echo "checksum already current; nothing to commit"; exit 0
+          fi
+
+          git add "$VALUES"
+          # [skip ci] keeps this from re-running the CI workflow; the path filter
+          # in chart-release.yml already prevents a release loop.
+          git commit -m "chore(chart): record ${VERSION} binary checksum [skip ci]"
+          git push origin "HEAD:$DEFAULT_BRANCH"
