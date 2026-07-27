@@ -46,6 +46,7 @@ cmd/docker-machine-driver-pve/   Plugin entrypoint (plugin.RegisterDriver)
 pkg/driver/                      libmachine Driver implementation
 pkg/proxmox/                     go-proxmox wrapper used by the driver
 deploy/nodedriver.yaml           Rancher NodeDriver CRD to apply
+deploy/chart/                    Helm chart Rancher installs the driver from
 docs/                            template prep + Rancher integration guides
 Makefile                         build / cross-compile / checksums
 ```
@@ -193,6 +194,41 @@ docker-machine create --driver pve \
 | `pve-onboot` | `false` | Start the VM automatically on PVE boot |
 | `ssh-user` | `root` | SSH user used to log into the VM |
 | `ssh-port` | `22` | SSH port used to log into the VM |
+
+## Releasing
+
+**Bump `version` and `appVersion` in
+[`deploy/chart/Chart.yaml`](deploy/chart/Chart.yaml) and merge to `master`.
+That is the entire release process.** The two fields must match; CI rejects the
+push if they drift.
+
+[`chart-release.yml`](.github/workflows/chart-release.yml) then:
+
+1. Diffs the chart version against the pre-push commit, validates semver, and
+   refuses a decrease or a version whose tag already exists.
+2. Creates and pushes the `v<version>` tag.
+3. Calls [`release.yml`](.github/workflows/release.yml), which runs CI as a
+   gate, builds the binaries with goreleaser, renders
+   `nodedriver-<version>.yaml`, and publishes the GitHub release.
+4. Commits the new binary's SHA-256 back into `deploy/chart/values.yaml`, since
+   the digest cannot exist until the binary is built.
+
+Two details that are load-bearing, in case you edit these workflows:
+
+- `release.yml` is invoked with `workflow_call`, **not** by its tag trigger. A
+  tag pushed using the default `GITHUB_TOKEN` does not start new workflow runs,
+  so the tag-triggered path would silently never fire. It is kept as a manual
+  escape hatch for re-releasing an existing tag.
+- `chart-release.yml` watches **`Chart.yaml` only**, and the checksum commit
+  writes **`values.yaml` only**. That asymmetry is what stops the release from
+  re-triggering itself. Widening the path filter to `deploy/chart/**` creates an
+  infinite release loop.
+
+Between the version bump and the checksum commit there is a short window where
+the chart on `master` claims a new version but still carries the previous
+version's digest. The chart detects this (`checksumFor` vs the deployed version)
+and refuses to render, so the failure is an explanatory error rather than a
+driver stuck in `Downloading`.
 
 ## Compatibility
 

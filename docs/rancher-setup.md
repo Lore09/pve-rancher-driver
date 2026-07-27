@@ -28,6 +28,57 @@ attaches a **pre-rendered `nodedriver-<version>.yaml`** to the GitHub release
 
 ## 2. Register the driver in Rancher
 
+There are two supported paths. **Option A needs no `kubectl` and is
+recommended**; Option B is the explicit route for GitOps and for debugging.
+
+### Option A: add this repo as a Rancher Repository (recommended)
+
+Rancher can serve Helm charts straight out of a git repo — it clones the
+repository and, finding no `index.yaml`, discovers and packages chart
+directories itself. So there is nothing to publish: point Rancher at this
+repository and the chart appears.
+
+1. In the **local** cluster: **Apps → Repositories → Create**
+2. Choose **Git repository**, then:
+
+   | Field | Value |
+   |---|---|
+   | Name | `pve-rancher-driver` |
+   | Git Repo URL | `https://github.com/lore09/pve-rancher-driver.git` |
+   | Git Branch | `master` |
+
+3. **Apps → Charts**, pick **Proxmox VE Node Driver**, and install into the
+   `local` cluster. For an arm64 Rancher server, set `nodeDriver.arch` to
+   `linux-arm64` first.
+
+Why this is the recommended path: the chart sets `whitelistDomains`, which the
+**Add Node Driver** form does not expose (see the warning further down). That
+single omission is the most common cause of a driver stuck in `Downloading`
+forever, and the chart removes it entirely.
+
+Things worth knowing:
+
+- **The chart must go into the `local` cluster.** A `NodeDriver` is cluster
+  scoped and only meaningful on the management cluster. The chart refuses to
+  install where `management.cattle.io/v3` is not served, so a downstream
+  install fails loudly rather than silently doing nothing.
+- **Repositories refresh hourly by default** (`spec.refreshInterval`). A newly
+  released version will not appear immediately; use **Refresh** on the
+  repository to force it.
+- **`helm uninstall` leaves the driver behind** on purpose
+  (`helm.sh/resource-policy: keep`), so uninstalling the app cannot break node
+  scale-up on clusters still using it. See the
+  [chart README](../deploy/chart/README.md#uninstalling) to remove it fully.
+- **Never commit an `index.yaml` to this repo.** Rancher uses the shallowest
+  `index.yaml` it finds anywhere in the clone *instead of* discovering charts,
+  so a stray one would pin the catalog to stale versions. A symlink anywhere in
+  the repo is also fatal — Rancher rejects the whole repository.
+
+Chart values are documented in the [chart README](../deploy/chart/README.md),
+including air-gapped installs that mirror the binary internally.
+
+### Option B: apply the NodeDriver manifest with kubectl
+
 Edit [`deploy/nodedriver.yaml`](../deploy/nodedriver.yaml):
 
 | Placeholder | Replace with |
@@ -112,9 +163,10 @@ in exactly these fields:
 > `objects.githubusercontent.com` **and** `release-assets.githubusercontent.com`,
 > both of which Rancher rejects without an explicit allow-list entry.
 >
-> **You must register via the manifest** (`kubectl apply -f
-> deploy/nodedriver.yaml`) so the three `whitelistDomains` entries below take
-> effect, or edit the resulting `NodeDriver` CRD by hand afterwards:
+> **Use the Helm chart ([Option A](#option-a-add-this-repo-as-a-rancher-repository-recommended))
+> or the manifest** — both set the three `whitelistDomains` entries, and the
+> chart does it without needing `kubectl`. If you already created the driver
+> through the Add form, patch the missing fields by hand:
 >
 > ```bash
 > kubectl --context rancher-local apply -f deploy/nodedriver.yaml
