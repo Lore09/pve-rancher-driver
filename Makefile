@@ -21,7 +21,7 @@ test:
 fmt:
 	gofmt -s -w .
 
-dist: $(BINARY)
+dist: build
 	mkdir -p dist
 	@set -e; for target in $(TARGETS); do \
 		os=$${target%/*}; arch=$${target#*/}; \
