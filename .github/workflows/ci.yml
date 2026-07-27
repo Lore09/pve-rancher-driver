@@ -1,11 +1,25 @@
 name: CI
 
+# The Go pipeline is skipped for changes that cannot affect the Go build —
+# currently the Helm chart. GitHub runs the workflow when *any* changed file
+# falls outside paths-ignore, so a push touching both the chart and Go code
+# still gets linted; only chart-only changes are skipped.
+#
+# NOTE: paths-ignore does not apply to workflow_call. release.yml invokes this
+# workflow as its release gate, so a chart version bump — which reaches this
+# workflow through chart-release.yml -> release.yml -> ci.yml — is still fully
+# linted and tested before anything is published. Skipping here only affects the
+# direct push/PR runs.
 on:
   push:
     branches: [master, main]
     tags-ignore: ["v*"]
+    paths-ignore:
+      - deploy/chart/**
   pull_request:
     branches: [master, main]
+    paths-ignore:
+      - deploy/chart/**
   workflow_call:
 
 concurrency:
