@@ -43,6 +43,36 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # goreleaser v2 `archives.formats: [binary]` writes the binaries into
+      # subdirs (dist/docker-machine-driver-pve_<os>_<arch>_vX/docker-machine-driver-pve)
+      # and lists the *archive* names (e.g. docker-machine-driver-pve-linux-amd64)
+      # in checksums.txt — but never creates those flat archive files at the
+      # dist/ top level. softprops/action-gh-release skims the top-level dist/
+      # for matching files; subdirs are silently skipped, which is why v0.1.1
+      # shipped checksums.txt + nodedriver yaml but no binaries (and the driver
+      # sat in `Downloading` forever in Rancher).
+      # Flatten the build outputs to match the names in checksums.txt so the
+      # upload step below picks them up.
+      - name: Flatten goreleaser binary outputs
+        shell: bash
+        run: |
+          set -eu
+          echo "==> goreleaser dist/ layout before flatten:"
+          find dist -maxdepth 2 -name 'docker-machine-driver-pve*' -print | sort
+          for d in dist/docker-machine-driver-pve_*; do
+            [ -d "$d" ] || continue
+            mid="$(basename "$d")"
+            mid="${mid#docker-machine-driver-pve_}"   # linux_amd64_v1 / darwin_arm64_v8.0
+            os="${mid%%_*}"
+            rest="${mid#*_}"
+            arch="${rest%%_*}"
+            flat="dist/docker-machine-driver-pve-${os}-${arch}"
+            cp "$d/docker-machine-driver-pve" "$flat"
+          done
+          rm -rf dist/docker-machine-driver-pve_*
+          echo "==> dist/ layout after flatten:"
+          ls -la dist/
+
       # goreleaser does not know about deploy/nodedriver.yaml; render the
       # CRD's <VERSION> / <SHA256> placeholders against the freshly-built
       # checksums and attach it to the release as a ready-to-apply manifest.
