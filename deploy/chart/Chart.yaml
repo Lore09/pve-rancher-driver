@@ -27,10 +27,17 @@ maintainers:
   - name: lore09
     url: https://github.com/lore09
 annotations:
-  # Rancher reads these to decide where the chart may be installed and how to
-  # label it in the Apps catalog. The driver only makes sense on the management
-  # cluster, which catalog.cattle.io/scope pins down.
+  # Rancher reads these to decide where the chart installs and how to label it
+  # in the Apps catalog.
   catalog.cattle.io/display-name: Proxmox VE Node Driver
+  # `management` marks this as belonging to the Rancher management (local)
+  # cluster rather than a downstream one. Valid values are management|downstream.
   catalog.cattle.io/scope: management
+  # Pre-fills the install namespace and release name in the Apps UI, so users
+  # are not asked to invent either. The NodeDriver itself is cluster scoped, so
+  # this namespace holds only the Helm release metadata — cattle-system is used
+  # because it always exists on the local cluster and is not garbage collected.
+  catalog.cattle.io/namespace: cattle-system
+  catalog.cattle.io/release-name: pve-rancher-driver
   catalog.cattle.io/os: linux
   catalog.cattle.io/kube-version: ">=1.23.0-0"

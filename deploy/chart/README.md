@@ -3,6 +3,29 @@
 Registers the `pve` node driver with Rancher so RKE2/K3s machine pools can
 provision Proxmox VE virtual machines cloned from a template.
 
+## Which namespace?
+
+**`cattle-system`, in the `local` cluster.** The chart declares this via
+`catalog.cattle.io/namespace`, so Rancher's Apps UI pre-fills it and you should
+not need to choose.
+
+The namespace barely matters, and it is worth knowing why: a `NodeDriver` is a
+**cluster-scoped** resource, so nothing in this chart is actually namespaced.
+The namespace holds only the Helm release metadata secret
+(`sh.helm.release.v1.pve-rancher-driver.v1`). `cattle-system` is the right home
+for it because it always exists on a Rancher local cluster — no
+`--create-namespace` needed — and is not something anyone deletes casually.
+
+Deleting the namespace would orphan the Helm release (the driver itself would
+survive, thanks to `helm.sh/resource-policy: keep`, but Helm would lose track of
+it and you would have to re-install to manage it again).
+
+Via CLI:
+
+```bash
+helm install pve-rancher-driver deploy/chart -n cattle-system
+```
+
 ## Install this into the `local` cluster
 
 A `NodeDriver` is a cluster-scoped `management.cattle.io/v3` resource that only
@@ -51,9 +74,29 @@ clusters still provision against breaks their node scale-up. To remove it
 deliberately:
 
 ```bash
-helm uninstall <release> -n <namespace>
+helm uninstall pve-rancher-driver -n cattle-system
 kubectl delete nodedriver.management.cattle.io pve
 ```
+
+### Re-installing after an uninstall
+
+Because the uninstall deliberately leaves the `NodeDriver` behind, a plain
+re-install fails: Helm finds a resource it does not own and refuses to adopt it.
+
+```
+Error: ... NodeDriver "pve" in namespace "" exists and cannot be imported
+into the current release: invalid ownership metadata
+```
+
+Either delete the leftover driver first (the `kubectl delete` above), or adopt
+it:
+
+```bash
+helm install pve-rancher-driver deploy/chart -n cattle-system --take-ownership
+```
+
+Adopting is the safer option on a live system — it leaves the driver in place,
+so clusters mid-provisioning are undisturbed.
 
 ## Air-gapped / self-hosted binaries
 

@@ -48,8 +48,13 @@ repository and the chart appears.
    | Git Branch | `master` |
 
 3. **Apps → Charts**, pick **Proxmox VE Node Driver**, and install into the
-   `local` cluster. For an arm64 Rancher server, set `nodeDriver.arch` to
+   `local` cluster. The namespace is pre-filled as **`cattle-system`** by the
+   chart; accept it. For an arm64 Rancher server, set `nodeDriver.arch` to
    `linux-arm64` first.
+
+   The namespace is nearly arbitrary — a `NodeDriver` is cluster scoped, so the
+   namespace holds only Helm's release metadata — but `cattle-system` always
+   exists on the local cluster and will not be deleted out from under it.
 
 Why this is the recommended path: the chart sets `whitelistDomains`, which the
 **Add Node Driver** form does not expose (see the warning further down). That
