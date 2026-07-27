@@ -19,6 +19,12 @@ import (
 const (
 	driverName    = "pve"
 	defaultSSHUser = "root"
+	// defaultAgentTimeout is how long the driver waits for the QEMU guest
+	// agent to report a usable IPv4 address on the cloned VM's NIC. The
+	// guest agent is the only robust way to learn a DHCP-assigned address
+	// without an external IPAM; the default is generous because cold first
+	// boots of cloud images can take a couple of minutes.
+	defaultAgentTimeout = 5 * time.Minute
 )
 
 // Driver is the libmachine Driver implementation backed by Proxmox VE.
@@ -39,10 +45,15 @@ type Driver struct {
 	MemoryMB       int
 	DiskGB         int
 	NetIface       string
+	NetDevice      string
 	CloudInit      bool
 	IPConfig       string
 	SSHKeys        string
 	Onboot         bool
+	AgentTimeout   time.Duration
+	KeepOnFailure   bool
+	SkipPermCheck   bool
+	NetMAC          string
 
 	client *proxmox.Client
 }
@@ -57,13 +68,15 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 			SSHUser:     defaultSSHUser,
 			SSHPort:     22,
 		},
-		VMName:    hostName,
-		Cores:     2,
-		Sockets:   1,
-		MemoryMB:  2048,
-		DiskGB:    20,
-		IPConfig:  "ip=dhcp",
-		Onboot:    false,
+		VMName:       hostName,
+		Cores:        2,
+		Sockets:      1,
+		MemoryMB:     2048,
+		DiskGB:       20,
+		NetDevice:    "net0",
+		IPConfig:     "ip=dhcp",
+		Onboot:       false,
+		AgentTimeout: defaultAgentTimeout,
 	}
 }
 
@@ -148,6 +161,18 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "PVE_NET_IFACE",
 			Usage:  "Name of the guest interface used to discover the machine IP",
 		},
+		mcnflag.StringFlag{
+			Name:   "pve-net-device",
+			EnvVar: "PVE_NET_DEVICE",
+			Usage:  "PVE config device (net0..net31) whose MAC is used for IP discovery",
+			Value:  "net0",
+		},
+		mcnflag.IntFlag{
+			Name:   "pve-agent-timeout",
+			EnvVar: "PVE_AGENT_TIMEOUT",
+			Usage:  "Seconds to wait for the QEMU guest agent to report the VM's IP",
+			Value:  int(defaultAgentTimeout / time.Second),
+		},
 		mcnflag.BoolFlag{
 			Name:   "pve-cloudinit",
 			EnvVar: "PVE_CLOUDINIT",
@@ -168,6 +193,16 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "pve-onboot",
 			EnvVar: "PVE_ONBOOT",
 			Usage:  "Whether the VM should autostart on PVE boot",
+		},
+		mcnflag.BoolFlag{
+			Name:   "pve-skip-permission-check",
+			EnvVar: "PVE_SKIP_PERMISSION_CHECK",
+			Usage:  "Skip the PreCreateCheck probe of the API token's effective privileges",
+		},
+		mcnflag.BoolFlag{
+			Name:   "pve-keep-on-failure",
+			EnvVar: "PVE_KEEP_ON_FAILURE",
+			Usage:  "Leave the cloned VM in place when Create fails (standalone CLI debugging only)",
 		},
 		mcnflag.StringFlag{
 			Name:   "ssh-user",
@@ -201,10 +236,22 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.MemoryMB = flags.Int("pve-memory")
 	d.DiskGB = flags.Int("pve-disk")
 	d.NetIface = flags.String("pve-net-iface")
+	d.NetDevice = flags.String("pve-net-device")
+	if d.NetDevice == "" {
+		d.NetDevice = "net0"
+	}
 	d.CloudInit = flags.Bool("pve-cloudinit")
 	d.IPConfig = flags.String("pve-ipconfig")
 	d.SSHKeys = flags.String("pve-sshkeys")
 	d.Onboot = flags.Bool("pve-onboot")
+	d.SkipPermCheck = flags.Bool("pve-skip-permission-check")
+	d.KeepOnFailure = flags.Bool("pve-keep-on-failure")
+	timeoutSec := flags.Int("pve-agent-timeout")
+	if timeoutSec > 0 {
+		d.AgentTimeout = time.Duration(timeoutSec) * time.Second
+	} else {
+		d.AgentTimeout = defaultAgentTimeout
+	}
 	d.SSHUser = flags.String("ssh-user")
 	d.SSHPort = flags.Int("ssh-port")
 	d.SetSwarmConfigFromFlags(flags)
@@ -215,7 +262,9 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 func (d *Driver) DriverName() string { return driverName }
 
 // PreCreateCheck validates that the minimal config is present before Rancher
-// attempts to provision.
+// attempts to provision, then probes the API token's effective privileges
+// against the live PVE major version. The probe is skippable for environments
+// with read-restricted /access/permissions.
 func (d *Driver) PreCreateCheck() error {
 	if d.APIUrl == "" {
 		return errors.New("pve: --pve-api-url is required")
@@ -229,7 +278,15 @@ func (d *Driver) PreCreateCheck() error {
 	if d.TemplateVMID == 0 {
 		return errors.New("pve: --pve-template-vmid is required to clone a VM")
 	}
-	return d.init()
+	if err := d.init(); err != nil {
+		return err
+	}
+	if d.SkipPermCheck {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return d.client.VerifyPermissions(ctx)
 }
 
 func (d *Driver) init() error {
@@ -252,7 +309,10 @@ func (d *Driver) init() error {
 }
 
 // Create provisions a new VM by cloning a configured template, applying
-// overrides (CPU/memory/cloud-init) and finally booting it.
+// overrides (CPU/memory/cloud-init) and finally booting it. The clone is
+// wrapped in a rollback: any error from Configure or Start removes the
+// half-built VM unless --pve-keep-on-failure is set, so a failed Create never
+// leaves an orphan.
 func (d *Driver) Create() error {
 	log.Infof("pve: creating VM %q on Proxmox VE", d.MachineName)
 	if err := d.init(); err != nil {
@@ -275,6 +335,22 @@ func (d *Driver) Create() error {
 	d.VMID = assigned
 	log.Infof("pve: cloned VM %d from template %d", assigned, d.TemplateVMID)
 
+	if err := d.finalizeCreate(ctx, vmName); err != nil {
+		if !d.KeepOnFailure {
+			log.Warnf("pve: Create failed (%v); removing VM %d to avoid orphans", err, d.VMID)
+			if rmErr := d.client.Remove(ctx, d.VMID); rmErr != nil {
+				log.Warnf("pve: cleanup of VM %d failed: %v", d.VMID, rmErr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// finalizeCreate runs the post-clone steps (Configure + start + NIC MAC
+// capture used by IP discovery). Broken out so the rollback in Create covers
+// every failure mode with one cleanup path.
+func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	onboot := d.Onboot
 	opts := proxmox.VMOptions{
 		Name:       vmName,
@@ -289,9 +365,19 @@ func (d *Driver) Create() error {
 	if err := d.client.Configure(ctx, d.VMID, opts); err != nil {
 		return err
 	}
-
+	if err := d.client.Start(ctx, d.VMID); err != nil {
+		return err
+	}
 	log.Infof("pve: starting VM %d", d.VMID)
-	return d.client.Start(ctx, d.VMID)
+
+	mac, err := d.client.VMNetMAC(ctx, d.VMID, d.NetDevice)
+	if err != nil {
+		log.Warnf("pve: could not read %s MAC for IP discovery: %v; falling back to first-IPv4 detection", d.NetDevice, err)
+	} else {
+		d.NetMAC = mac
+		log.Infof("pve: VM %d uses MAC %s on %s", d.VMID, mac, d.NetDevice)
+	}
+	return nil
 }
 
 // Start powers on the VM if it is not already running.
@@ -401,11 +487,23 @@ func (d *Driver) GetSSHHostname() (string, error) {
 }
 
 // waitUntilGuestIP polls the QEMU guest-agent until an IPv4 address is
-// available or a generous timeout elapses.
+// available or the configured agent timeout elapses. If the VM's NIC MAC was
+// captured at clone time, IP discovery is restricted to that interface — this
+// avoids the well-known failure mode where the guest agent reports IPs on
+// Docker/CNI bridges or IPv6 link-locals before DHCP has finished on the NIC
+// we actually cloned for.
 func (d *Driver) waitUntilGuestIP(ctx context.Context) (string, error) {
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(d.AgentTimeout)
 	for {
-		ip, err := d.client.GuestIP(ctx, d.VMID, d.NetIface)
+		var (
+			ip  string
+			err error
+		)
+		if d.NetMAC != "" {
+			ip, err = d.client.GuestIPByMAC(ctx, d.VMID, d.NetMAC)
+		} else {
+			ip, err = d.client.GuestIP(ctx, d.VMID, d.NetIface)
+		}
 		if err == nil && ip != "" {
 			return ip, nil
 		}

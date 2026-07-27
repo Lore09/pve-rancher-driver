@@ -10,6 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	proxmox "github.com/luthermonson/go-proxmox"
@@ -323,4 +326,229 @@ type VMOptions struct {
 	CloudInit bool
 	IPConfig  string
 	SSHKeys   string
+}
+
+// ---------- PVE version + permission probe ----------
+
+// requiredPrivs returns the privileges the driver's API token must have in
+// order to clone/config/start/read-guest-agent on a VM. The set differs
+// between PVE major versions: 9.x introduced the more narrowly-scoped
+// VM.GuestAgent.Audit in place of VM.Monitor for reading guest-agent data.
+// Until PVE 8 reaches EOL (2026-08-31) we support both, picking based on the
+// version reported by the live API endpoint.
+var requiredPrivs = map[int][]string{
+	9: {
+		"VM.Clone", "VM.Allocate", "VM.Audit", "VM.PowerMgmt",
+		"VM.Config.Disk", "VM.Config.CPU", "VM.Config.Memory",
+		"VM.Config.Network", "VM.Config.Cloudinit", "VM.Config.Options",
+		"VM.GuestAgent.Audit",
+		"Datastore.AllocateSpace", "Datastore.Audit",
+		"SDN.Use", "Pool.Allocate",
+	},
+	8: {
+		"VM.Clone", "VM.Allocate", "VM.Audit", "VM.PowerMgmt",
+		"VM.Config.Disk", "VM.Config.CPU", "VM.Config.Memory",
+		"VM.Config.Network", "VM.Config.Cloudinit", "VM.Config.Options",
+		"VM.Monitor",
+		"Datastore.AllocateSpace", "Datastore.Audit",
+		"SDN.Use", "Pool.Allocate",
+	},
+}
+
+// Version returns the PVE server version as parsed major.minor and the raw
+// release string. Used both for the permission-set dispatch and for any
+// future version-gated behaviour.
+func (c *Client) Version(ctx context.Context) (major int, raw string, err error) {
+	v, err := c.api.Version(ctx)
+	if err != nil {
+		return 0, "", fmt.Errorf("proxmox: cannot read server version: %w", err)
+	}
+	raw = v.Version
+	major, _ = parsePVEMajor(v.Version)
+	return major, raw, nil
+}
+
+// VerifyPermissions probes the API token's effective permissions and PVE major
+// version together, returning a descriptive error if any required privilege is
+// absent. The error lists every missing priv so the operator can paste the
+// `pveum acl modify` line without a second round-trip.
+//
+// The probe exists because PVE API tokens with privilege separation (the
+// default, recommended setting) start with zero privileges even if the parent
+// user is an admin; the symptom of a missing ACL on the token itself is not an
+// auth error but silent empty API responses — templated dropdowns come back
+// blank, clones fail with vague messages. Failing fast in PreCreateCheck
+// short-circuits that unhappy path.
+func (c *Client) VerifyPermissions(ctx context.Context) error {
+	major, _, err := c.Version(ctx)
+	if err != nil {
+		return err
+	}
+	needed, ok := requiredPrivs[major]
+	if !ok {
+		// Unknown future version — fall back to the most recent known set
+		// (PVE 9). New privileges in 10.x will trigger missing-priv errors
+		// here that an operator can resolve and then we'll update the map.
+		needed = requiredPrivs[9]
+	}
+
+	perms, err := c.api.Permissions(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("proxmox: cannot read token permissions: %w", err)
+	}
+	// Permissions is map[path]Permission where Permission is map[priv]IntOrBool.
+	// We collapse every granted priv across every path into one set, since
+	// every required priv is expected to be granted on "/" at minimum.
+	granted := make(map[string]struct{}, 64)
+	for _, p := range perms {
+		for priv := range p {
+			granted[priv] = struct{}{}
+		}
+	}
+	var missing []string
+	for _, priv := range needed {
+		if _, ok := granted[priv]; !ok {
+			missing = append(missing, priv)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"proxmox: API token is missing privileges required by the driver "+
+				"(PVE %d): %s. Grant them to BOTH the user and the token, "+
+				"see README \"Proxmox VE API token\" section",
+			major, strings.Join(missing, ", "),
+		)
+	}
+	return nil
+}
+
+// ---------- MAC-based IP detection ----------
+
+// VMNetMAC retrieves the MAC address of the given net device on the named VM.
+// device is a PVE config field name like "net0" (default if empty). The MAC is
+// returned in lowercase colon-separated form (e.g. "aa:bb:cc:dd:ee:ff"); an
+// empty string is returned if the VM has no such device or the entry omits the
+// MAC (PVE itself may generate one on first boot — callers should re-read
+// shortly after clone to give the cluster time to assign it).
+func (c *Client) VMNetMAC(ctx context.Context, vmid int, device string) (string, error) {
+	vm, err := c.vm(ctx, vmid)
+	if err != nil {
+		return "", err
+	}
+	if vm.VirtualMachineConfig == nil {
+		return "", errors.New("proxmox: VM config not loaded")
+	}
+	if device == "" {
+		device = "net0"
+	}
+	raw := netDeviceFromConfig(vm.VirtualMachineConfig, device)
+	if raw == "" {
+		return "", fmt.Errorf("proxmox: vm %d has no %q device configured", vmid, device)
+	}
+	mac := parseNetMAC(raw)
+	if mac == "" {
+		return "", fmt.Errorf("proxmox: %s entry %q has no MAC; PVE may not have assigned one yet", device, raw)
+	}
+	return mac, nil
+}
+
+// netDeviceFromConfig pulls the named net<N> field off the VM config struct.
+// VirtualMachineConfig exposes Net0..Net31 as plain string fields, so we
+// fall through to a small switch rather than reflect on every call.
+func netDeviceFromConfig(cfg *proxmox.VirtualMachineConfig, device string) string {
+	switch device {
+	case "net0":
+		return cfg.Net0
+	case "net1":
+		return cfg.Net1
+	case "net2":
+		return cfg.Net2
+	case "net3":
+		return cfg.Net3
+	case "net4":
+		return cfg.Net4
+	case "net5":
+		return cfg.Net5
+	case "net6":
+		return cfg.Net6
+	case "net7":
+		return cfg.Net7
+	case "net8":
+		return cfg.Net8
+	case "net9":
+		return cfg.Net9
+	}
+	return ""
+}
+
+// parseNetMAC extracts the MAC from a PVE net<N> config value. The value is a
+// comma-separated list whose first item is "model=MAC" (e.g.
+// "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1"). The MAC field is
+// optional in the API — PVE generates one on demand — so we return "" when no
+// MAC is present rather than erroring.
+func parseNetMAC(raw string) string {
+	first := raw
+	if i := strings.Index(raw, ","); i >= 0 {
+		first = raw[:i]
+	}
+	if i := strings.Index(first, "="); i >= 0 {
+		first = first[i+1:]
+	}
+	macPattern := regexp.MustCompile(`(?i)^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+	if macPattern.MatchString(first) {
+		return strings.ToLower(first)
+	}
+	return ""
+}
+
+// GuestIPByMAC waits for the QEMU guest agent and returns the first IPv4
+// address reported on the interface whose hardware-address matches the given
+// MAC. This avoids the common failure mode where the guest agent reports IPs
+// on Docker/CNI bridges or IPv6 link-local addresses before DHCP has finished
+// on the actual NIC we cloned for. mac may be empty, in which case GuestIP
+// (the older, less-strict helper) is the right fallback.
+func (c *Client) GuestIPByMAC(ctx context.Context, vmid int, mac string) (string, error) {
+	if mac == "" {
+		return c.GuestIP(ctx, vmid, "")
+	}
+	vm, err := c.vm(ctx, vmid)
+	if err != nil {
+		return "", err
+	}
+	if err := vm.WaitForAgent(ctx, 60); err != nil {
+		return "", fmt.Errorf("proxmox: guest agent not available: %w", err)
+	}
+	ifaces, err := vm.AgentGetNetworkIFaces(ctx)
+	if err != nil {
+		return "", fmt.Errorf("proxmox: guest agent network query failed: %w", err)
+	}
+	lower := strings.ToLower(mac)
+	for _, n := range ifaces {
+		if strings.ToLower(n.HardwareAddress) != lower {
+			continue
+		}
+		for _, a := range n.IPAddresses {
+			if a.IPAddress == "" || a.IPAddressType != "ipv4" {
+				continue
+			}
+			if a.IPAddress == "127.0.0.1" {
+				continue
+			}
+			return a.IPAddress, nil
+		}
+	}
+	return "", fmt.Errorf("proxmox: no IPv4 address reported by guest agent for interface with MAC %s", mac)
+}
+
+// parsePVEMajor pulls the major version out of a PVE release string like
+// "8.2.4" or "9.0/no-subscription". Returns 0 if the format is unrecognized.
+func parsePVEMajor(s string) (int, error) {
+	if i := strings.IndexAny(s, "/ "); i > 0 {
+		s = s[:i]
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) < 1 {
+		return 0, errors.New("proxmox: empty version string")
+	}
+	return strconv.Atoi(parts[0])
 }
