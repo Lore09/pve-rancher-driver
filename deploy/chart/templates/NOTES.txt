@@ -1,0 +1,41 @@
+{{- $d := .Values.nodeDriver -}}
+{{- $version := $d.version | default .Chart.AppVersion -}}
+{{- $tag := $version -}}
+{{- if not (hasPrefix "v" $tag) }}{{ $tag = printf "v%s" $tag }}{{ end -}}
+
+Proxmox VE node driver {{ $tag }} registered as NodeDriver/{{ $d.name }}.
+
+Rancher now downloads the driver binary for {{ $d.arch }}. Watch it become Active:
+
+  kubectl get nodedrivers.management.cattle.io {{ $d.name }} -w
+
+{{ if not $d.checksum -}}
+WARNING: no checksum was supplied, so Rancher will not verify the downloaded
+binary's integrity. This is expected immediately after a version bump, before
+the release workflow records the digest. To verify explicitly:
+
+  curl -sL {{ trimSuffix "/" .Values.release.baseUrl }}/{{ $tag }}/checksums.txt | grep {{ .Values.release.binaryName }}-{{ $d.arch }}
+  helm upgrade {{ .Release.Name }} . --reuse-values \
+    --set nodeDriver.checksum=<sha256> --set nodeDriver.checksumFor={{ $tag }}
+
+{{ end -}}
+Next steps:
+
+1. Cluster Management -> Cloud Credentials -> Create -> {{ $d.displayName }}
+   Fill in API URL, API Token ID and API Token Secret.
+
+2. Cluster Management -> Create -> RKE2/K3s, enable the {{ $d.displayName }}
+   driver, and add a machine pool. You will need a PVE template VMID; see
+   docs/template-preparation.md.
+
+If the driver stays in `Downloading`, the cause is almost always download
+related. Check in this order:
+
+  kubectl describe nodedriver {{ $d.name }}
+
+  - a checksum mismatch means the digest does not match the binary for {{ $tag }}
+  - a timeout usually means whitelistDomains is missing a host; GitHub's
+    release redirect crosses github.com, objects.githubusercontent.com and
+    release-assets.githubusercontent.com, and all three are required
+
+Full troubleshooting: docs/rancher-setup.md

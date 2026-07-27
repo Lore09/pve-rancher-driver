@@ -1,0 +1,36 @@
+# Helm chart that registers the pve node driver with Rancher.
+#
+# `version` is the single source of truth for releases: bumping it on the
+# default branch is what drives .github/workflows/chart-release.yml to create
+# the matching git tag and publish the driver binaries. Nothing else needs to
+# be edited to cut a release.
+#
+# `appVersion` is kept identical to `version` and is what the NodeDriver's
+# download URL is built from, so the chart can never point at a driver build
+# other than the one released alongside it.
+apiVersion: v2
+name: pve-rancher-driver
+description: Registers the Proxmox VE node driver with Rancher so RKE2/K3s machine pools can provision PVE virtual machines
+type: application
+version: 0.1.3
+appVersion: "0.1.3"
+kubeVersion: ">=1.23.0-0"
+home: https://github.com/lore09/pve-rancher-driver
+sources:
+  - https://github.com/lore09/pve-rancher-driver
+keywords:
+  - proxmox
+  - proxmox-ve
+  - node-driver
+  - rke2
+maintainers:
+  - name: lore09
+    url: https://github.com/lore09
+annotations:
+  # Rancher reads these to decide where the chart may be installed and how to
+  # label it in the Apps catalog. The driver only makes sense on the management
+  # cluster, which catalog.cattle.io/scope pins down.
+  catalog.cattle.io/display-name: Proxmox VE Node Driver
+  catalog.cattle.io/scope: management
+  catalog.cattle.io/os: linux
+  catalog.cattle.io/kube-version: ">=1.23.0-0"

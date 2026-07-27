@@ -1,0 +1,74 @@
+# Values for the pve-rancher-driver chart.
+#
+# Defaults are correct for a stock Rancher server running on linux/amd64 that
+# can reach github.com. The only fields most users touch are `arch` (for an
+# arm64 Rancher server) and `whitelistDomains` (when self-hosting the binary).
+
+nodeDriver:
+  # Name of the NodeDriver resource, and the prefix Rancher strips from the
+  # driver's flags when mapping them onto form fields. Changing this breaks the
+  # flag -> field mapping, so leave it alone unless you know why.
+  name: pve
+
+  displayName: Proxmox VE
+  description: Provision RKE2/K3s nodes as Proxmox VE virtual machines cloned from a template
+
+  # Driver version to download. Empty means "use the chart's appVersion", which
+  # is what keeps the chart and the binary in lockstep. Override only to pin an
+  # older binary against a newer chart.
+  version: ""
+
+  # Which released binary to hand Rancher. This must match the architecture of
+  # the machine running the *Rancher management server*, not the machines being
+  # provisioned. Valid: linux-amd64, linux-arm64.
+  arch: linux-amd64
+
+  # SHA-256 of the binary named by arch/version above.
+  #
+  # Written automatically by .github/workflows/release.yml after it builds the
+  # release, because the digest cannot be known until the binary exists. Do not
+  # edit by hand.
+  checksum: ""
+  # The driver version `checksum` was recorded for. The chart refuses to render
+  # when this disagrees with the version being deployed, which turns a silent
+  # checksum mismatch (the classic "driver stuck in Downloading forever") into
+  # an explicit error. Written automatically alongside `checksum`.
+  checksumFor: ""
+
+  active: true
+  addCloudCredential: true
+
+  # Hosts Rancher is permitted to download the driver from. GitHub's release
+  # redirect chain crosses all three of these; omitting any one leaves the
+  # driver stuck in `Downloading`. Replace the list entirely when self-hosting.
+  whitelistDomains:
+    - github.com
+    - objects.githubusercontent.com
+    - release-assets.githubusercontent.com
+
+  # UI extension bundle for the driver's icon and custom form. Empty means
+  # Rancher renders a generic gear icon and derives the form from the driver's
+  # flags, which is the supported default.
+  uiUrl: ""
+
+# GitHub repository the release binaries are fetched from. Point this at a
+# mirror or an internal artifact host to avoid depending on GitHub; remember to
+# update whitelistDomains to match.
+release:
+  baseUrl: https://github.com/lore09/pve-rancher-driver/releases/download
+  binaryName: docker-machine-driver-pve
+
+# Refuse to install unless the cluster actually serves management.cattle.io/v3.
+#
+# This catches the most common install mistake: applying the chart to a
+# downstream cluster, where it appears to succeed and silently does nothing,
+# because NodeDriver only means anything on the Rancher local (management)
+# cluster. Set false only for offline `helm template` rendering, where Helm has
+# no cluster to discover API groups from.
+verifyManagementCluster: true
+
+# Keep the NodeDriver in place when the release is uninstalled. Deleting a
+# driver that existing clusters still provision against breaks node scale-up on
+# those clusters, so the resource is annotated helm.sh/resource-policy: keep by
+# default. Set false if you genuinely want `helm uninstall` to remove it.
+retainOnUninstall: true

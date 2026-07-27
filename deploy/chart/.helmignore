@@ -1,0 +1,8 @@
+.DS_Store
+.git/
+.gitignore
+*.tgz
+# Never ship an index.yaml inside the chart: Rancher's git-backed repository
+# scanner uses the shallowest index.yaml it finds anywhere in the clone instead
+# of discovering charts, so a stray one would pin the catalog to stale versions.
+index.yaml

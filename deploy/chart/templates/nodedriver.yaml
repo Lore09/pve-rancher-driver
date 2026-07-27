@@ -1,0 +1,77 @@
+{{- $d := .Values.nodeDriver -}}
+{{- $version := $d.version | default .Chart.AppVersion -}}
+{{- if not $version -}}
+{{- fail "nodeDriver.version is empty and the chart has no appVersion; set --set nodeDriver.version=v0.1.3" -}}
+{{- end -}}
+
+{{/*
+Normalise the version to a leading "v" so both 0.1.3 and v0.1.3 work, since
+release tags carry the prefix but Chart.appVersion conventionally does not.
+*/}}
+{{- $tag := $version -}}
+{{- if not (hasPrefix "v" $tag) -}}
+{{- $tag = printf "v%s" $tag -}}
+{{- end -}}
+
+{{- if not (has $d.arch (list "linux-amd64" "linux-arm64" "darwin-amd64" "darwin-arm64")) -}}
+{{- fail (printf "nodeDriver.arch %q is not a published target; use linux-amd64 or linux-arm64" $d.arch) -}}
+{{- end -}}
+
+{{/*
+Guard against the window between a chart version bump and the release workflow
+recording the new binary's digest. Rendering with a checksum belonging to a
+different version is exactly what leaves a driver stuck in `Downloading`
+forever, so fail loudly with the two ways out.
+*/}}
+{{- $checksumFor := $d.checksumFor -}}
+{{- if and $checksumFor (not (hasPrefix "v" $checksumFor)) -}}
+{{- $checksumFor = printf "v%s" $checksumFor -}}
+{{- end -}}
+{{- if and $d.checksum (ne $checksumFor $tag) -}}
+{{- fail (printf "chart is deploying driver %s but nodeDriver.checksum was recorded for %s. The release workflow records the digest a few minutes after a version bump; either wait for that commit, pass the correct digest with --set nodeDriver.checksum=<sha256> --set nodeDriver.checksumFor=%s, or skip verification with --set nodeDriver.checksum=\"\"" $tag (default "(unset)" $checksumFor) $tag) -}}
+{{- end -}}
+
+{{- if .Values.verifyManagementCluster -}}
+{{- if not (.Capabilities.APIVersions.Has "management.cattle.io/v3") -}}
+{{- fail "this cluster does not serve management.cattle.io/v3, so it is not a Rancher local (management) cluster. A NodeDriver installed anywhere else has no effect. Install into the `local` cluster, or pass --set verifyManagementCluster=false for offline rendering." -}}
+{{- end -}}
+{{- end -}}
+
+apiVersion: management.cattle.io/v3
+kind: NodeDriver
+metadata:
+  name: {{ $d.name | quote }}
+  annotations:
+    {{- if .Values.retainOnUninstall }}
+    # Existing clusters provision new nodes through this driver. Removing it
+    # with the Helm release would break their scale-up, so Helm is told to
+    # leave the resource behind.
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    # Tell Rancher how the driver's flags split between a reusable cloud
+    # credential and per-machine-pool template options. Field names are the
+    # driver flag minus its `pve-` prefix, camelCased
+    # (e.g. `pve-api-url` -> `apiUrl`).
+    publicCredentialFields: "apiUrl,apiTokenId"
+    privateCredentialFields: "apiTokenSecret"
+    optionalCredentialFields: "apiInsecure,caCert"
+    passwordFields: "apiTokenSecret"
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  displayName: {{ $d.displayName | quote }}
+  description: {{ $d.description | quote }}
+  active: {{ $d.active }}
+  addCloudCredential: {{ $d.addCloudCredential }}
+  builtin: false
+  url: {{ printf "%s/%s/%s-%s" (trimSuffix "/" .Values.release.baseUrl) $tag .Values.release.binaryName $d.arch | quote }}
+  checksum: {{ $d.checksum | quote }}
+  uiUrl: {{ $d.uiUrl | quote }}
+  externalId: ""
+  whitelistDomains:
+    {{- range $d.whitelistDomains }}
+    - {{ . | quote }}
+    {{- end }}
