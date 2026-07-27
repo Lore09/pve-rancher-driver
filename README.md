@@ -147,7 +147,12 @@ docker-machine create --driver pve \
 | `pve-sockets` | `1` | CPU sockets |
 | `pve-memory` | `2048` | RAM in MB |
 | `pve-disk` | `20` | Disk size in GB (informational; template disk is used as-is) |
-| `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface |
+| `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface name |
+| `pve-net-device` | `net0` | PVE config device (`net0`..`net31`) whose MAC pins down IP discovery |
+| `pve-agent-timeout` | `300` | Seconds to wait for the QEMU guest agent to report an IP |
+| `pve-skip-permission-check` | `false` | Skip the token-permission probe in `PreCreateCheck` |
+| `pve-keep-on-failure` | `false` | Leave the cloned VM in place when Create fails (debugging only) |
+| `pve-disk` | `20` | Disk size in GB (informational; template disk is used as-is) |
 | `pve-cloudinit` | `false` | Push `ipconfig0` / `sshkeys` to the cloned VM |
 | `pve-ipconfig` | `ip=dhcp` | Cloud-init `ipconfig0` value |
 | `pve-sshkeys` | *(empty)* | Cloud-init `sshkeys` value (URL or inline) |
