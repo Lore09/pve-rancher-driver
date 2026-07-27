@@ -32,10 +32,50 @@ Edit [`deploy/nodedriver.yaml`](../deploy/nodedriver.yaml):
 
 | Placeholder | Replace with |
 |---|---|
-| `<VERSION>` | The release tag, e.g. `v0.1.0` |
+| `<VERSION>` | The release tag, e.g. `v0.1.1` |
 | `<SHA256>` | The sha256 of `docker-machine-driver-pve-linux-amd64` from `checksums.txt` |
 
-Then apply it to Rancher's **local** cluster:
+The release uploads **two distinct artifacts** with very different roles —
+**the `url` field must point to the binary, not the manifest**:
+
+| Release asset | What it is | Goes where |
+|---|---|---|
+| `docker-machine-driver-pve-linux-amd64` | The **driver binary** (executable) | `spec.url` + `spec.checksum` of the NodeDriver |
+| `docker-machine-driver-pve-linux-arm64`, `*-darwin-*` | Other arch/OS binaries | Not needed by Rancher |
+| `checksums.txt` | sha256s of every binary above | Used to fill `<SHA256>` |
+| `nodedriver-v<VERSION>.yaml` | The **rendered NodeDriver CRD** (this manifest, with `<VERSION>`/`<SHA256>` already substituted) | Applied with `kubectl apply -f` — **not** the `url` |
+
+So for any release `v<x>` (≥ v0.1.2 — see the note below about why) the
+correct fields are:
+
+```yaml
+spec:
+  url: "https://github.com/Lore09/pve-rancher-driver/releases/download/v<x>/docker-machine-driver-pve-linux-amd64"
+  checksum: "<sha256 of docker-machine-driver-pve-linux-amd64 from that release's checksums.txt>"
+  whitelistDomains:
+    - github.com
+    - objects.githubusercontent.com
+    - release-assets.githubusercontent.com
+```
+
+> ⚠️ Pointing `url` at `nodedriver-v0.1.1.yaml` (the manifest) instead of the
+> binary is the **most common reason a driver sits in `Downloading`
+> forever**. The mistake usually comes in two parts:
+>
+> - `spec.url` ends in `nodedriver-v0.1.1.yaml` instead of
+>   `docker-machine-driver-pve-linux-amd64`, **and**
+> - `spec.checksum` is the sha256 of the YAML (e.g. for the v0.1.1 release the
+>   YAML hashes to `867c3f58…df3f3`), not of the binary
+>   (`26e408680add8f06e9d5c6fe09ddc6f873601aa19a0a122c8a8037d08d255ca4`) —
+>   note the v0.1.1 release binary is **not downloadable** at all because of
+>   the workflow bug fixed in v0.1.2+, see the note below.
+>
+> Rancher downloads whatever `url` names, computes its sha256, and compares it
+> to `checksum`. When the YAML matches its own checksum, the next stage
+> (execute as a binary) silently never completes — `state=downloading`,
+> `Downloaded=Unknown`. The fix is to point **both** fields at the binary.
+
+Then apply the manifest to Rancher's **local** cluster:
 
 ```bash
 kubectl --context rancher-local apply -f deploy/nodedriver.yaml
@@ -52,8 +92,47 @@ Wait until `pve` reports `Active`. Status meanings:
 - **`Inactive` / error** — `kubectl describe nodedriver pve` shows the cause;
   usually a checksum mismatch or an unreachable URL.
 
-Equivalent UI path: **Cluster Management → Drivers → Node Drivers → Add Node
-Driver**, paste the same URL and checksum.
+### Equivalent UI path: Add Node Driver form
+
+**Cluster Management → Drivers → Node Drivers → Add Node Driver**, and fill
+in exactly these fields:
+
+| Field | Value |
+|---|---|
+| **Download URL** | `https://github.com/lore09/pve-rancher-driver/releases/download/<VERSION>/docker-machine-driver-pve-linux-amd64` (replace `<VERSION>`, e.g. `v0.1.0`) |
+| **Custom Checksum** | *(toggle on)* |
+| **Checksum** | The SHA-256 of `docker-machine-driver-pve-linux-amd64` from `dist/checksums.txt` |
+| **Node Driver Name** | `pve` |
+| **Display Name** | `Proxmox VE (pve)` |
+
+> ⚠️ **`Whitelist Domains` is not exposed in the Add Node Driver UI form.**
+> Rancher applies a default allow-list that does **not** include GitHub's
+> release redirect chain. If you register the driver through the UI it will
+> sit in `Downloading` forever, because GitHub redirects the request through
+> `objects.githubusercontent.com` **and** `release-assets.githubusercontent.com`,
+> both of which Rancher rejects without an explicit allow-list entry.
+>
+> **You must register via the manifest** (`kubectl apply -f
+> deploy/nodedriver.yaml`) so the three `whitelistDomains` entries below take
+> effect, or edit the resulting `NodeDriver` CRD by hand afterwards:
+>
+> ```bash
+> kubectl --context rancher-local apply -f deploy/nodedriver.yaml
+> # Or, if you already created it through the UI, patch the missing fields:
+> kubectl --context rancher-local patch nodedriver pve --type merge -p '{
+>   "spec": {
+>     "whitelistDomains": ["github.com","objects.githubusercontent.com","release-assets.githubusercontent.com"]
+>   }
+> }'
+> # And force a re-download by touching url/checksum:
+> kubectl --context rancher-local patch nodedriver pve --type merge -p '{
+>   "spec": { "checksum": "<SHA256>" }
+> }'
+> ```
+>
+> If you really cannot use `kubectl`, the same three domains can be added in
+> the UI by editing the `pve` NodeDriver resource through the Rancher CRD
+> browser / **Edit YAML** view — the Add form itself does not show the field.
 
 > Rancher only re-downloads when `url` or `checksum` change. Every new
 > release must bump **both**, or old nodes keep using the cached driver.
@@ -147,11 +226,58 @@ Typical timing: 5–8 minutes from `+` to `Ready` on a warm template.
 - Only attach the extra disk to pools that actually run Longhorn storage
   (usually workers); control-plane/etcd pools should stay on the boot disk.
 
+## Fixing a driver already stuck in `Downloading`
+
+If you already registered the driver through the UI form (or applied the
+manifest with the wrong URL), patch it in place instead of deleting it:
+
+```bash
+# 1. Get the binary's sha256 from the release (use a release >= v0.1.2).
+#    v0.1.1 shipped no binaries at all — see the note below.
+RELEASE=v0.1.2   # or whatever the latest tag is
+curl -sL "https://github.com/Lore09/pve-rancher-driver/releases/download/${RELEASE}/checksums.txt" \
+  | grep docker-machine-driver-pve-linux-amd64
+#   -> <sha256>  docker-machine-driver-pve-linux-amd64
+
+# 2. Patch all three wrong fields in one shot
+kubectl --context rancher-local patch nodedriver pve --type merge -p '{
+  "spec": {
+    "url": "https://github.com/Lore09/pve-rancher-driver/releases/download/'"${RELEASE}"'/docker-machine-driver-pve-linux-amd64",
+    "checksum": "<sha256-from-step-1>",
+    "whitelistDomains": [
+      "github.com",
+      "objects.githubusercontent.com",
+      "release-assets.githubusercontent.com"
+    ]
+  }
+}'
+
+# 3. Force Rancher to re-fetch by changing url/checksum (already done above);
+#    then watch it flip from Downloading -> Active
+kubectl --context rancher-local get nodedrivers.management.cattle.io pve -w
+```
+
+The matching `checksum` always comes from the **same release's** `checksums.txt`
+for the arch matching `url` — for a Rancher server running on linux/amd64 that
+is the `docker-machine-driver-pve-linux-amd64` line. Do **not** paste the
+sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
+
+> ℹ️ **Release `v0.1.1` is broken.** Its GitHub release contains only
+> `checksums.txt` and `nodedriver-v0.1.1.yaml` — **no driver binaries** —
+> because the release workflow used `goreleaser archives.formats: [binary]`,
+> which writes binaries into subdirs (`dist/docker-machine-driver-pve_<os>_<arch>_vX/`)
+> without creating the flat archive files that `checksums.txt` references.
+> The upload glob `dist/docker-machine-driver-pve-*` matched the subdirs,
+> which `softprops/action-gh-release` silently skips. Use a release **≥ v0.1.2**
+> — the workflow now flattens the binaries before upload, so the
+> `docker-machine-driver-pve-linux-amd64` asset actually exists.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Driver stuck in `Downloading` | Missing `whitelistDomains` entry | Ensure all three GitHub redirect hosts are listed; re-apply |
+| Driver stuck in `Downloading`, `Downloaded=Unknown` | None of the three: (a) `url` points to the YAML manifest not the binary, (b) missing `whitelistDomains` entry, (c) `checksum` mismatch vs. `url` | Verify `spec.url` ends in `docker-machine-driver-pve-linux-amd64`; recompute sha256 of that exact asset; ensure all three GitHub redirect hosts are listed in `whitelistDomains`; re-apply |
+| Driver stuck in `Downloading` but only after fixing `url` | Missing `whitelistDomains` entry — GitHub redirects through `objects.githubusercontent.com` and `release-assets.githubusercontent.com` | Both must be added; `github.com` alone is not enough |
 | "API token is missing privileges" at save | Token ACL not granted to the token itself | Run both `pveum acl modify` lines (user **and** `-token`) from the README |
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
 | Create times out "waiting for guest agent IP" | qemu-guest-agent missing/disabled in image, or agent enabled but `--agent 1` missing on template | Re-bake image, set `--agent 1`, verify with `qm agent <id> ping` |
