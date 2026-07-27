@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	driverName    = "pve"
+	driverName     = "pve"
 	defaultSSHUser = "root"
 	// defaultAgentTimeout is how long the driver waits for the QEMU guest
 	// agent to report a usable IPv4 address on the cloned VM's NIC. The
@@ -30,6 +30,11 @@ const (
 	// without an external IPAM; the default is generous because cold first
 	// boots of cloud images can take a couple of minutes.
 	defaultAgentTimeout = 5 * time.Minute
+	// defaultBootDiskDevice is the PVE config key of the disk grown by
+	// --pve-disk. scsi0 matches the templates produced by the template
+	// preparation guide; templates booting from virtio0/sata0 must override it.
+	defaultBootDiskDevice = "scsi0"
+	defaultNetModel       = "virtio"
 )
 
 // Driver is the libmachine Driver implementation backed by Proxmox VE.
@@ -51,8 +56,14 @@ type Driver struct {
 	DiskGB           int
 	ExtraDiskSize    int
 	ExtraDiskStorage string
+	BootDiskDevice   string
 	NetIface         string
 	NetDevice        string
+	NetBridge        string
+	NetModel         string
+	NetVlanTag       int
+	NetMTU           int
+	NetFirewall      string
 	CloudInit        bool
 	IPConfig         string
 	CIUser           string
@@ -76,15 +87,17 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 			SSHUser:     defaultSSHUser,
 			SSHPort:     22,
 		},
-		VMName:       hostName,
-		Cores:        2,
-		Sockets:      1,
-		MemoryMB:     2048,
-		DiskGB:       20,
-		NetDevice:    "net0",
-		IPConfig:     "ip=dhcp",
-		Onboot:       false,
-		AgentTimeout: defaultAgentTimeout,
+		VMName:         hostName,
+		Cores:          2,
+		Sockets:        1,
+		MemoryMB:       2048,
+		DiskGB:         0,
+		BootDiskDevice: defaultBootDiskDevice,
+		NetDevice:      "net0",
+		NetModel:       defaultNetModel,
+		IPConfig:       "ip=dhcp",
+		Onboot:         false,
+		AgentTimeout:   defaultAgentTimeout,
 	}
 }
 
@@ -161,8 +174,14 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.IntFlag{
 			Name:   "pve-disk",
 			EnvVar: "PVE_DISK",
-			Usage:  "Disk size in GB (informational; template disk is used as-is)",
-			Value:  20,
+			Usage:  "Grow the cloned boot disk to this size in GB (0 = keep the template's size). PVE can only grow a disk, never shrink it",
+			Value:  0,
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-boot-disk-device",
+			EnvVar: "PVE_BOOT_DISK_DEVICE",
+			Usage:  "PVE config key of the boot disk grown by pve-disk, e.g. scsi0, virtio0, sata0",
+			Value:  defaultBootDiskDevice,
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-extra-disk-size",
@@ -183,8 +202,36 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.StringFlag{
 			Name:   "pve-net-device",
 			EnvVar: "PVE_NET_DEVICE",
-			Usage:  "PVE config device (net0..net31) whose MAC is used for IP discovery",
+			Usage:  "PVE config device (net0..net31) whose MAC is used for IP discovery, and which the pve-net-* settings below are written to",
 			Value:  "net0",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-net-bridge",
+			EnvVar: "PVE_NET_BRIDGE",
+			Usage:  "PVE bridge to attach the NIC to, e.g. vmbr1. Leave empty to inherit the template's network configuration untouched",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-net-model",
+			EnvVar: "PVE_NET_MODEL",
+			Usage:  "Emulated NIC model used when pve-net-bridge is set (virtio, e1000, rtl8139, ...)",
+			Value:  defaultNetModel,
+		},
+		mcnflag.IntFlag{
+			Name:   "pve-net-vlan-tag",
+			EnvVar: "PVE_NET_VLAN_TAG",
+			Usage:  "802.1Q VLAN tag for the NIC (0 = untagged). Requires pve-net-bridge",
+			Value:  0,
+		},
+		mcnflag.IntFlag{
+			Name:   "pve-net-mtu",
+			EnvVar: "PVE_NET_MTU",
+			Usage:  "NIC MTU (0 = PVE default). Requires pve-net-bridge",
+			Value:  0,
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-net-firewall",
+			EnvVar: "PVE_NET_FIREWALL",
+			Usage:  "Enable the PVE firewall on the NIC: true or false. Empty leaves the PVE default. Requires pve-net-bridge",
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-agent-timeout",
@@ -259,6 +306,10 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.Sockets = flags.Int("pve-sockets")
 	d.MemoryMB = flags.Int("pve-memory")
 	d.DiskGB = flags.Int("pve-disk")
+	d.BootDiskDevice = flags.String("pve-boot-disk-device")
+	if d.BootDiskDevice == "" {
+		d.BootDiskDevice = defaultBootDiskDevice
+	}
 	d.ExtraDiskSize = flags.Int("pve-extra-disk-size")
 	d.ExtraDiskStorage = flags.String("pve-extra-disk-storage")
 	d.NetIface = flags.String("pve-net-iface")
@@ -266,6 +317,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	if d.NetDevice == "" {
 		d.NetDevice = "net0"
 	}
+	d.NetBridge = flags.String("pve-net-bridge")
+	d.NetModel = flags.String("pve-net-model")
+	d.NetVlanTag = flags.Int("pve-net-vlan-tag")
+	d.NetMTU = flags.Int("pve-net-mtu")
+	d.NetFirewall = strings.TrimSpace(flags.String("pve-net-firewall"))
 	d.CloudInit = flags.Bool("pve-cloudinit")
 	d.IPConfig = flags.String("pve-ipconfig")
 	d.CIUser = flags.String("pve-ciuser")
@@ -307,6 +363,27 @@ func (d *Driver) PreCreateCheck() error {
 	}
 	if d.ExtraDiskSize > 0 && d.ExtraDiskStorage == "" {
 		return errors.New("pve: --pve-extra-disk-storage is required when --pve-extra-disk-size > 0")
+	}
+	if _, err := parseNetFirewall(d.NetFirewall); err != nil {
+		return err
+	}
+	// The pve-net-* knobs are only ever applied as part of rewriting the net
+	// device, which is gated on a bridge being named. Silently ignoring them
+	// would look like the driver honoured a VLAN it never set, so fail loudly.
+	if d.NetBridge == "" {
+		var orphans []string
+		if d.NetVlanTag > 0 {
+			orphans = append(orphans, "--pve-net-vlan-tag")
+		}
+		if d.NetMTU > 0 {
+			orphans = append(orphans, "--pve-net-mtu")
+		}
+		if d.NetFirewall != "" {
+			orphans = append(orphans, "--pve-net-firewall")
+		}
+		if len(orphans) > 0 {
+			return fmt.Errorf("pve: %s require --pve-net-bridge to be set", strings.Join(orphans, ", "))
+		}
 	}
 	if err := d.init(); err != nil {
 		return err
@@ -389,15 +466,25 @@ func (d *Driver) Create() error {
 // in Create covers every failure mode with one cleanup path.
 func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	onboot := d.Onboot
+	firewall, err := parseNetFirewall(d.NetFirewall)
+	if err != nil {
+		return err
+	}
 	opts := proxmox.VMOptions{
-		Name:      vmName,
-		Cores:     uint16(d.Cores),
-		Sockets:   uint16(d.Sockets),
-		Memory:    uint32(d.MemoryMB),
-		Onboot:    &onboot,
-		CloudInit: d.CloudInit,
-		IPConfig:  d.IPConfig,
-		CIUser:    d.CIUser,
+		Name:        vmName,
+		Cores:       uint16(d.Cores),
+		Sockets:     uint16(d.Sockets),
+		Memory:      uint32(d.MemoryMB),
+		Onboot:      &onboot,
+		CloudInit:   d.CloudInit,
+		IPConfig:    d.IPConfig,
+		CIUser:      d.CIUser,
+		NetDevice:   d.NetDevice,
+		NetBridge:   d.NetBridge,
+		NetModel:    d.NetModel,
+		NetVlanTag:  d.NetVlanTag,
+		NetMTU:      d.NetMTU,
+		NetFirewall: firewall,
 	}
 	if d.CloudInit {
 		keys, err := d.combinedSSHKeys()
@@ -414,6 +501,15 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		return err
 	}
 
+	// Grow the boot disk before AddDisk: AddDisk picks the first free scsi<N>
+	// slot, so resizing the existing boot disk first keeps that scan honest.
+	if d.DiskGB > 0 {
+		if err := d.client.ResizeBootDisk(ctx, d.VMID, d.BootDiskDevice, d.DiskGB); err != nil {
+			return err
+		}
+		log.Infof("pve: grew boot disk %s of VM %d to %dGB", d.BootDiskDevice, d.VMID, d.DiskGB)
+	}
+
 	if d.ExtraDiskSize > 0 {
 		slot, err := d.client.AddDisk(ctx, d.VMID, d.ExtraDiskStorage, d.ExtraDiskSize)
 		if err != nil {
@@ -427,6 +523,9 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	}
 	log.Infof("pve: started VM %d", d.VMID)
 
+	// Must stay after Configure: rewriting net<N> for --pve-net-bridge makes
+	// PVE mint a new MAC, so reading it any earlier would pin IP discovery to
+	// the template's old address.
 	mac, err := d.client.VMNetMAC(ctx, d.VMID, d.NetDevice)
 	if err != nil {
 		log.Warnf("pve: could not read %s MAC for IP discovery: %v; falling back to first-IPv4 detection", d.NetDevice, err)
@@ -435,6 +534,24 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		log.Infof("pve: VM %d uses MAC %s on %s", d.VMID, mac, d.NetDevice)
 	}
 	return nil
+}
+
+// parseNetFirewall converts the tri-state --pve-net-firewall flag into a
+// pointer: nil means "leave the PVE default alone". A bool flag cannot express
+// that third state, and defaulting to false would silently disable a firewall
+// the template had enabled.
+func parseNetFirewall(s string) (*bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return nil, nil
+	case "true", "1", "yes", "on":
+		v := true
+		return &v, nil
+	case "false", "0", "no", "off":
+		v := false
+		return &v, nil
+	}
+	return nil, fmt.Errorf("pve: --pve-net-firewall must be true or false, got %q", s)
 }
 
 // ensureSSHKeyPair creates the docker-machine SSH keypair at GetSSHKeyPath()

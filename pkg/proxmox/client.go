@@ -156,6 +156,12 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 		return err
 	}
 	var options []proxmox.VirtualMachineOption
+	// Enable the PVE-side guest agent channel unconditionally. Every IP
+	// discovery path in this driver goes through the guest agent, and a
+	// template built without `--agent 1` is the single most common reason a
+	// node never reports an address. Forcing it here means the template only
+	// has to have qemu-guest-agent installed, not correctly configured.
+	options = append(options, proxmox.VirtualMachineOption{Name: "agent", Value: "1"})
 	if opts.Name != "" {
 		options = append(options, proxmox.VirtualMachineOption{Name: "name", Value: opts.Name})
 	}
@@ -182,6 +188,16 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 			options = append(options, proxmox.VirtualMachineOption{Name: "sshkeys", Value: opts.SSHKeys})
 		}
 	}
+	// Rewriting net<N> without an explicit macaddr= makes PVE generate a fresh
+	// MAC for the device. That is safe here only because the driver captures
+	// the MAC (VMNetMAC) *after* Configure returns — do not move that capture
+	// earlier, or MAC-matched IP discovery will match a stale address.
+	if opts.NetBridge != "" {
+		options = append(options, proxmox.VirtualMachineOption{
+			Name:  netDeviceKey(opts.NetDevice),
+			Value: buildNetValue(opts),
+		})
+	}
 	if len(options) == 0 {
 		return nil
 	}
@@ -193,6 +209,76 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 		if err := task.Wait(ctx, time.Second, c.waitTimeout()); err != nil {
 			return fmt.Errorf("proxmox: configure task did not complete: %w", err)
 		}
+	}
+	return nil
+}
+
+// netDeviceKey normalises a PVE net device config key, defaulting to net0.
+func netDeviceKey(device string) string {
+	if device == "" {
+		return "net0"
+	}
+	return device
+}
+
+// buildNetValue renders a PVE net<N> config value from the network fields of
+// opts, e.g. "model=virtio,bridge=vmbr1,tag=42,mtu=9000,firewall=1". Only the
+// fields the caller actually set are emitted so PVE applies its own defaults
+// for the rest.
+func buildNetValue(opts VMOptions) string {
+	model := opts.NetModel
+	if model == "" {
+		model = "virtio"
+	}
+	v := fmt.Sprintf("model=%s,bridge=%s", model, opts.NetBridge)
+	if opts.NetVlanTag > 0 {
+		v += fmt.Sprintf(",tag=%d", opts.NetVlanTag)
+	}
+	if opts.NetMTU > 0 {
+		v += fmt.Sprintf(",mtu=%d", opts.NetMTU)
+	}
+	if opts.NetFirewall != nil {
+		firewall := 0
+		if *opts.NetFirewall {
+			firewall = 1
+		}
+		v += fmt.Sprintf(",firewall=%d", firewall)
+	}
+	return v
+}
+
+// ResizeBootDisk grows the given disk (e.g. "scsi0") of a VM to sizeGB.
+//
+// PVE can only ever *grow* a disk: passing a size smaller than the template's
+// disk is rejected by the API, so callers should skip the call rather than
+// pass a smaller value. go-proxmox has no VM resize helper (only the LXC
+// equivalent), hence the raw PUT plus manual task wait.
+func (c *Client) ResizeBootDisk(ctx context.Context, vmid int, disk string, sizeGB int) error {
+	if disk == "" {
+		return errors.New("proxmox: disk device is required to resize")
+	}
+	if sizeGB <= 0 {
+		return errors.New("proxmox: disk size must be greater than 0")
+	}
+	node, err := c.ResolveNode(ctx)
+	if err != nil {
+		return err
+	}
+	var upid proxmox.UPID
+	body := map[string]interface{}{
+		"disk": disk,
+		"size": fmt.Sprintf("%dG", sizeGB),
+	}
+	if err := c.api.Put(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/resize", node, vmid), body, &upid); err != nil {
+		return fmt.Errorf("proxmox: resize %s of vm %d to %dGB failed: %w", disk, vmid, sizeGB, err)
+	}
+	// A resize on some storage backends completes synchronously and returns an
+	// empty UPID; only wait when PVE actually handed back a task.
+	if upid == "" {
+		return nil
+	}
+	if err := c.waitTask(ctx, proxmox.NewTask(upid, c.api)); err != nil {
+		return fmt.Errorf("proxmox: resize task for vm %d did not complete: %w", vmid, err)
 	}
 	return nil
 }
@@ -383,6 +469,23 @@ type VMOptions struct {
 	// SSHKeys must already be URL-encoded as PVE expects for the sshkeys
 	// config value (one OpenSSH key per line, percent-encoded).
 	SSHKeys string
+
+	// NetDevice is the PVE config key the network settings below are written
+	// to ("net0" when empty). Nothing is written unless NetBridge is set.
+	NetDevice string
+	// NetBridge is the PVE bridge to attach the NIC to, e.g. "vmbr1". This is
+	// the switch for the whole net<N> rewrite: when empty the template's own
+	// network configuration is left completely untouched.
+	NetBridge string
+	// NetModel is the emulated NIC model ("virtio" when empty).
+	NetModel string
+	// NetVlanTag is the 802.1Q VLAN tag; 0 leaves the NIC untagged.
+	NetVlanTag int
+	// NetMTU overrides the NIC MTU; 0 uses the PVE default.
+	NetMTU int
+	// NetFirewall toggles the PVE firewall on the NIC; nil leaves it at the
+	// PVE default.
+	NetFirewall *bool
 }
 
 // ---------- PVE version + permission probe ----------
