@@ -172,11 +172,17 @@ docker-machine create --driver pve \
 | `pve-cores` | `2` | CPU cores per socket |
 | `pve-sockets` | `1` | CPU sockets |
 | `pve-memory` | `2048` | RAM in MB |
-| `pve-disk` | `20` | Disk size in GB (informational; template disk is used as-is) |
+| `pve-disk` | `0` | Grow the cloned boot disk to this size in GB (`0` = keep the template's size). PVE can only grow a disk, never shrink it |
+| `pve-boot-disk-device` | `scsi0` | PVE config key of the boot disk grown by `pve-disk` (`scsi0`, `virtio0`, `sata0`, ...) |
 | `pve-extra-disk-size` | `0` | Extra blank disk in GB for storage provisioners (0 = none) |
 | `pve-extra-disk-storage` | *(empty)* | PVE storage for the extra disk (required when size > 0) |
 | `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface name |
-| `pve-net-device` | `net0` | PVE config device (`net0`..`net31`) whose MAC pins down IP discovery |
+| `pve-net-device` | `net0` | PVE config device (`net0`..`net31`) whose MAC pins down IP discovery, and which the `pve-net-*` settings below are written to |
+| `pve-net-bridge` | *(empty)* | PVE bridge to attach the NIC to, e.g. `vmbr1`. **Empty leaves the template's network untouched**; setting it rewrites `pve-net-device` |
+| `pve-net-model` | `virtio` | Emulated NIC model, applied only when `pve-net-bridge` is set |
+| `pve-net-vlan-tag` | `0` | 802.1Q VLAN tag (`0` = untagged). Requires `pve-net-bridge` |
+| `pve-net-mtu` | `0` | NIC MTU (`0` = PVE default). Requires `pve-net-bridge` |
+| `pve-net-firewall` | *(empty)* | `true`/`false` to toggle the PVE firewall on the NIC; empty keeps the PVE default. Requires `pve-net-bridge` |
 | `pve-agent-timeout` | `300` | Seconds to wait for the QEMU guest agent to report an IP |
 | `pve-skip-permission-check` | `false` | Skip the token-permission probe in `PreCreateCheck` |
 | `pve-keep-on-failure` | `false` | Leave the cloned VM in place when Create fails (debugging only) |
