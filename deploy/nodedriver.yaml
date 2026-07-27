@@ -1,0 +1,39 @@
+# Register the pve driver in Rancher by applying this manifest against the
+# Rancher local (management) cluster:
+#
+#   kubectl apply -f deploy/nodedriver.yaml
+#
+# Before applying, replace <VERSION> with the release tag (e.g. v0.1.0) and
+# <SHA256> with the SHA-256 of the published docker-machine-driver-pve binary
+# for the host that runs the Rancher management server (typically
+# docker-machine-driver-pve-linux-amd64). Rancher only re-downloads the binary
+# when url or checksum change, so bump both together for every release.
+#
+# The annotations under metadata.annotations tell Rancher how the driver
+# flags map onto a reusable cloud credential: split token + URL are the
+# public credential fields, the token secret is private, and the rest are
+# plain template options. Field names are the driver flag minus its
+# `pve-` prefix, camelCased (e.g. `pve-api-url` -> `apiUrl`).
+apiVersion: management.cattle.io/v3
+kind: NodeDriver
+metadata:
+  name: pve
+  annotations:
+    publicCredentialFields: "apiUrl,apiTokenId"
+    privateCredentialFields: "apiTokenSecret"
+    optionalCredentialFields: "apiInsecure,caCert"
+    passwordFields: "apiTokenSecret"
+spec:
+  displayName: "Proxmox VE (pve)"
+  description: "Provision RKE2/K3s nodes as Proxmox VE virtual machines cloned from a template"
+  active: true
+  addCloudCredential: true
+  builtin: false
+  url: "https://github.com/lore09/pve-rancher-driver/releases/download/<VERSION>/docker-machine-driver-pve-linux-amd64"
+  checksum: "<SHA256>"
+  uiUrl: ""
+  externalId: ""
+  whitelistDomains:
+    - github.com
+    - objects.githubusercontent.com
+    - release-assets.githubusercontent.com
