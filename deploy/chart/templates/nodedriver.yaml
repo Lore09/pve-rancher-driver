@@ -1,11 +1,11 @@
 {{- $d := .Values.nodeDriver -}}
 {{- $version := $d.version | default .Chart.AppVersion -}}
 {{- if not $version -}}
-{{- fail "nodeDriver.version is empty and the chart has no appVersion; set --set nodeDriver.version=v0.1.3" -}}
+{{- fail "nodeDriver.version is empty and the chart has no appVersion; set --set nodeDriver.version=v0.2.0" -}}
 {{- end -}}
 
 {{/*
-Normalise the version to a leading "v" so both 0.1.3 and v0.1.3 work, since
+Normalise the version to a leading "v" so both 0.2.0 and v0.2.0 work, since
 release tags carry the prefix but Chart.appVersion conventionally does not.
 */}}
 {{- $tag := $version -}}
