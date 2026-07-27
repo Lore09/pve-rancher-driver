@@ -175,6 +175,9 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 		if opts.IPConfig != "" {
 			options = append(options, proxmox.VirtualMachineOption{Name: "ipconfig0", Value: opts.IPConfig})
 		}
+		if opts.CIUser != "" {
+			options = append(options, proxmox.VirtualMachineOption{Name: "ciuser", Value: opts.CIUser})
+		}
 		if opts.SSHKeys != "" {
 			options = append(options, proxmox.VirtualMachineOption{Name: "sshkeys", Value: opts.SSHKeys})
 		}
@@ -192,6 +195,57 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 		}
 	}
 	return nil
+}
+
+// AddDisk attaches a new disk to the VM at the first free SCSI slot
+// (scsi0..scsi30) and returns the slot that was used (e.g. "scsi1").
+// sizeGB is the size in gigabytes; storage is a PVE storage name such as
+// "local-lvm". The typical use is giving a node a dedicated raw block
+// device for a storage provisioner like Longhorn; the guest is expected to
+// format and mount it (via the template's cloud-init/systemd hooks).
+func (c *Client) AddDisk(ctx context.Context, vmid int, storage string, sizeGB int) (string, error) {
+	if storage == "" {
+		return "", errors.New("proxmox: storage is required to add a disk")
+	}
+	if sizeGB <= 0 {
+		return "", errors.New("proxmox: disk size must be greater than 0")
+	}
+	node, err := c.ResolveNode(ctx)
+	if err != nil {
+		return "", err
+	}
+	// Read the raw config map so we can scan scsi<N> keys without enumerating
+	// the 31 individual struct fields on VirtualMachineConfig.
+	raw := map[string]interface{}{}
+	if err := c.api.Get(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), &raw); err != nil {
+		return "", fmt.Errorf("proxmox: cannot read vm %d config: %w", vmid, err)
+	}
+	slot := ""
+	for i := 0; i <= 30; i++ {
+		name := fmt.Sprintf("scsi%d", i)
+		if _, exists := raw[name]; !exists {
+			slot = name
+			break
+		}
+	}
+	if slot == "" {
+		return "", fmt.Errorf("proxmox: vm %d has no free SCSI slot", vmid)
+	}
+	vm, err := c.vm(ctx, vmid)
+	if err != nil {
+		return "", err
+	}
+	task, err := vm.Config(ctx, proxmox.VirtualMachineOption{
+		Name:  slot,
+		Value: fmt.Sprintf("%s:%d", storage, sizeGB),
+	})
+	if err != nil {
+		return "", fmt.Errorf("proxmox: add disk %s=%s:%d failed: %w", slot, storage, sizeGB, err)
+	}
+	if err := c.waitTask(ctx, task); err != nil {
+		return "", err
+	}
+	return slot, nil
 }
 
 // Start powers on a VM, waiting for the start task to complete.
@@ -325,7 +379,10 @@ type VMOptions struct {
 	Onboot    *bool
 	CloudInit bool
 	IPConfig  string
-	SSHKeys   string
+	CIUser    string
+	// SSHKeys must already be URL-encoded as PVE expects for the sshkeys
+	// config value (one OpenSSH key per line, percent-encoded).
+	SSHKeys string
 }
 
 // ---------- PVE version + permission probe ----------

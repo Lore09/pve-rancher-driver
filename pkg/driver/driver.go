@@ -6,11 +6,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/log"
 	"github.com/docker/machine/libmachine/mcnflag"
+	"github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
 
 	"github.com/lore09/pve-rancher-driver/pkg/proxmox"
@@ -31,29 +36,32 @@ const (
 type Driver struct {
 	*drivers.BaseDriver
 
-	APIUrl         string
-	APITokenID     string
-	APITokenSecret string
-	Insecure       bool
-	CACertPEM      string
-	Node           string
-	VMID           int
-	TemplateVMID   int
-	VMName         string
-	Cores          int
-	Sockets        int
-	MemoryMB       int
-	DiskGB         int
-	NetIface       string
-	NetDevice      string
-	CloudInit      bool
-	IPConfig       string
-	SSHKeys        string
-	Onboot         bool
-	AgentTimeout   time.Duration
-	KeepOnFailure   bool
-	SkipPermCheck   bool
-	NetMAC          string
+	APIUrl           string
+	APITokenID       string
+	APITokenSecret   string
+	Insecure         bool
+	CACertPEM        string
+	Node             string
+	VMID             int
+	TemplateVMID     int
+	VMName           string
+	Cores            int
+	Sockets          int
+	MemoryMB         int
+	DiskGB           int
+	ExtraDiskSize    int
+	ExtraDiskStorage string
+	NetIface         string
+	NetDevice        string
+	CloudInit        bool
+	IPConfig         string
+	CIUser           string
+	SSHKeys          string
+	Onboot           bool
+	AgentTimeout     time.Duration
+	KeepOnFailure    bool
+	SkipPermCheck    bool
+	NetMAC           string
 
 	client *proxmox.Client
 }
@@ -156,6 +164,17 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Disk size in GB (informational; template disk is used as-is)",
 			Value:  20,
 		},
+		mcnflag.IntFlag{
+			Name:   "pve-extra-disk-size",
+			EnvVar: "PVE_EXTRA_DISK_SIZE",
+			Usage:  "Attach an extra blank disk of this size in GB (0 = none). Use for Longhorn or other storage provisioners",
+			Value:  0,
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-extra-disk-storage",
+			EnvVar: "PVE_EXTRA_DISK_STORAGE",
+			Usage:  "PVE storage for the extra disk, e.g. local-lvm (required when pve-extra-disk-size > 0)",
+		},
 		mcnflag.StringFlag{
 			Name:   "pve-net-iface",
 			EnvVar: "PVE_NET_IFACE",
@@ -185,9 +204,14 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  "ip=dhcp",
 		},
 		mcnflag.StringFlag{
+			Name:   "pve-ciuser",
+			EnvVar: "PVE_CIUSER",
+			Usage:  "Cloud-init user PVE should create/configure with the SSH keys (required for images without a default user, e.g. openSUSE Leap Micro)",
+		},
+		mcnflag.StringFlag{
 			Name:   "pve-sshkeys",
 			EnvVar: "PVE_SSHKEYS",
-			Usage:  "Cloud-init sshkeys string (URL or inline, newline-separated)",
+			Usage:  "Extra OpenSSH public keys injected via cloud-init (one per line, plain text). The driver's own generated key is always added",
 		},
 		mcnflag.BoolFlag{
 			Name:   "pve-onboot",
@@ -235,6 +259,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.Sockets = flags.Int("pve-sockets")
 	d.MemoryMB = flags.Int("pve-memory")
 	d.DiskGB = flags.Int("pve-disk")
+	d.ExtraDiskSize = flags.Int("pve-extra-disk-size")
+	d.ExtraDiskStorage = flags.String("pve-extra-disk-storage")
 	d.NetIface = flags.String("pve-net-iface")
 	d.NetDevice = flags.String("pve-net-device")
 	if d.NetDevice == "" {
@@ -242,6 +268,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	}
 	d.CloudInit = flags.Bool("pve-cloudinit")
 	d.IPConfig = flags.String("pve-ipconfig")
+	d.CIUser = flags.String("pve-ciuser")
 	d.SSHKeys = flags.String("pve-sshkeys")
 	d.Onboot = flags.Bool("pve-onboot")
 	d.SkipPermCheck = flags.Bool("pve-skip-permission-check")
@@ -277,6 +304,9 @@ func (d *Driver) PreCreateCheck() error {
 	}
 	if d.TemplateVMID == 0 {
 		return errors.New("pve: --pve-template-vmid is required to clone a VM")
+	}
+	if d.ExtraDiskSize > 0 && d.ExtraDiskStorage == "" {
+		return errors.New("pve: --pve-extra-disk-storage is required when --pve-extra-disk-size > 0")
 	}
 	if err := d.init(); err != nil {
 		return err
@@ -328,6 +358,13 @@ func (d *Driver) Create() error {
 		vmName = d.MachineName
 	}
 
+	// docker-machine/libmachine expects a keypair at GetSSHKeyPath() to log
+	// in after Create; the driver is responsible for creating it and for
+	// getting the public half onto the guest (via cloud-init below).
+	if err := d.ensureSSHKeyPair(); err != nil {
+		return err
+	}
+
 	assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, d.VMID, vmName)
 	if err != nil {
 		return err
@@ -347,28 +384,48 @@ func (d *Driver) Create() error {
 	return nil
 }
 
-// finalizeCreate runs the post-clone steps (Configure + start + NIC MAC
-// capture used by IP discovery). Broken out so the rollback in Create covers
-// every failure mode with one cleanup path.
+// finalizeCreate runs the post-clone steps (Configure + optional extra disk
+// + start + NIC MAC capture used by IP discovery). Broken out so the rollback
+// in Create covers every failure mode with one cleanup path.
 func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	onboot := d.Onboot
 	opts := proxmox.VMOptions{
-		Name:       vmName,
-		Cores:      uint16(d.Cores),
-		Sockets:    uint16(d.Sockets),
-		Memory:     uint32(d.MemoryMB),
-		Onboot:     &onboot,
-		CloudInit:  d.CloudInit,
-		IPConfig:   d.IPConfig,
-		SSHKeys:    d.SSHKeys,
+		Name:      vmName,
+		Cores:     uint16(d.Cores),
+		Sockets:   uint16(d.Sockets),
+		Memory:    uint32(d.MemoryMB),
+		Onboot:    &onboot,
+		CloudInit: d.CloudInit,
+		IPConfig:  d.IPConfig,
+		CIUser:    d.CIUser,
+	}
+	if d.CloudInit {
+		keys, err := d.combinedSSHKeys()
+		if err != nil {
+			return err
+		}
+		if keys != "" {
+			opts.SSHKeys = keys
+		}
+	} else {
+		log.Warnf("pve: cloud-init disabled; no SSH key will be injected — the template must already trust %s", d.GetSSHKeyPath()+".pub")
 	}
 	if err := d.client.Configure(ctx, d.VMID, opts); err != nil {
 		return err
 	}
+
+	if d.ExtraDiskSize > 0 {
+		slot, err := d.client.AddDisk(ctx, d.VMID, d.ExtraDiskStorage, d.ExtraDiskSize)
+		if err != nil {
+			return err
+		}
+		log.Infof("pve: attached %dGB extra disk as %s on storage %q", d.ExtraDiskSize, slot, d.ExtraDiskStorage)
+	}
+
 	if err := d.client.Start(ctx, d.VMID); err != nil {
 		return err
 	}
-	log.Infof("pve: starting VM %d", d.VMID)
+	log.Infof("pve: started VM %d", d.VMID)
 
 	mac, err := d.client.VMNetMAC(ctx, d.VMID, d.NetDevice)
 	if err != nil {
@@ -378,6 +435,37 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		log.Infof("pve: VM %d uses MAC %s on %s", d.VMID, mac, d.NetDevice)
 	}
 	return nil
+}
+
+// ensureSSHKeyPair creates the docker-machine SSH keypair at GetSSHKeyPath()
+// if it does not exist yet. GenerateSSHKey is a no-op when the private key is
+// already on disk, so this is safe to call on every Create.
+func (d *Driver) ensureSSHKeyPair() error {
+	keyPath := d.GetSSHKeyPath()
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		return fmt.Errorf("pve: cannot create machine key directory: %w", err)
+	}
+	if err := ssh.GenerateSSHKey(keyPath); err != nil {
+		return fmt.Errorf("pve: cannot generate SSH keypair: %w", err)
+	}
+	return nil
+}
+
+// combinedSSHKeys merges any operator-supplied --pve-sshkeys with the public
+// key docker-machine generated for this machine and returns the URL-encoded
+// value PVE expects for the `sshkeys` config option.
+func (d *Driver) combinedSSHKeys() (string, error) {
+	pub, err := os.ReadFile(d.GetSSHKeyPath() + ".pub")
+	if err != nil {
+		return "", fmt.Errorf("pve: cannot read generated SSH public key: %w", err)
+	}
+	lines := []string{strings.TrimSpace(string(pub))}
+	for _, k := range strings.Split(d.SSHKeys, "\n") {
+		if k = strings.TrimSpace(k); k != "" {
+			lines = append(lines, k)
+		}
+	}
+	return url.QueryEscape(strings.Join(lines, "\n")), nil
 }
 
 // Start powers on the VM if it is not already running.
