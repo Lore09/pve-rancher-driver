@@ -175,7 +175,11 @@ driver flag shows up as a form field; the ones that matter first:
 | Node | `pve-node` | Leave empty to use the first online PVE node |
 | VMID | `pve-vmid` | `0` = PVE auto-assigns (recommended) |
 | Cores / Sockets / Memory | `pve-cores` / `pve-sockets` / `pve-memory` | Per-VM sizing |
-| Network device | `pve-net-device` | Which PVE NIC's MAC is used for IP discovery (`net0`) |
+| Network device | `pve-net-device` | Which PVE NIC's MAC is used for IP discovery (`net0`), and the device the settings below rewrite |
+| Bridge | `pve-net-bridge` | e.g. `vmbr1`. Leave empty to inherit the template's network. See [per-pool networking](#per-pool-networking) |
+| NIC model / VLAN tag / MTU / firewall | `pve-net-model` / `pve-net-vlan-tag` / `pve-net-mtu` / `pve-net-firewall` | All require **Bridge** to be set |
+| Boot disk size | `pve-disk` | GB; grows the cloned boot disk. `0` = keep the template's size |
+| Boot disk device | `pve-boot-disk-device` | `scsi0` by default; match your template's boot disk |
 | Cloud-init | `pve-cloudinit` | Enable to push `ipconfig0`/`sshkeys`/`ciuser` |
 | IP config | `pve-ipconfig` | `ip=dhcp` or static `ip=10.0.0.5/24,gw=10.0.0.1` |
 | Cloud-init user | `pve-ciuser` | e.g. `rancher` for Leap Micro; leave empty for Debian's built-in `debian` user |
@@ -194,10 +198,18 @@ extra disks usually go.
 The driver flow per node is:
 
 ```
-clone template → configure (cpu/mem/cloud-init) → [optional extra disk]
-  → start → capture NIC MAC → poll guest agent for IPv4 (MAC-matched)
+clone template → configure (agent=1, cpu/mem/cloud-init, [network])
+  → [grow boot disk] → [optional extra disk] → start
+  → capture NIC MAC → poll guest agent for IPv4 (MAC-matched)
   → report created → Rancher system-agent bootstraps over SSH
 ```
+
+The order is deliberate in two places. The boot disk is grown *before* the
+extra disk is attached, because the extra disk lands in the first free
+`scsi<N>` slot. And the NIC MAC is captured *after* the configure step,
+because rewriting the net device (when `pve-net-bridge` is set) makes PVE
+generate a fresh MAC — reading it earlier would pin IP discovery to the
+template's old address.
 
 Useful places to look while a node provisions:
 
@@ -225,6 +237,53 @@ Typical timing: 5–8 minutes from `+` to `Ready` on a warm template.
   on first boot.
 - Only attach the extra disk to pools that actually run Longhorn storage
   (usually workers); control-plane/etcd pools should stay on the boot disk.
+
+## Per-pool networking
+
+By default the driver leaves the cloned VM's network exactly as the template
+had it, and only *reads* the NIC's MAC address to pin down IP discovery. That
+is enough when every node lives on one bridge.
+
+Set `pve-net-bridge` on a machine pool to override it, which lets one template
+serve pools on different networks instead of maintaining a template per VLAN:
+
+| Goal | Fields |
+|---|---|
+| Workers on an isolated bridge | `pve-net-bridge: vmbr1` |
+| Pool on VLAN 100 | `pve-net-bridge: vmbr0`, `pve-net-vlan-tag: 100` |
+| Jumbo frames for a storage pool | `pve-net-bridge: vmbr0`, `pve-net-mtu: 9000` |
+| Firewall the NIC | `pve-net-bridge: vmbr0`, `pve-net-firewall: true` |
+
+Notes:
+
+- `pve-net-vlan-tag`, `pve-net-mtu` and `pve-net-firewall` **only apply when
+  `pve-net-bridge` is set**. Setting one without a bridge is rejected in
+  `PreCreateCheck` rather than silently ignored, so a pool never comes up
+  believing it is on a VLAN the driver never configured.
+- `pve-net-firewall` is deliberately a string, not a checkbox: empty means
+  "leave PVE's default alone", which a boolean cannot express. A checkbox
+  defaulting to off would silently disable a firewall the template enabled.
+- Rewriting the device assigns a **new MAC**. That is handled internally (the
+  MAC is read after configuration), but it does mean DHCP reservations keyed to
+  the template's MAC will not match.
+- The driver writes only the device named by `pve-net-device`. Other NICs on
+  the template are untouched.
+
+## Boot disk sizing
+
+`pve-disk` grows the cloned boot disk. It defaults to `0`, meaning the
+template's own disk size is kept.
+
+**PVE can only grow a disk, never shrink it.** A value smaller than the
+template's disk is rejected by the PVE API, so leave the field at `0` rather
+than trying to reduce it. If your template does not boot from `scsi0`, set
+`pve-boot-disk-device` to match (`virtio0`, `sata0`, ...) — the resize targets
+that key by name and will fail if the device does not exist.
+
+Note this grows the *block device*. Whether the guest's filesystem expands to
+fill it depends on the image: most cloud images run `growpart`/`cloud-initramfs`
+on first boot and will. Verify with `lsblk` and `df -h` on a test node before
+relying on it for a whole pool.
 
 ## Fixing a driver already stuck in `Downloading`
 
@@ -280,11 +339,15 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Driver stuck in `Downloading` but only after fixing `url` | Missing `whitelistDomains` entry — GitHub redirects through `objects.githubusercontent.com` and `release-assets.githubusercontent.com` | Both must be added; `github.com` alone is not enough |
 | "API token is missing privileges" at save | Token ACL not granted to the token itself | Run both `pveum acl modify` lines (user **and** `-token`) from the README |
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
-| Create times out "waiting for guest agent IP" | qemu-guest-agent missing/disabled in image, or agent enabled but `--agent 1` missing on template | Re-bake image, set `--agent 1`, verify with `qm agent <id> ping` |
+| Create times out "waiting for guest agent IP" | **qemu-guest-agent not installed or not running inside the image.** The driver now sets `agent=1` on every clone, so the PVE-side channel is no longer a cause | Re-bake the image with `qemu-guest-agent` installed and enabled; verify with `qm agent <id> ping` |
 | VM boots but node never `Ready` | cloud-init user lacks passwordless sudo, or `curl`/`bash` missing | Fix template; verify `sudo -n true` works for the SSH user |
 | SSH permission denied during bootstrap | `ssh-user` doesn't match the cloud-init user, or keys not injected | Match users; keep `pve-cloudinit` on; check the VM's cloud-init log (`/var/log/cloud-init-output.log`) |
 | Extra disk missing in guest | `pve-extra-disk-storage` wrong/empty | Field is required when size > 0; check storage name with `pvesm status` |
 | IP picked from wrong interface (docker0/cni) | First-IPv4 fallback was used | Ensure MAC capture succeeded (driver logs); set `pve-net-device` to the right `netN` |
+| "require --pve-net-bridge to be set" at save | A VLAN tag / MTU / firewall value was set without a bridge — those only apply while rewriting the net device | Set `pve-net-bridge`, or clear the other `pve-net-*` fields. See [per-pool networking](#per-pool-networking) |
+| Boot disk still the template's size | `pve-disk` left at `0`, or the guest did not grow its filesystem | Set `pve-disk`; check `lsblk` vs `df -h` in the guest — the block device grows, the filesystem only follows if the image runs `growpart` |
+| Resize fails "disk ... does not exist" | Template does not boot from `scsi0` | Set `pve-boot-disk-device` to the template's actual boot disk key (`qm config <vmid>`) |
+| Node gets an unexpected IP after setting a bridge | Rewriting the net device assigns a new MAC, so DHCP reservations keyed to the old MAC no longer match | Re-key the reservation to the new MAC, or use `pve-ipconfig` for a static address |
 
 ## Upgrading the driver
 
