@@ -157,6 +157,12 @@ extension uses for **Test Connection** and the template/storage/bridge
 dropdowns; without it Test Connection reports that Rancher could not reach the
 Proxmox VE server. Provisioning itself does not use that proxy.
 
+That proxy also verifies PVE's TLS certificate against the Rancher server's
+trust store, which a stock PVE certificate fails — the credential's `Insecure
+TLS` / `CA Cert` apply to the driver only. Either
+[add the PVE CA to Rancher](docs/rancher-setup.md#make-rancher-trust-the-proxmox-ve-certificate)
+or accept the warning and type the machine-pool fields by hand.
+
 Alternatively, paste the URL and checksum directly through the UI at
 **Cluster Management → Drivers → Node Drivers → Add Node Driver**.
 

@@ -131,6 +131,13 @@ kubectl patch nodedriver.management.cattle.io pve --type=json \
 If you edit it in place, add the host to your Helm values too, or the next
 `helm upgrade` will revert it.
 
+Allow-listing only gets the proxy as far as connecting. It then verifies the PVE
+certificate against the Rancher server's trust store and cannot be told to skip
+it, so a stock PVE certificate needs its CA added to Rancher —
+[step-by-step](../../docs/rancher-setup.md#make-rancher-trust-the-proxmox-ve-certificate).
+Skipping that is also fine: Test Connection downgrades to a warning, the
+credential still saves, and the machine-pool fields become text inputs.
+
 ## Air-gapped / self-hosted binaries
 
 Host the binary somewhere your Rancher pods can reach, then:

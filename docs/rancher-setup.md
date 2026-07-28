@@ -211,8 +211,8 @@ and fill in:
 | `API URL` | `https://<pve-host>:8006/api2/json` |
 | `API Token ID` | e.g. `rancher@pve!machine` |
 | `API Token Secret` | The secret printed once by `pveum user token add` |
-| `Insecure TLS` | Only for lab/self-signed certs |
-| `CA Cert` | PEM content of your PVE CA (alternative to Insecure) |
+| `Insecure TLS` | Only for lab/self-signed certs. Used by the **driver** when it provisions; it does not affect the UI's Test Connection — see [below](#make-rancher-trust-the-proxmox-ve-certificate) |
+| `CA Cert` | PEM content of your PVE CA (alternative to Insecure). Same scope as above: driver only |
 
 When the cluster is created, Rancher stores the secret in a Kubernetes
 `Secret` and hands it to the driver per machine — the secret never appears in
@@ -241,21 +241,118 @@ helm upgrade pve-rancher-driver deploy/chart -n cattle-system --reuse-values \
 ```
 
 If you patch the live resource instead, add the host to your Helm values too or
-the next upgrade reverts it. The
-driver binary does not use this proxy, so a driver that reached `Active` can
-still fail here.
+the next upgrade reverts it. The driver binary does not use this proxy, so a
+driver that reached `Active` can still fail here.
 
-Two more things to know about that proxy path:
+### Make Rancher trust the Proxmox VE certificate
 
-- It validates the PVE TLS certificate using the Rancher server's trust store.
-  `Insecure TLS` and `CA Cert` on the credential are consumed by the *driver*
-  (which talks to PVE directly from the Rancher pod), not by the proxy — so with
-  a self-signed PVE certificate Test Connection can still fail with a gateway
-  error even once the host is allow-listed. Fix it by making the Rancher server
-  trust the PVE CA (Rancher's `tls-ca` / additional-trusted-CA mechanism), or by
-  giving PVE a certificate from a CA it already trusts.
-- Provisioning itself does not depend on the proxy. If you cannot get it
-  working, the fields the dropdowns would have filled in can be typed by hand.
+Allow-listing the host gets the proxy as far as *connecting* to PVE. It then
+validates the certificate against the **Rancher server's** trust store, and
+there is no way to turn that off: Rancher's proxy uses Go's default HTTP
+transport with no TLS overrides. `Insecure TLS` and `CA Cert` on the credential
+are read by the **driver**, which connects to PVE directly and never goes
+through the proxy — they have no effect here.
+
+A stock PVE install serves port 8006 with a certificate signed by its own
+cluster CA, which nothing trusts by default, so this step applies to most
+self-hosted setups.
+
+**Confirm this is your problem.** Run the same request from inside the Rancher
+pod:
+
+```bash
+kubectl -n cattle-system exec deploy/rancher -- \
+  curl -sS -o /dev/null -w '%{http_code}\n' https://<pve-host>:8006/api2/json/version
+```
+
+| Output | Meaning |
+|---|---|
+| `curl: (60) ... unable to get local issuer certificate` (or `self signed certificate`) | Trust problem — continue below |
+| `Could not resolve host` | In-cluster DNS cannot resolve the PVE hostname (common with `.home`/`.lan` domains served only by your router). Use a resolvable name or an IP, and allow-list whatever you use |
+| `Connection refused` / a timeout | Network or firewall between the Rancher pod and PVE |
+| `401` | TLS and connectivity are fine — the trust step is already done |
+
+**1. Get the PVE cluster CA.** On a default install it is
+`/etc/pve/pve-root-ca.pem`, shared by every node in the cluster and unchanged
+when individual node certificates are renewed:
+
+```bash
+scp root@<pve-host>:/etc/pve/pve-root-ca.pem .
+```
+
+If you replaced PVE's certificate with your own, use *that* chain's CA instead.
+For a self-signed certificate with no separate CA, export the served
+certificate itself:
+
+```bash
+openssl s_client -connect <pve-host>:8006 -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -out pve-root-ca.pem
+```
+
+**2. Give it to Rancher.** For a Helm-installed Rancher (the normal case):
+
+```bash
+kubectl -n cattle-system create secret generic tls-ca-additional \
+  --from-file=ca-additional.pem=pve-root-ca.pem
+
+helm upgrade rancher rancher-stable/rancher -n cattle-system --reuse-values \
+  --set additionalTrustedCAs=true
+
+kubectl -n cattle-system rollout restart deploy/rancher
+```
+
+Use whichever chart repo you installed from — `rancher-latest`, `rancher-stable`
+or `rancher-prime`; `helm -n cattle-system get metadata rancher` will tell you.
+
+Three things go wrong here more often than anything else:
+
+- **The key name must be `ca-additional.pem`.** Rancher's entrypoint looks for
+  exactly that filename and ignores the secret otherwise.
+- **`additionalTrustedCAs=true` is what mounts the secret** and runs
+  `update-ca-certificates` so the CA lands in the system pool Go reads. Creating
+  the secret alone does nothing.
+- **If `tls-ca-additional` already exists**, do not replace it — concatenate the
+  existing PEM and the PVE CA into one file and recreate the secret from that,
+  or you will drop whatever CA was already trusted.
+
+  ```bash
+  kubectl -n cattle-system get secret tls-ca-additional \
+    -o jsonpath='{.data.ca-additional\.pem}' | base64 -d > existing.pem
+  cat existing.pem pve-root-ca.pem > combined.pem
+  kubectl -n cattle-system create secret generic tls-ca-additional \
+    --from-file=ca-additional.pem=combined.pem --dry-run=client -o yaml \
+    | kubectl apply -f -
+  ```
+
+For a Docker-install Rancher, bind-mount the same file instead and restart the
+container:
+
+```bash
+-v /path/to/pve-root-ca.pem:/etc/rancher/ssl/ca-additional.pem
+```
+
+**3. Verify.** Re-run the `curl` from the top of this section — it should print
+`401` (reachable, TLS verified, token not passed) instead of `curl: (60)`. Then
+reload the Rancher UI tab and press **Test Connection** again.
+
+### If you would rather not touch Rancher's trust store
+
+Nothing about provisioning depends on this proxy, so you can skip the whole
+thing:
+
+- **Test Connection** reports a *warning* rather than an error when the host is
+  allow-listed but unreachable, and the cloud credential saves anyway.
+- The machine pool form detects the same condition and replaces the four
+  discovered dropdowns — node, template VMID, extra-disk storage, bridge — with
+  plain text inputs. Fill them in from the PVE UI (node name under
+  *Datacenter*, template VMID from the [template
+  guide](template-preparation.md), storage from *Datacenter → Storage*, bridge
+  from *Node → Network*).
+- Clones then run through the driver inside the Rancher pod, which honours
+  `Insecure TLS` / `CA Cert` — so a self-signed PVE certificate is fine there.
+
+The only thing you lose is discovery in the form. If typing a wrong node name or
+VMID worries you, do the trust step instead.
 
 ## 4. Create a cluster with machine pools
 
@@ -439,7 +536,8 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Driver stuck in `Downloading`, `Downloaded=Unknown` | None of the three: (a) `url` points to the YAML manifest not the binary, (b) missing `whitelistDomains` entry, (c) `checksum` mismatch vs. `url` | Verify `spec.url` ends in `docker-machine-driver-pve-linux-amd64`; recompute sha256 of that exact asset; ensure all three GitHub redirect hosts are listed in `whitelistDomains`; re-apply |
 | Driver stuck in `Downloading` but only after fixing `url` | Missing `whitelistDomains` entry — GitHub redirects through `objects.githubusercontent.com` and `release-assets.githubusercontent.com` | Both must be added; `github.com` alone is not enough |
 | "Rancher could not reach the Proxmox VE server — the host is not in the node driver allow list" at Test Connection | PVE host missing from `spec.whitelistDomains`, which gates Rancher's `/meta/proxy` | Add the PVE hostname (no scheme, no port) — see [Allow-list the PVE host first](#allow-list-the-pve-host-first) |
-| Test Connection still fails with a gateway error once allow-listed | Rancher server does not trust the PVE TLS certificate; the proxy always verifies it and ignores the credential's `Insecure TLS` / `CA Cert` | Make Rancher trust the PVE CA, or type the machine-pool fields by hand — provisioning does not use this proxy |
+| Test Connection warns that Rancher could not reach or verify the host, once allow-listed | Rancher server does not trust the PVE TLS certificate; the proxy always verifies it and ignores the credential's `Insecure TLS` / `CA Cert`. Confirm with the in-pod `curl` | [Make Rancher trust the PVE CA](#make-rancher-trust-the-proxmox-ve-certificate), or accept the warning and type the machine-pool fields by hand — provisioning does not use this proxy |
+| Machine pool dropdowns are text inputs instead of dropdowns | Expected fallback when the PVE API is unreachable through the proxy — usually the certificate trust issue above | Fill the four fields by hand, or fix trust to get discovery back |
 | Test Connection says the credentials are not allowed / unauthorized | Wrong `API Token ID` or secret (`/version` needs no privileges, so this is not an ACL problem). Before the fix in the UI extension, the token was sent in `Authorization`, which Rancher itself rejected with 401 | Re-check the token id is `user@realm!tokenid` and the secret is the one printed by `pveum user token add`; update the UI extension |
 | "API token is missing privileges" at save | Token ACL not granted to the token itself | Run both `pveum acl modify` lines (user **and** `-token`) from the README |
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
