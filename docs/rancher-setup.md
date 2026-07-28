@@ -218,6 +218,45 @@ When the cluster is created, Rancher stores the secret in a Kubernetes
 `Secret` and hands it to the driver per machine — the secret never appears in
 node-template objects.
 
+### Allow-list the PVE host first
+
+**Test Connection** (and the template/storage/bridge dropdowns in the machine
+pool form) run in your browser and reach PVE through Rancher's `/meta/proxy`,
+which refuses any host that is not in the driver's `whitelistDomains`. Add the
+PVE **hostname** — no scheme, no `:8006`, because Rancher matches the URL's
+hostname:
+
+```bash
+kubectl patch nodedriver.management.cattle.io pve --type=json \
+  -p '[{"op":"add","path":"/spec/whitelistDomains/-","value":"<pve-host>"}]'
+```
+
+Or set it at install time by passing the whole list (Helm's
+`--set …whitelistDomains[3]=x` replaces the list rather than appending, blanking
+the GitHub entries):
+
+```bash
+helm upgrade pve-rancher-driver deploy/chart -n cattle-system --reuse-values \
+  --set 'nodeDriver.whitelistDomains={github.com,objects.githubusercontent.com,release-assets.githubusercontent.com,<pve-host>}'
+```
+
+If you patch the live resource instead, add the host to your Helm values too or
+the next upgrade reverts it. The
+driver binary does not use this proxy, so a driver that reached `Active` can
+still fail here.
+
+Two more things to know about that proxy path:
+
+- It validates the PVE TLS certificate using the Rancher server's trust store.
+  `Insecure TLS` and `CA Cert` on the credential are consumed by the *driver*
+  (which talks to PVE directly from the Rancher pod), not by the proxy — so with
+  a self-signed PVE certificate Test Connection can still fail with a gateway
+  error even once the host is allow-listed. Fix it by making the Rancher server
+  trust the PVE CA (Rancher's `tls-ca` / additional-trusted-CA mechanism), or by
+  giving PVE a certificate from a CA it already trusts.
+- Provisioning itself does not depend on the proxy. If you cannot get it
+  working, the fields the dropdowns would have filled in can be typed by hand.
+
 ## 4. Create a cluster with machine pools
 
 **Cluster Management → Create → RKE2/K3s → Custom (or your cluster type) →
@@ -399,6 +438,9 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 |---|---|---|
 | Driver stuck in `Downloading`, `Downloaded=Unknown` | None of the three: (a) `url` points to the YAML manifest not the binary, (b) missing `whitelistDomains` entry, (c) `checksum` mismatch vs. `url` | Verify `spec.url` ends in `docker-machine-driver-pve-linux-amd64`; recompute sha256 of that exact asset; ensure all three GitHub redirect hosts are listed in `whitelistDomains`; re-apply |
 | Driver stuck in `Downloading` but only after fixing `url` | Missing `whitelistDomains` entry — GitHub redirects through `objects.githubusercontent.com` and `release-assets.githubusercontent.com` | Both must be added; `github.com` alone is not enough |
+| "Rancher could not reach the Proxmox VE server — the host is not in the node driver allow list" at Test Connection | PVE host missing from `spec.whitelistDomains`, which gates Rancher's `/meta/proxy` | Add the PVE hostname (no scheme, no port) — see [Allow-list the PVE host first](#allow-list-the-pve-host-first) |
+| Test Connection still fails with a gateway error once allow-listed | Rancher server does not trust the PVE TLS certificate; the proxy always verifies it and ignores the credential's `Insecure TLS` / `CA Cert` | Make Rancher trust the PVE CA, or type the machine-pool fields by hand — provisioning does not use this proxy |
+| Test Connection says the credentials are not allowed / unauthorized | Wrong `API Token ID` or secret (`/version` needs no privileges, so this is not an ACL problem). Before the fix in the UI extension, the token was sent in `Authorization`, which Rancher itself rejected with 401 | Re-check the token id is `user@realm!tokenid` and the secret is the one printed by `pveum user token add`; update the UI extension |
 | "API token is missing privileges" at save | Token ACL not granted to the token itself | Run both `pveum acl modify` lines (user **and** `-token`) from the README |
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
 | Create times out "waiting for guest agent IP" | **qemu-guest-agent not installed or not running inside the image.** The driver now sets `agent=1` on every clone, so the PVE-side channel is no longer a cause | Re-bake the image with `qemu-guest-agent` installed and enabled; verify with `qm agent <id> ping` |

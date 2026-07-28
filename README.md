@@ -151,6 +151,12 @@ with the matching line from `dist/checksums.txt` for
 Rancher management plane). `whitelistDomains` already lists all three GitHub
 release redirect hosts — don't drop any, or the download silently stalls.
 
+Also **add your PVE hostname** to `whitelistDomains` (hostname only, no scheme
+and no `:8006`). The same list gates Rancher's `/meta/proxy`, which the UI
+extension uses for **Test Connection** and the template/storage/bridge
+dropdowns; without it Test Connection reports that Rancher could not reach the
+Proxmox VE server. Provisioning itself does not use that proxy.
+
 Alternatively, paste the URL and checksum directly through the UI at
 **Cluster Management → Drivers → Node Drivers → Add Node Driver**.
 

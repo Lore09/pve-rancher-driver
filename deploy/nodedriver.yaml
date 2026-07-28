@@ -33,7 +33,13 @@ spec:
   checksum: "<SHA256>"
   uiUrl: ""
   externalId: ""
+  # The first three hosts are GitHub's release redirect chain, needed to
+  # download the binary. Add your PVE host as a fourth entry — hostname only,
+  # no scheme and no `:8006` — because this same list gates Rancher's
+  # /meta/proxy, which the UI extension uses for "Test Connection" and the
+  # template/storage/bridge dropdowns.
   whitelistDomains:
     - github.com
     - objects.githubusercontent.com
     - release-assets.githubusercontent.com
+    # - pve.example.com

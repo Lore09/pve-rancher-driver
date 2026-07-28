@@ -49,13 +49,25 @@ nodeDriver:
   active: true
   addCloudCredential: true
 
-  # Hosts Rancher is permitted to download the driver from. GitHub's release
-  # redirect chain crosses all three of these; omitting any one leaves the
-  # driver stuck in `Downloading`. Replace the list entirely when self-hosting.
+  # Hosts Rancher is permitted to reach on the driver's behalf. This gates two
+  # unrelated things:
+  #
+  #  1. Downloading the binary. GitHub's release redirect chain crosses all
+  #     three hosts below; omitting any one leaves the driver stuck in
+  #     `Downloading`. Replace them when self-hosting the binary.
+  #  2. The UI extension's `/meta/proxy` calls to the PVE API — "Test
+  #     Connection" on the cloud credential and the template/storage/bridge
+  #     dropdowns. **Add your PVE host here** (hostname only, no port and no
+  #     scheme: `pve.example.com`, not `https://pve.example.com:8006`, since
+  #     Rancher matches the URL's hostname). Without it Test Connection fails
+  #     with "Rancher could not reach the Proxmox VE server".
+  #
+  # Wildcards are supported by Rancher (`*.example.com`).
   whitelistDomains:
     - github.com
     - objects.githubusercontent.com
     - release-assets.githubusercontent.com
+    # - pve.example.com
 
   # UI extension bundle for the driver's icon and custom form. Empty means
   # Rancher renders a generic gear icon and derives the form from the driver's

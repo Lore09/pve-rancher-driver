@@ -50,7 +50,7 @@ correctly without needing `kubectl`.
 | `nodeDriver.version` | chart `appVersion` | Override only to pin an older binary against a newer chart |
 | `nodeDriver.checksum` | *(written by CI)* | SHA-256 of the binary. Do not edit by hand |
 | `nodeDriver.checksumFor` | *(written by CI)* | Version the checksum belongs to; a mismatch blocks rendering |
-| `nodeDriver.whitelistDomains` | 3 GitHub hosts | Replace entirely when self-hosting the binary |
+| `nodeDriver.whitelistDomains` | 3 GitHub hosts | Replace the GitHub entries when self-hosting the binary. **Append your PVE hostname** (no port, no scheme) so the UI extension's Test Connection and dropdowns can reach the PVE API through Rancher's proxy |
 | `nodeDriver.active` | `true` | Whether the driver is enabled |
 | `nodeDriver.uiUrl` | `""` | UI extension bundle. Empty means a generic icon and a form derived from the driver's flags |
 | `release.baseUrl` | GitHub releases | Point at an internal mirror for air-gapped installs |
@@ -97,6 +97,39 @@ helm install pve-rancher-driver deploy/chart -n cattle-system --take-ownership
 
 Adopting is the safer option on a live system — it leaves the driver in place,
 so clusters mid-provisioning are undisturbed.
+
+## Allow-listing your PVE host
+
+The UI extension talks to the PVE API through Rancher's `/meta/proxy`, and that
+proxy only forwards to hosts in the driver's `whitelistDomains`. Until your PVE
+host is listed, **Test Connection** on the cloud credential fails with *"Rancher
+could not reach the Proxmox VE server"* and the template/storage/bridge
+dropdowns stay empty:
+
+```bash
+helm upgrade pve-rancher-driver deploy/chart -n cattle-system --reuse-values \
+  --set 'nodeDriver.whitelistDomains={github.com,objects.githubusercontent.com,release-assets.githubusercontent.com,pve.example.com}'
+```
+
+Pass the **whole list**. Helm's `--set nodeDriver.whitelistDomains[3]=…`
+replaces the list instead of appending to it, leaving the three GitHub entries
+rendered as empty strings — which breaks the binary download.
+
+Use the **hostname only** — no scheme and no `:8006`; Rancher matches the URL's
+hostname, so `pve.example.com:8006` never matches. Wildcards (`*.example.com`)
+work. Note the driver binary itself does not go through this proxy, so a driver
+that downloaded fine can still fail here.
+
+No reinstall is needed — the `NodeDriver` is a live resource and can also be
+edited in place:
+
+```bash
+kubectl patch nodedriver.management.cattle.io pve --type=json \
+  -p '[{"op":"add","path":"/spec/whitelistDomains/-","value":"pve.example.com"}]'
+```
+
+If you edit it in place, add the host to your Helm values too, or the next
+`helm upgrade` will revert it.
 
 ## Air-gapped / self-hosted binaries
 
