@@ -10,7 +10,18 @@ nodeDriver:
   # flag -> field mapping, so leave it alone unless you know why.
   name: pve
 
-  displayName: Proxmox VE
+  # Must stay equal to `name` above. Rancher's dashboard treats displayName as an
+  # *identifier*, not a label: the Cloud Credential type picker derives the
+  # provider id from spec.displayName, lowercases it, and then looks up both the
+  # `<id>credentialConfig` schema field and the UI extension's icon/translation
+  # under that id. A pretty value like "Proxmox VE" becomes the id "proxmox ve",
+  # which matches no schema field and no extension registration — the driver then
+  # shows up unstyled, or not at all.
+  #
+  # The human-readable name lives in the UI extension instead, as the
+  # `cluster.provider.pve` translation key in pve-rancher-ui-extension. That is
+  # the only place it should be set.
+  displayName: pve
   description: Provision RKE2/K3s nodes as Proxmox VE virtual machines cloned from a template
 
   # Driver version to download. Empty means "use the chart's appVersion", which
