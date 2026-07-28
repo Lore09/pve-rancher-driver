@@ -57,10 +57,27 @@ Makefile                         build / cross-compile / checksums
 
 Create a dedicated user and a token, then grant a least-privilege role **to
 both the user and the token** (PVE tokens do not inherit the user's ACLs
-unless `--privsep 0` is set):
+unless `--privsep 0` is set). The required privilege set differs between
+PVE majors: PVE 9.x replaced the broad `VM.Monitor` with the more narrowly
+scoped `VM.GuestAgent.Audit` for reading guest-agent data. The driver
+probes the live server version in `PreCreateCheck` and only accepts the
+matching set.
+
+**PVE 9.x** (and later):
+
+```bash
+pveum role add RancherPVENode -privs "VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate"
+```
+
+**PVE 8.x** (still supported until its EOL on 2026-08-31):
 
 ```bash
 pveum role add RancherPVENode -privs "VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.Monitor,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate"
+```
+
+Then, for either version:
+
+```bash
 pveum user add rancher@pve
 pveum user token add rancher@pve machine
 pveum acl modify / -user rancher@pve -role RancherPVENode
@@ -70,6 +87,10 @@ pveum acl modify / -token 'rancher@pve!machine' -role RancherPVENode
 The driver's `pve-api-token-id` is `rancher@pve!machine`; the
 `pve-api-token-secret` is printed once by `pveum user token add` — save it,
 it is not shown again.
+
+> If you have a single role already defined and want to cover both PVE 8 and
+> 9 clusters, grant the union (both `VM.Monitor` and `VM.GuestAgent.Audit`).
+> The extra priv is harmless on the version that does not require it.
 
 ### VM template
 
