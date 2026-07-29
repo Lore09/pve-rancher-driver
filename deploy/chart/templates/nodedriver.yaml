@@ -52,9 +52,20 @@ metadata:
     # credential and per-machine-pool template options. Field names are the
     # driver flag minus its `pve-` prefix, camelCased
     # (e.g. `pve-api-url` -> `apiUrl`).
-    publicCredentialFields: "apiUrl,apiTokenId"
+    #
+    # apiInsecure and caCert are listed as public credential fields, not under
+    # `optionalCredentialFields`. That annotation is accepted by the API but
+    # Rancher does not build the credential schema from it: with the fields
+    # listed there, `kubectl get dynamicschema pvecredentialconfig` showed only
+    # apiUrl/apiTokenId/apiTokenSecret, so the UI could write the TLS settings
+    # and the API silently dropped them on save. The symptom was provisioning
+    # failing with "x509: certificate signed by unknown authority" no matter
+    # what the credential form was told.
+    #
+    # They are "public" in the sense Rancher means: stored in the credential
+    # but not secret. Neither a CA certificate nor a boolean is sensitive.
+    publicCredentialFields: "apiUrl,apiTokenId,apiInsecure,caCert"
     privateCredentialFields: "apiTokenSecret"
-    optionalCredentialFields: "apiInsecure,caCert"
     passwordFields: "apiTokenSecret"
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
