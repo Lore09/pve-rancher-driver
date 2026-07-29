@@ -515,13 +515,7 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		NetMTU:      d.NetMTU,
 		NetFirewall: firewall,
 	}
-	// The cloud-init user and the SSH user are the same account by definition:
-	// cloud-init installs the keys for `ciuser`, and that is the only account
-	// the driver or Rancher can then log into. Defaulting one from the other
-	// removes a whole class of "provisions fine, never reaches Ready" failures.
-	if opts.CIUser == "" {
-		opts.CIUser = d.SSHUser
-	}
+	opts.CIUser = d.resolveCIUser()
 	if d.CloudInit {
 		keys, err := d.combinedSSHKeys()
 		if err != nil {
@@ -585,6 +579,20 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		}
 	}
 	return nil
+}
+
+// resolveCIUser returns the account cloud-init should create and configure.
+//
+// The cloud-init user and the SSH user are the same account by definition:
+// cloud-init installs the SSH keys for `ciuser`, and that is the only account
+// the driver or Rancher can subsequently log into. Deriving one from the other
+// removes a whole class of "provisions fine, never reaches Ready" failures
+// caused by the two fields drifting apart.
+func (d *Driver) resolveCIUser() string {
+	if ciuser := strings.TrimSpace(d.CIUser); ciuser != "" {
+		return ciuser
+	}
+	return d.SSHUser
 }
 
 // resolveVMName builds the name given to the PVE VM: the machine name Rancher
