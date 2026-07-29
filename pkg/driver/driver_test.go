@@ -92,3 +92,110 @@ func TestPreCreateCheckRejectsNetOptionsWithoutBridge(t *testing.T) {
 		})
 	}
 }
+
+func TestPreCreateCheckDataDiskValidation(t *testing.T) {
+	base := func() *Driver {
+		return &Driver{
+			APIUrl:         "https://pve.example:8006/api2/json",
+			APITokenID:     "rancher@pve!machine",
+			APITokenSecret: "secret",
+			TemplateVMID:   9000,
+			SkipPermCheck:  true,
+			CloudInit:      true,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*Driver)
+		wantMsg string
+	}{
+		{
+			name:    "invalid entry is rejected",
+			mutate:  func(d *Driver) { d.DataDiskEntries = []string{"size=10"} },
+			wantMsg: "storage is required",
+		},
+		{
+			name: "mounting disk without cloud-init is rejected",
+			mutate: func(d *Driver) {
+				d.CloudInit = false
+				d.DataDiskEntries = []string{"size=10,storage=local-lvm,fs=ext4,mount=/data"}
+			},
+			wantMsg: "--pve-cloudinit",
+		},
+		{
+			name: "fs=none disk without cloud-init is allowed",
+			mutate: func(d *Driver) {
+				d.CloudInit = false
+				d.DataDiskEntries = []string{"size=10,storage=local-lvm,fs=none"}
+			},
+			wantMsg: "",
+		},
+		{
+			name:    "valid mounting disk with cloud-init is allowed",
+			mutate:  func(d *Driver) { d.DataDiskEntries = []string{"size=10,storage=local-lvm,fs=ext4,mount=/data"} },
+			wantMsg: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := base()
+			tt.mutate(d)
+			err := d.PreCreateCheck()
+			if tt.wantMsg != "" {
+				if err == nil {
+					t.Fatalf("PreCreateCheck() = nil error, want one mentioning %q", tt.wantMsg)
+				}
+				if !strings.Contains(err.Error(), tt.wantMsg) {
+					t.Fatalf("PreCreateCheck() error = %q, want it to mention %q", err, tt.wantMsg)
+				}
+				return
+			}
+			// PreCreateCheck goes on to dial a nonexistent PVE API, so a nil error
+			// is not expected. Assert only that it got past disk validation.
+			if err != nil {
+				for _, s := range []string{"--pve-data-disk", "--pve-cloudinit"} {
+					if strings.Contains(err.Error(), s) {
+						t.Fatalf("PreCreateCheck() failed disk validation unexpectedly: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// PreCreateCheck must leave the parsed specs on the driver so Create does not
+// have to parse the entries a second time.
+func TestPreCreateCheckStoresParsedDataDisks(t *testing.T) {
+	d := &Driver{
+		APIUrl:          "https://pve.example:8006/api2/json",
+		APITokenID:      "rancher@pve!machine",
+		APITokenSecret:  "secret",
+		TemplateVMID:    9000,
+		SkipPermCheck:   true,
+		CloudInit:       true,
+		DataDiskEntries: []string{"size=10,storage=local-lvm,fs=ext4,mount=/data"},
+	}
+	_ = d.PreCreateCheck()
+	if len(d.DataDisks) != 1 || d.DataDisks[0].Label != "pvedata1" {
+		t.Fatalf("PreCreateCheck() left DataDisks = %+v, want one spec labelled pvedata1", d.DataDisks)
+	}
+}
+
+func TestGetCreateFlagsContainsDataDiskFlags(t *testing.T) {
+	names := map[string]bool{}
+	for _, f := range (&Driver{}).GetCreateFlags() {
+		names[f.String()] = true
+	}
+	for _, want := range []string{"pve-data-disk", "pve-boot-disk-size", "pve-disk-setup-timeout"} {
+		if !names[want] {
+			t.Errorf("GetCreateFlags() is missing %q", want)
+		}
+	}
+	for _, gone := range []string{"pve-disk", "pve-extra-disk-size", "pve-extra-disk-storage"} {
+		if names[gone] {
+			t.Errorf("GetCreateFlags() still declares removed flag %q", gone)
+		}
+	}
+}

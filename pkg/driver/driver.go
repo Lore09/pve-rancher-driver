@@ -31,10 +31,14 @@ const (
 	// boots of cloud images can take a couple of minutes.
 	defaultAgentTimeout = 5 * time.Minute
 	// defaultBootDiskDevice is the PVE config key of the disk grown by
-	// --pve-disk. scsi0 matches the templates produced by the template
+	// --pve-boot-disk-size. scsi0 matches the templates produced by the template
 	// preparation guide; templates booting from virtio0/sata0 must override it.
 	defaultBootDiskDevice = "scsi0"
-	defaultNetModel       = "virtio"
+	// defaultDiskSetupTimeout bounds the whole SSH-plus-guest-setup phase for
+	// data disks. It is separate from the agent timeout because it starts only
+	// once an IP is known, and covers mkfs on disks that can be large.
+	defaultDiskSetupTimeout = 5 * time.Minute
+	defaultNetModel         = "virtio"
 )
 
 // Driver is the libmachine Driver implementation backed by Proxmox VE.
@@ -53,9 +57,10 @@ type Driver struct {
 	Cores            int
 	Sockets          int
 	MemoryMB         int
-	DiskGB           int
-	ExtraDiskSize    int
-	ExtraDiskStorage string
+	BootDiskGB       int
+	DataDiskEntries  []string
+	DataDisks        []proxmox.DiskSpec
+	DiskSetupTimeout time.Duration
 	BootDiskDevice   string
 	NetIface         string
 	NetDevice        string
@@ -90,14 +95,15 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		VMName:         hostName,
 		Cores:          2,
 		Sockets:        1,
-		MemoryMB:       2048,
-		DiskGB:         0,
-		BootDiskDevice: defaultBootDiskDevice,
-		NetDevice:      "net0",
-		NetModel:       defaultNetModel,
-		IPConfig:       "ip=dhcp",
-		Onboot:         false,
-		AgentTimeout:   defaultAgentTimeout,
+		MemoryMB:         2048,
+		BootDiskGB:       0,
+		BootDiskDevice:   defaultBootDiskDevice,
+		NetDevice:        "net0",
+		NetModel:         defaultNetModel,
+		IPConfig:         "ip=dhcp",
+		Onboot:           false,
+		AgentTimeout:     defaultAgentTimeout,
+		DiskSetupTimeout: defaultDiskSetupTimeout,
 	}
 }
 
@@ -172,27 +178,27 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  2048,
 		},
 		mcnflag.IntFlag{
-			Name:   "pve-disk",
-			EnvVar: "PVE_DISK",
+			Name:   "pve-boot-disk-size",
+			EnvVar: "PVE_BOOT_DISK_SIZE",
 			Usage:  "Grow the cloned boot disk to this size in GB (0 = keep the template's size). PVE can only grow a disk, never shrink it",
 			Value:  0,
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-boot-disk-device",
 			EnvVar: "PVE_BOOT_DISK_DEVICE",
-			Usage:  "PVE config key of the boot disk grown by pve-disk, e.g. scsi0, virtio0, sata0",
+			Usage:  "PVE config key of the boot disk grown by pve-boot-disk-size, e.g. scsi0, virtio0, sata0",
 			Value:  defaultBootDiskDevice,
 		},
-		mcnflag.IntFlag{
-			Name:   "pve-extra-disk-size",
-			EnvVar: "PVE_EXTRA_DISK_SIZE",
-			Usage:  "Attach an extra blank disk of this size in GB (0 = none). Use for Longhorn or other storage provisioners",
-			Value:  0,
+		mcnflag.StringSliceFlag{
+			Name:   "pve-data-disk",
+			EnvVar: "PVE_DATA_DISK",
+			Usage:  "Data disk to attach, repeatable. Comma-separated key=value pairs: size=<GB>,storage=<pve-storage>[,fs=ext4|xfs|none][,mount=<abs path>][,label=<name>][,device=scsi1..scsi30][,discard=on|off][,iothread=0|1][,backup=0|1]. Unless fs=none, the driver formats the disk and mounts it at mount= over SSH once the VM is up",
 		},
-		mcnflag.StringFlag{
-			Name:   "pve-extra-disk-storage",
-			EnvVar: "PVE_EXTRA_DISK_STORAGE",
-			Usage:  "PVE storage for the extra disk, e.g. local-lvm (required when pve-extra-disk-size > 0)",
+		mcnflag.IntFlag{
+			Name:   "pve-disk-setup-timeout",
+			EnvVar: "PVE_DISK_SETUP_TIMEOUT",
+			Usage:  "Seconds to wait for SSH plus formatting and mounting of the data disks",
+			Value:  int(defaultDiskSetupTimeout / time.Second),
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-net-iface",
@@ -305,13 +311,12 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.Cores = flags.Int("pve-cores")
 	d.Sockets = flags.Int("pve-sockets")
 	d.MemoryMB = flags.Int("pve-memory")
-	d.DiskGB = flags.Int("pve-disk")
+	d.BootDiskGB = flags.Int("pve-boot-disk-size")
 	d.BootDiskDevice = flags.String("pve-boot-disk-device")
 	if d.BootDiskDevice == "" {
 		d.BootDiskDevice = defaultBootDiskDevice
 	}
-	d.ExtraDiskSize = flags.Int("pve-extra-disk-size")
-	d.ExtraDiskStorage = flags.String("pve-extra-disk-storage")
+	d.DataDiskEntries = flags.StringSlice("pve-data-disk")
 	d.NetIface = flags.String("pve-net-iface")
 	d.NetDevice = flags.String("pve-net-device")
 	if d.NetDevice == "" {
@@ -334,6 +339,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		d.AgentTimeout = time.Duration(timeoutSec) * time.Second
 	} else {
 		d.AgentTimeout = defaultAgentTimeout
+	}
+	if setupSec := flags.Int("pve-disk-setup-timeout"); setupSec > 0 {
+		d.DiskSetupTimeout = time.Duration(setupSec) * time.Second
+	} else {
+		d.DiskSetupTimeout = defaultDiskSetupTimeout
 	}
 	d.SSHUser = flags.String("ssh-user")
 	d.SSHPort = flags.Int("ssh-port")
@@ -361,11 +371,23 @@ func (d *Driver) PreCreateCheck() error {
 	if d.TemplateVMID == 0 {
 		return errors.New("pve: --pve-template-vmid is required to clone a VM")
 	}
-	if d.ExtraDiskSize > 0 && d.ExtraDiskStorage == "" {
-		return errors.New("pve: --pve-extra-disk-storage is required when --pve-extra-disk-size > 0")
-	}
-	if _, err := parseNetFirewall(d.NetFirewall); err != nil {
+	disks, err := ParseDataDisks(d.DataDiskEntries)
+	if err != nil {
 		return err
+	}
+	d.DataDisks = disks
+	// Formatting and mounting happens over SSH with the keypair cloud-init
+	// injects, so a mounting disk without cloud-init could never be set up.
+	// Failing here beats cloning a VM the driver cannot finish.
+	if !d.CloudInit {
+		for _, disk := range disks {
+			if disk.NeedsGuestSetup() {
+				return fmt.Errorf("pve: --pve-cloudinit is required to format and mount %s: the driver needs the injected SSH key to reach the guest (use fs=none to attach the disk raw instead)", disk.Mount)
+			}
+		}
+	}
+	if _, ferr := parseNetFirewall(d.NetFirewall); ferr != nil {
+		return ferr
 	}
 	// The pve-net-* knobs are only ever applied as part of rewriting the net
 	// device, which is gated on a bridge being named. Silently ignoring them
@@ -461,9 +483,9 @@ func (d *Driver) Create() error {
 	return nil
 }
 
-// finalizeCreate runs the post-clone steps (Configure + optional extra disk
-// + start + NIC MAC capture used by IP discovery). Broken out so the rollback
-// in Create covers every failure mode with one cleanup path.
+// finalizeCreate runs the post-clone steps (Configure + data disks + start +
+// NIC MAC capture used by IP discovery + guest-side disk setup). Broken out so
+// the rollback in Create covers every failure mode with one cleanup path.
 func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	onboot := d.Onboot
 	firewall, err := parseNetFirewall(d.NetFirewall)
@@ -501,21 +523,23 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		return err
 	}
 
-	// Grow the boot disk before AddDisk: AddDisk picks the first free scsi<N>
-	// slot, so resizing the existing boot disk first keeps that scan honest.
-	if d.DiskGB > 0 {
-		if err := d.client.ResizeBootDisk(ctx, d.VMID, d.BootDiskDevice, d.DiskGB); err != nil {
+	// Grow the boot disk before AddDisks: slot allocation scans the live config
+	// for free scsi<N> keys, so resizing the existing boot disk first keeps that
+	// scan honest.
+	if d.BootDiskGB > 0 {
+		if err := d.client.ResizeBootDisk(ctx, d.VMID, d.BootDiskDevice, d.BootDiskGB); err != nil {
 			return err
 		}
-		log.Infof("pve: grew boot disk %s of VM %d to %dGB", d.BootDiskDevice, d.VMID, d.DiskGB)
+		log.Infof("pve: grew boot disk %s of VM %d to %dGB", d.BootDiskDevice, d.VMID, d.BootDiskGB)
 	}
 
-	if d.ExtraDiskSize > 0 {
-		slot, err := d.client.AddDisk(ctx, d.VMID, d.ExtraDiskStorage, d.ExtraDiskSize)
-		if err != nil {
-			return err
-		}
-		log.Infof("pve: attached %dGB extra disk as %s on storage %q", d.ExtraDiskSize, slot, d.ExtraDiskStorage)
+	attached, err := d.client.AddDisks(ctx, d.VMID, d.DataDisks)
+	if err != nil {
+		return err
+	}
+	for _, disk := range attached {
+		log.Infof("pve: attached %dGB data disk as %s on storage %q (serial %s)",
+			disk.Spec.Size, disk.Device, disk.Spec.Storage, disk.Spec.Label)
 	}
 
 	if err := d.client.Start(ctx, d.VMID); err != nil {
@@ -532,6 +556,19 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	} else {
 		d.NetMAC = mac
 		log.Infof("pve: VM %d uses MAC %s on %s", d.VMID, mac, d.NetDevice)
+	}
+
+	// Data disks are set up over SSH, so the address has to be resolved here
+	// rather than left to the GetIP call libmachine makes after Create.
+	if len(d.DataDisks) > 0 {
+		ip, err := d.waitUntilGuestIP(ctx)
+		if err != nil {
+			return err
+		}
+		d.IPAddress = ip
+		if err := d.setupGuestDisks(attached); err != nil {
+			return err
+		}
 	}
 	return nil
 }
