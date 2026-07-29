@@ -60,6 +60,7 @@ type Driver struct {
 	CACertPEM        string
 	Node             string
 	VMID             int
+	VMIDRange        string
 	TemplateVMID     int
 	VMNamePrefix     string
 	Cores            int
@@ -155,6 +156,11 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Explicit VMID to assign to the created VM. 0 = auto assigned",
 			Value:  0,
 		},
+		mcnflag.StringFlag{
+			Name:   "pve-vmid-range",
+			EnvVar: "PVE_VMID_RANGE",
+			Usage:  "Allocate the VM's ID from this inclusive range, e.g. 200-299. Empty lets Proxmox pick the next free id cluster-wide. Ignored when pve-vmid is set",
+		},
 		mcnflag.IntFlag{
 			Name:   "pve-template-vmid",
 			EnvVar: "PVE_TEMPLATE_VMID",
@@ -162,8 +168,8 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  0,
 		},
 		mcnflag.StringFlag{
-			Name:   "pve-vmname-prefix",
-			EnvVar: "PVE_VMNAME_PREFIX",
+			Name:   "pve-vm-name-prefix",
+			EnvVar: "PVE_VM_NAME_PREFIX",
 			Usage:  "Prefix prepended to the PVE VM name as <prefix>-<machine name>. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name",
 		},
 		mcnflag.IntFlag{
@@ -288,15 +294,21 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "PVE_KEEP_ON_FAILURE",
 			Usage:  "Leave the cloned VM in place when Create fails (standalone CLI debugging only)",
 		},
+		// These MUST keep the pve- prefix. Rancher derives a machine-config
+		// field name by splitting a flag on its first dash and discarding what
+		// precedes it, assuming that part is the driver name — so a flag named
+		// `ssh-port` becomes the field `port`, and Rancher then passes it back
+		// as `--pve-port`, which this driver does not define. Provisioning fails
+		// with "flag provided but not defined: -pve-port".
 		mcnflag.StringFlag{
-			Name:   "ssh-user",
-			EnvVar: "SSH_USER",
-			Usage:  "SSH user used to log into the VM",
+			Name:   "pve-ssh-user",
+			EnvVar: "PVE_SSH_USER",
+			Usage:  "SSH user used to log into the VM. Must be the account that exists in the guest (debian, rancher, ...)",
 			Value:  defaultSSHUser,
 		},
 		mcnflag.IntFlag{
-			Name:   "ssh-port",
-			EnvVar: "SSH_PORT",
+			Name:   "pve-ssh-port",
+			EnvVar: "PVE_SSH_PORT",
 			Usage:  "SSH port used to log into the VM",
 			Value:  22,
 		},
@@ -313,8 +325,9 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.CACertPEM = flags.String("pve-ca-cert")
 	d.Node = flags.String("pve-node")
 	d.VMID = flags.Int("pve-vmid")
+	d.VMIDRange = strings.TrimSpace(flags.String("pve-vmid-range"))
 	d.TemplateVMID = flags.Int("pve-template-vmid")
-	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vmname-prefix"))
+	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vm-name-prefix"))
 	d.Cores = flags.Int("pve-cores")
 	d.Sockets = flags.Int("pve-sockets")
 	d.MemoryMB = flags.Int("pve-memory")
@@ -352,8 +365,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	} else {
 		d.DiskSetupTimeout = defaultDiskSetupTimeout
 	}
-	d.SSHUser = flags.String("ssh-user")
-	d.SSHPort = flags.Int("ssh-port")
+	d.SSHUser = flags.String("pve-ssh-user")
+	d.SSHPort = flags.Int("pve-ssh-port")
 	d.SetSwarmConfigFromFlags(flags)
 	return nil
 }
@@ -380,6 +393,12 @@ func (d *Driver) PreCreateCheck() error {
 	}
 	if err := d.validateVMNamePrefix(); err != nil {
 		return err
+	}
+	if _, _, err := parseVMIDRange(d.VMIDRange); err != nil {
+		return err
+	}
+	if d.VMIDRange != "" && d.VMID != 0 {
+		return fmt.Errorf("pve: --pve-vmid %d and --pve-vmid-range %q are mutually exclusive; an explicit id makes the range meaningless (and cannot work for a pool of more than one machine)", d.VMID, d.VMIDRange)
 	}
 	disks, err := ParseDataDisks(d.DataDiskEntries)
 	if err != nil {
@@ -471,7 +490,7 @@ func (d *Driver) Create() error {
 		return err
 	}
 
-	assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, d.VMID, vmName)
+	assigned, err := d.cloneFromTemplate(ctx, vmName)
 	if err != nil {
 		return err
 	}
@@ -581,6 +600,59 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	return nil
 }
 
+// vmidClaimAttempts bounds the retry loop below. Each attempt costs one
+// /cluster/resources call plus a failed clone, so a handful is plenty: the
+// window being retried is the few hundred milliseconds between picking an id
+// and Proxmox writing the config file.
+const vmidClaimAttempts = 5
+
+// cloneFromTemplate clones the template into a VMID chosen according to the
+// pve-vmid / pve-vmid-range settings.
+//
+// With no range configured this is a straight passthrough: Proxmox picks via
+// /cluster/nextid. With a range, the driver picks the lowest free id itself —
+// and because "free" is only true until someone else takes it, a pool creating
+// several machines at once will occasionally lose the race. That case is
+// retried rather than surfaced, since it is expected rather than exceptional.
+func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, error) {
+	minID, maxID, err := parseVMIDRange(d.VMIDRange)
+	if err != nil {
+		return 0, err
+	}
+	if d.VMID != 0 || d.VMIDRange == "" {
+		return d.client.CloneFromTemplate(ctx, d.TemplateVMID, d.VMID, vmName)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= vmidClaimAttempts; attempt++ {
+		id, err := d.client.NextFreeVMID(ctx, minID, maxID)
+		if err != nil {
+			return 0, err
+		}
+		assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, id, vmName)
+		if err == nil {
+			return assigned, nil
+		}
+		if !isVMIDTakenError(err) {
+			return 0, err
+		}
+		lastErr = err
+		log.Warnf("pve: VMID %d was claimed by someone else between selection and clone (attempt %d/%d); picking another",
+			id, attempt, vmidClaimAttempts)
+	}
+	return 0, fmt.Errorf("pve: could not claim a free VMID in %s after %d attempts: %w", d.VMIDRange, vmidClaimAttempts, lastErr)
+}
+
+// isVMIDTakenError reports whether a clone failed purely because the chosen
+// VMID was taken in the meantime.
+//
+// This matches on Proxmox's error text, which is fragile — but the alternative
+// is retrying every clone failure, which would turn a genuine error (missing
+// template, no space on the storage) into five identical ones.
+func isVMIDTakenError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
 // resolveCIUser returns the account cloud-init should create and configure.
 //
 // The cloud-init user and the SSH user are the same account by definition:
@@ -617,10 +689,10 @@ func (d *Driver) validateVMNamePrefix() error {
 		return nil
 	}
 	if !vmNamePrefixPattern.MatchString(prefix) {
-		return fmt.Errorf("pve: --pve-vmname-prefix %q must contain only letters, digits and inner hyphens (PVE validates the VM name as a DNS name)", prefix)
+		return fmt.Errorf("pve: --pve-vm-name-prefix %q must contain only letters, digits and inner hyphens (PVE validates the VM name as a DNS name)", prefix)
 	}
 	if n := len(d.resolveVMName()); n > maxVMNameLen {
-		return fmt.Errorf("pve: --pve-vmname-prefix %q makes the VM name %d characters long, over the %d-character DNS label limit; use a shorter prefix", prefix, n, maxVMNameLen)
+		return fmt.Errorf("pve: --pve-vm-name-prefix %q makes the VM name %d characters long, over the %d-character DNS label limit; use a shorter prefix", prefix, n, maxVMNameLen)
 	}
 	return nil
 }

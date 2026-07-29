@@ -269,7 +269,7 @@ func TestPreCreateCheckVMNamePrefix(t *testing.T) {
 	for _, prefix := range []string{"", "k8s", "prod1", "a", "my-cluster"} {
 		t.Run("accepts "+prefix, func(t *testing.T) {
 			err := base(prefix).PreCreateCheck()
-			if err != nil && strings.Contains(err.Error(), "--pve-vmname-prefix") {
+			if err != nil && strings.Contains(err.Error(), "--pve-vm-name-prefix") {
 				t.Fatalf("PreCreateCheck() rejected valid prefix %q: %v", prefix, err)
 			}
 		})
@@ -300,5 +300,54 @@ func TestResolveCIUser(t *testing.T) {
 				t.Errorf("resolveCIUser() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// Rancher derives a machine-config field name from a flag by splitting on the
+// first dash and discarding what precedes it, assuming that part is the driver
+// name. A flag named `ssh-port` therefore becomes the field `port`, which
+// Rancher passes back as `--pve-port` — a flag this driver does not define, so
+// provisioning dies with "flag provided but not defined: -pve-port".
+//
+// Every flag must therefore carry the pve- prefix. This is invisible until a
+// real cluster is provisioned, which is why it is asserted here.
+func TestAllCreateFlagsUsePveDriverPrefix(t *testing.T) {
+	for _, f := range (&Driver{}).GetCreateFlags() {
+		name := f.String()
+		if !strings.HasPrefix(name, "pve-") {
+			t.Errorf("flag %q lacks the pve- prefix: Rancher would rename it to %q and pass back --pve-%s",
+				name, strings.SplitN(name, "-", 2)[1], strings.SplitN(name, "-", 2)[1])
+		}
+	}
+}
+
+// The field names Rancher derives are what the UI extension binds to, so they
+// are part of the contract with pve-rancher-ui-extension.
+func TestCreateFlagsDeriveExpectedFieldNames(t *testing.T) {
+	// Rancher: strip up to the first dash, then lower-camel-case the rest.
+	fieldName := func(flag string) string {
+		rest := strings.SplitN(flag, "-", 2)[1]
+		parts := strings.Split(rest, "-")
+		out := parts[0]
+		for _, p := range parts[1:] {
+			if p != "" {
+				out += strings.ToUpper(p[:1]) + p[1:]
+			}
+		}
+		return out
+	}
+
+	got := map[string]bool{}
+	for _, f := range (&Driver{}).GetCreateFlags() {
+		got[fieldName(f.String())] = true
+	}
+
+	for _, want := range []string{
+		"templateVmid", "dataDisk", "netBridge", "cloudinit",
+		"sshUser", "sshPort", "vmNamePrefix", "bootDiskSize",
+	} {
+		if !got[want] {
+			t.Errorf("no flag derives the machine-config field %q that the UI extension binds to", want)
+		}
 	}
 }
