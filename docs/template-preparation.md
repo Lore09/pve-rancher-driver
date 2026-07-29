@@ -79,8 +79,12 @@ qm create $TMPL --name debian-13-tmpl --memory 2048 --cores 2 \
   --scsihw virtio-scsi-single --agent 1 \
   --serial0 socket --vga serial0 --ostype l26
 
+# Import the image, then attach whatever volume PVE actually created. Do not
+# hardcode the volume name: block storages (LVM/ZFS/Ceph) name it
+# `vm-9000-disk-0`, while directory storages use `9000/vm-9000-disk-0.qcow2`.
+# importdisk registers it as `unused0`, so read it back from the config.
 qm importdisk $TMPL debian-13-genericcloud-amd64.qcow2 $STORAGE
-qm set $TMPL --scsi0 $STORAGE:vm-$TMPL-disk-0,discard=on,ssd=1 \
+qm set $TMPL --scsi0 "$(qm config $TMPL | sed -n 's/^unused0: //p'),discard=on,ssd=1" \
   --boot order=scsi0
 qm set $TMPL --ide2 $STORAGE:cloudinit
 ```
@@ -99,6 +103,14 @@ Notes:
 - `--ide2 $STORAGE:cloudinit` attaches the cloud-init drive (requirement 2). The
   storage must have the **Images** content type enabled — `pvesm status` lists
   what each one allows.
+- **Storage type changes the volume name**, which is why `--scsi0` reads it back
+  from `unused0` instead of naming it. A block storage (LVM-thin, ZFS, Ceph)
+  produces `vm-9000-disk-0`; a directory storage produces
+  `9000/vm-9000-disk-0.qcow2`. Hardcoding either one fails on the other with
+  `unable to parse directory volume name`.
+- On PVE 8 and later you can do both steps at once and skip `importdisk`
+  entirely, letting PVE name the volume:
+  `qm set $TMPL --scsi0 $STORAGE:0,import-from=/abs/path/to/image.qcow2,discard=on,ssd=1`
 - `vmbr0` must be a bridge whose network hands out DHCP leases, unless you
   plan to pass static `--pve-ipconfig` per node.
 - Do **not** set `--ciuser` for Debian: the image's default `debian` user is
@@ -160,7 +172,9 @@ qm create $TMPL --name leapmicro-62-tmpl --memory 2048 --cores 2 \
   --serial0 socket --vga serial0 --ostype l26
 
 qm importdisk $TMPL openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 $STORAGE
-qm set $TMPL --scsi0 $STORAGE:vm-$TMPL-disk-0,discard=on,ssd=1 \
+# See Option A: the volume name differs per storage type, so attach the volume
+# importdisk registered as `unused0` rather than guessing its name.
+qm set $TMPL --scsi0 "$(qm config $TMPL | sed -n 's/^unused0: //p'),discard=on,ssd=1" \
   --boot order=scsi0
 qm set $TMPL --ide2 $STORAGE:cloudinit
 qm set $TMPL --ciuser rancher
