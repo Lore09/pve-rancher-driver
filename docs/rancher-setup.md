@@ -1,200 +1,35 @@
 # Integrating the `pve` node driver with Rancher
 
-This walks the whole path from a built driver binary to a working RKE2/K3s
-cluster whose nodes are Proxmox VE VMs. It assumes:
+From an installed driver to a working RKE2/K3s cluster whose nodes are Proxmox
+VE VMs: the cloud credential, the machine-pool fields, and what to do when a
+node does not come up. It assumes:
 
-- Rancher **v2.x** (management.cattle.io/v3 NodeDriver support) and `kubectl`
-  access to the **local** (management) cluster.
-- A Proxmox VE cluster reachable from the Rancher pods, with the API token
-  from the [README](../README.md#prepare-proxmox-ve) and a template from
+- Rancher **2.10+** and `kubectl` access to the **local** (management) cluster.
+- The driver and UI extension installed ([README](../README.md#install)).
+- A Proxmox VE cluster reachable from the Rancher pods, with the API token from
+  the [README](../README.md#prepare-proxmox-ve) and a template from
   [template-preparation.md](template-preparation.md).
-- This repo checked out, or the release artifacts downloaded.
 
-## 1. Build (or fetch) the driver binary
+## Before you start
 
-Rancher downloads the driver binary from the URL in the NodeDriver resource,
-so it must be hosted somewhere the Rancher pods can reach — typically a
-GitHub release of this repo.
+The driver and the UI extension must already be installed — see the
+[README](../README.md#install) for the two-chart install, or
+[installation.md](installation.md) for the Helm/manifest/air-gapped routes and
+the chart values reference.
 
-```bash
-make dist          # produces dist/docker-machine-driver-pve-<os>-<arch> + checksums.txt
-cat dist/checksums.txt | grep linux-amd64
-```
-
-If you tag a release (`git tag v0.1.0 && git push origin v0.1.0`), the
-[release workflow](../.github/workflows/release.yml) does this for you and
-attaches a **pre-rendered `nodedriver-<version>.yaml`** to the GitHub release
-— if you use that file you can skip step 2 entirely.
-
-## 2. Register the driver in Rancher
-
-There are two supported paths. **Option A needs no `kubectl` and is
-recommended**; Option B is the explicit route for GitOps and for debugging.
-
-### Option A: add this repo as a Rancher Repository (recommended)
-
-Rancher can serve Helm charts straight out of a git repo — it clones the
-repository and, finding no `index.yaml`, discovers and packages chart
-directories itself. So there is nothing to publish: point Rancher at this
-repository and the chart appears.
-
-1. In the **local** cluster: **Apps → Repositories → Create**
-2. Choose **Git repository**, then:
-
-   | Field | Value |
-   |---|---|
-   | Name | `pve-rancher-driver` |
-   | Git Repo URL | `https://github.com/lore09/pve-rancher-driver.git` |
-   | Git Branch | `master` |
-
-3. **Apps → Charts**, pick **Proxmox VE Node Driver**, and install into the
-   `local` cluster. The namespace is pre-filled as **`cattle-system`** by the
-   chart; accept it. For an arm64 Rancher server, set `nodeDriver.arch` to
-   `linux-arm64` first.
-
-   The namespace is nearly arbitrary — a `NodeDriver` is cluster scoped, so the
-   namespace holds only Helm's release metadata — but `cattle-system` always
-   exists on the local cluster and will not be deleted out from under it.
-
-Why this is the recommended path: the chart sets `whitelistDomains`, which the
-**Add Node Driver** form does not expose (see the warning further down). That
-single omission is the most common cause of a driver stuck in `Downloading`
-forever, and the chart removes it entirely.
-
-Things worth knowing:
-
-- **The chart must go into the `local` cluster.** A `NodeDriver` is cluster
-  scoped and only meaningful on the management cluster. The chart refuses to
-  install where `management.cattle.io/v3` is not served, so a downstream
-  install fails loudly rather than silently doing nothing.
-- **Repositories refresh hourly by default** (`spec.refreshInterval`). A newly
-  released version will not appear immediately; use **Refresh** on the
-  repository to force it.
-- **`helm uninstall` leaves the driver behind** on purpose
-  (`helm.sh/resource-policy: keep`), so uninstalling the app cannot break node
-  scale-up on clusters still using it. See the
-  [chart README](../deploy/chart/README.md#uninstalling) to remove it fully.
-- **Never commit an `index.yaml` to this repo.** Rancher uses the shallowest
-  `index.yaml` it finds anywhere in the clone *instead of* discovering charts,
-  so a stray one would pin the catalog to stale versions. A symlink anywhere in
-  the repo is also fatal — Rancher rejects the whole repository.
-
-Chart values are documented in the [chart README](../deploy/chart/README.md),
-including air-gapped installs that mirror the binary internally.
-
-### Option B: apply the NodeDriver manifest with kubectl
-
-Edit [`deploy/nodedriver.yaml`](../deploy/nodedriver.yaml):
-
-| Placeholder | Replace with |
-|---|---|
-| `<VERSION>` | The release tag, e.g. `v0.1.1` |
-| `<SHA256>` | The sha256 of `docker-machine-driver-pve-linux-amd64` from `checksums.txt` |
-
-The release uploads **two distinct artifacts** with very different roles —
-**the `url` field must point to the binary, not the manifest**:
-
-| Release asset | What it is | Goes where |
-|---|---|---|
-| `docker-machine-driver-pve-linux-amd64` | The **driver binary** (executable) | `spec.url` + `spec.checksum` of the NodeDriver |
-| `docker-machine-driver-pve-linux-arm64`, `*-darwin-*` | Other arch/OS binaries | Not needed by Rancher |
-| `checksums.txt` | sha256s of every binary above | Used to fill `<SHA256>` |
-| `nodedriver-v<VERSION>.yaml` | The **rendered NodeDriver CRD** (this manifest, with `<VERSION>`/`<SHA256>` already substituted) | Applied with `kubectl apply -f` — **not** the `url` |
-
-So for any release later than `v0.1.1` (see the note below about why that one
-is unusable) the correct fields are:
-
-```yaml
-spec:
-  url: "https://github.com/Lore09/pve-rancher-driver/releases/download/v<x>/docker-machine-driver-pve-linux-amd64"
-  checksum: "<sha256 of docker-machine-driver-pve-linux-amd64 from that release's checksums.txt>"
-  whitelistDomains:
-    - github.com
-    - objects.githubusercontent.com
-    - release-assets.githubusercontent.com
-```
-
-> ⚠️ Pointing `url` at `nodedriver-v0.1.1.yaml` (the manifest) instead of the
-> binary is the **most common reason a driver sits in `Downloading`
-> forever**. The mistake usually comes in two parts:
->
-> - `spec.url` ends in `nodedriver-v0.1.1.yaml` instead of
->   `docker-machine-driver-pve-linux-amd64`, **and**
-> - `spec.checksum` is the sha256 of the YAML (e.g. for the v0.1.1 release the
->   YAML hashes to `867c3f58…df3f3`), not of the binary
->   (`26e408680add8f06e9d5c6fe09ddc6f873601aa19a0a122c8a8037d08d255ca4`) —
->   note the v0.1.1 release binary is **not downloadable** at all because of
->   the workflow bug fixed after v0.1.1, see the note below.
->
-> Rancher downloads whatever `url` names, computes its sha256, and compares it
-> to `checksum`. When the YAML matches its own checksum, the next stage
-> (execute as a binary) silently never completes — `state=downloading`,
-> `Downloaded=Unknown`. The fix is to point **both** fields at the binary.
-
-Then apply the manifest to Rancher's **local** cluster:
+Check the driver is registered before going further:
 
 ```bash
-kubectl --context rancher-local apply -f deploy/nodedriver.yaml
-kubectl --context rancher-local get nodedrivers.management.cattle.io pve -w
+kubectl get nodedriver pve -o jsonpath='{.spec.active}{" "}{.status.conditions[?(@.type=="Downloaded")].status}{"\n"}'
+# expect: true True
 ```
 
-Wait until `pve` reports `Active`. Status meanings:
+If that reports anything else, fix the install first — everything below assumes
+a driver in `Active`. [Fixing a driver already stuck in
+`Downloading`](#fixing-a-driver-already-stuck-in-downloading) covers the usual
+cause.
 
-- **`Downloading`** — Rancher is fetching the binary. If this never finishes,
-  check `whitelistDomains`: it must contain `github.com`,
-  `objects.githubusercontent.com` **and** `release-assets.githubusercontent.com`
-  (GitHub's release redirect chain crosses all three; the manifest ships with
-  all three already listed). Self-hosted binaries need their own host added.
-- **`Inactive` / error** — `kubectl describe nodedriver pve` shows the cause;
-  usually a checksum mismatch or an unreachable URL.
-
-### Equivalent UI path: Add Node Driver form
-
-**Cluster Management → Drivers → Node Drivers → Add Node Driver**, and fill
-in exactly these fields:
-
-| Field | Value |
-|---|---|
-| **Download URL** | `https://github.com/lore09/pve-rancher-driver/releases/download/<VERSION>/docker-machine-driver-pve-linux-amd64` (replace `<VERSION>`, e.g. `v0.1.0`) |
-| **Custom Checksum** | *(toggle on)* |
-| **Checksum** | The SHA-256 of `docker-machine-driver-pve-linux-amd64` from `dist/checksums.txt` |
-| **Node Driver Name** | `pve` |
-| **Display Name** | `Proxmox VE (pve)` |
-
-> ⚠️ **`Whitelist Domains` is not exposed in the Add Node Driver UI form.**
-> Rancher applies a default allow-list that does **not** include GitHub's
-> release redirect chain. If you register the driver through the UI it will
-> sit in `Downloading` forever, because GitHub redirects the request through
-> `objects.githubusercontent.com` **and** `release-assets.githubusercontent.com`,
-> both of which Rancher rejects without an explicit allow-list entry.
->
-> **Use the Helm chart ([Option A](#option-a-add-this-repo-as-a-rancher-repository-recommended))
-> or the manifest** — both set the three `whitelistDomains` entries, and the
-> chart does it without needing `kubectl`. If you already created the driver
-> through the Add form, patch the missing fields by hand:
->
-> ```bash
-> kubectl --context rancher-local apply -f deploy/nodedriver.yaml
-> # Or, if you already created it through the UI, patch the missing fields:
-> kubectl --context rancher-local patch nodedriver pve --type merge -p '{
->   "spec": {
->     "whitelistDomains": ["github.com","objects.githubusercontent.com","release-assets.githubusercontent.com"]
->   }
-> }'
-> # And force a re-download by touching url/checksum:
-> kubectl --context rancher-local patch nodedriver pve --type merge -p '{
->   "spec": { "checksum": "<SHA256>" }
-> }'
-> ```
->
-> If you really cannot use `kubectl`, the same three domains can be added in
-> the UI by editing the `pve` NodeDriver resource through the Rancher CRD
-> browser / **Edit YAML** view — the Add form itself does not show the field.
-
-> Rancher only re-downloads when `url` or `checksum` change. Every new
-> release must bump **both**, or old nodes keep using the cached driver.
-
-## 3. Create a cloud credential
+## 1. Create a cloud credential
 
 The NodeDriver manifest's annotations split the driver flags into a reusable
 credential and per-template options:
@@ -354,7 +189,7 @@ thing:
 The only thing you lose is discovery in the form. If typing a wrong node name or
 VMID worries you, do the trust step instead.
 
-## 4. Create a cluster with machine pools
+## 2. Create a cluster with machine pools
 
 **Cluster Management → Create → RKE2/K3s → Custom (or your cluster type) →
 toggle the `Proxmox VE (pve)` node driver**, then add a machine pool. Every
@@ -407,7 +242,7 @@ filesystem with cloud-init off is rejected before any VM is cloned.
 Mount paths may only contain `A-Z a-z 0-9 . _ / -`; the driver refuses anything
 else, since the path is interpolated into the setup script it runs as root.
 
-## 5. Watch provisioning
+## 3. Watch provisioning
 
 The driver flow per node is:
 
