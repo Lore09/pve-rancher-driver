@@ -743,7 +743,24 @@ func (d *Driver) combinedSSHKeys() (string, error) {
 			lines = append(lines, k)
 		}
 	}
-	return url.QueryEscape(strings.Join(lines, "\n")), nil
+	return pveURLEncode(strings.Join(lines, "\n")), nil
+}
+
+// pveURLEncode percent-encodes a value for a PVE option whose format is
+// `urlencoded`, such as `sshkeys`.
+//
+// url.QueryEscape is *form* encoding and emits "+" for a space. PVE validates
+// with
+//
+//	$text !~ m/^[-%a-zA-Z0-9_.!~*'()]*$/  ->  "invalid urlencoded string"
+//
+// and "+" is not in that set, so an SSH key — which always contains spaces,
+// between the algorithm, the key body and the comment — is rejected outright.
+// Percent-encoding the space instead keeps the output inside the permitted
+// character set, since QueryEscape already escapes everything except
+// [A-Za-z0-9-_.~].
+func pveURLEncode(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
 }
 
 // Start powers on the VM if it is not already running.

@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
@@ -349,5 +350,51 @@ func TestCreateFlagsDeriveExpectedFieldNames(t *testing.T) {
 		if !got[want] {
 			t.Errorf("no flag derives the machine-config field %q that the UI extension binds to", want)
 		}
+	}
+}
+
+// PVE validates `sshkeys` against [-%a-zA-Z0-9_.!~*'()], which excludes "+".
+// url.QueryEscape emits "+" for spaces, and an SSH key always has spaces, so
+// form encoding is rejected with "invalid urlencoded string".
+func TestPVEURLEncode(t *testing.T) {
+	const key = "ssh-rsa AAAAB3NzaC1yc2E+a/b== user@host"
+
+	got := pveURLEncode(key)
+
+	if strings.Contains(got, "+") {
+		t.Errorf("pveURLEncode(%q) = %q, must not contain '+'", key, got)
+	}
+	if !strings.Contains(got, "%20") {
+		t.Errorf("pveURLEncode(%q) = %q, spaces should be percent-encoded", key, got)
+	}
+
+	// Everything emitted must be inside the set PVE accepts.
+	for _, r := range got {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("-%_.!~*'()", r):
+		default:
+			t.Errorf("pveURLEncode(%q) produced %q, which PVE's urlencoded format rejects", key, string(r))
+		}
+	}
+
+	// And it must still round-trip to the original key.
+	back, err := url.QueryUnescape(got)
+	if err != nil {
+		t.Fatalf("output is not valid percent-encoding: %v", err)
+	}
+	if back != key {
+		t.Errorf("round-trip = %q, want %q", back, key)
+	}
+}
+
+func TestPVEURLEncodeMultipleKeys(t *testing.T) {
+	got := pveURLEncode("ssh-rsa AAAA one@host\nssh-ed25519 BBBB two@host")
+
+	if strings.Contains(got, "+") {
+		t.Errorf("encoded keys contain '+': %q", got)
+	}
+	if !strings.Contains(got, "%0A") {
+		t.Errorf("newline between keys should be percent-encoded, got %q", got)
 	}
 }
