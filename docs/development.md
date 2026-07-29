@@ -64,7 +64,7 @@ docker-machine create --driver pve \
   --pve-cores 2 --pve-memory 4096 \
   --pve-cloudinit \
   --pve-data-disk size=10,storage=local-lvm,fs=ext4,mount=/data \
-  --ssh-user debian \
+  --pve-ssh-user debian \
   pve-test-node
 ```
 
@@ -116,7 +116,7 @@ driver stuck in `Downloading`.
 4. If it should appear in the polished form, add it to the UI extension too —
    the custom Vue form renders only the fields it knows about, so a new flag is
    invisible there until you do. **A flag that is declared but not rendered
-   silently takes its default**, which is how `ssh-user` once defaulted to
+   silently takes its default**, which is how `pve-ssh-user` once defaulted to
    `root` on every pool.
 
 Rancher caches the machine-config schema per driver version, so a new flag does

@@ -26,9 +26,27 @@ For which fields to set on a machine pool and why, see
 |------|---------|-------------|
 | `pve-node` | *(first online)* | Target PVE node name |
 | `pve-template-vmid` | *(required)* | Template VMID to clone from |
-| `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned |
-| `pve-vmname-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
+| `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned. Only meaningful for a single machine; mutually exclusive with `pve-vmid-range` |
+| `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
+| `pve-vm-name-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
 | `pve-onboot` | `false` | Start the VM automatically when the PVE host boots |
+
+### How VMIDs are allocated
+
+With neither flag set, the driver asks Proxmox for the next free id
+(`/cluster/nextid`), which is the lowest unused id from 100 upwards.
+
+With `pve-vmid-range`, the driver picks the lowest free id inside the range
+itself, checking every VM **and container** in the cluster — Proxmox shares one
+id space between them, and templates occupy ids too.
+
+That check is advisory: an id is free when it is chosen and can be taken before
+the clone lands, which a pool creating several machines at once will
+occasionally hit. The driver retries up to 5 times with a freshly chosen id, so
+the race is invisible in normal use. If the range fills up, provisioning fails
+with a clear error rather than silently spilling outside it.
+
+Valid ids are `100`-`999999999`; Proxmox reserves `1`-`99`.
 
 ## Sizing
 
@@ -107,14 +125,14 @@ See [networking.md](networking.md) for how to build the node network itself.
 |------|---------|-------------|
 | `pve-cloudinit` | `false` | Push `ipconfig0` / `ciuser` / `sshkeys` to the cloned VM. **Required** for any data disk with a filesystem |
 | `pve-ipconfig` | `ip=dhcp` | Cloud-init `ipconfig0` value. The UI forces DHCP; the driver discovers the resulting address through the guest agent |
-| `pve-ciuser` | *(empty)* | Cloud-init user to create and install the keys for. Empty means "same as `ssh-user`", which is nearly always what you want |
+| `pve-ciuser` | *(empty)* | Cloud-init user to create and install the keys for. Empty means "same as `pve-ssh-user`", which is nearly always what you want |
 | `pve-sshkeys` | *(empty)* | Extra OpenSSH public keys, one per line. The machine's own generated key is always injected as well |
-| `ssh-user` | `root` | Account the driver and Rancher log in as. **Must be a user that exists in the guest** — `debian` for Debian's cloud image, `rancher` for Leap Micro. The `root` default works with neither |
-| `ssh-port` | `22` | SSH port |
+| `pve-ssh-user` | `root` | Account the driver and Rancher log in as. **Must be a user that exists in the guest** — `debian` for Debian's cloud image, `rancher` for Leap Micro. The `root` default works with neither |
+| `pve-ssh-port` | `22` | SSH port |
 
-`pve-ciuser` and `ssh-user` are the same account: cloud-init installs the SSH
+`pve-ciuser` and `pve-ssh-user` are the same account: cloud-init installs the SSH
 keys for `ciuser`, and that is the only account anything can subsequently log
-into. Leaving `pve-ciuser` empty derives it from `ssh-user`, which is why the
+into. Leaving `pve-ciuser` empty derives it from `pve-ssh-user`, which is why the
 UI exposes a single **VM User** field.
 
 ## Debugging

@@ -212,8 +212,9 @@ driver flag shows up as a form field; the ones that matter first:
 | IP config | `pve-ipconfig` | `ip=dhcp` or static `ip=10.0.0.5/24,gw=10.0.0.1` |
 | Cloud-init user | `pve-ciuser` | e.g. `rancher` for Leap Micro; leave empty for Debian's built-in `debian` user |
 | Extra SSH keys | `pve-sshkeys` | Optional additional public keys (the machine's own key is always injected) |
-| SSH user | `ssh-user` | **Must match the cloud-init user** — `debian` or `rancher`. Defaults to `root`, which neither documented template permits: leave it at the default and the node provisions and then never reaches `Ready` |
-| VM name prefix | `pve-vmname-prefix` | Optional. Rendered as `<prefix>-<machine name>`, e.g. `k8s-mycluster-pool1-x7k2p`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only |
+| SSH user | `pve-ssh-user` | **Must match the cloud-init user** — `debian` or `rancher`. Defaults to `root`, which neither documented template permits: leave it at the default and the node provisions and then never reaches `Ready` |
+| VMID range | `pve-vmid-range` | Optional, e.g. `200-299`. Keeps a cluster's VMIDs in a predictable band. Empty lets Proxmox pick the next free id |
+| VM name prefix | `pve-vm-name-prefix` | Optional. Rendered as `<prefix>-<machine name>`, e.g. `k8s-mycluster-pool1-x7k2p`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only |
 | Data Disks | `pve-data-disk` | One row per disk; repeatable. See [Data disks](#data-disks) below |
 | Agent timeout | `pve-agent-timeout` | Seconds to wait for the guest-agent IP (default 300) |
 | On boot | `pve-onboot` | Autostart VM with the PVE host |
@@ -405,7 +406,7 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
 | Create times out "waiting for guest agent IP" | **qemu-guest-agent not installed or not running inside the image.** The driver now sets `agent=1` on every clone, so the PVE-side channel is no longer a cause | Re-bake the image with `qemu-guest-agent` installed and enabled; verify with `qm agent <id> ping` |
 | VM boots but node never `Ready` | cloud-init user lacks passwordless sudo, or `curl`/`bash` missing | Fix template; verify `sudo -n true` works for the SSH user |
-| SSH permission denied during bootstrap | `ssh-user` doesn't match the cloud-init user, or keys not injected | Match users; keep `pve-cloudinit` on; check the VM's cloud-init log (`/var/log/cloud-init-output.log`) |
+| SSH permission denied during bootstrap | `pve-ssh-user` doesn't match the cloud-init user, or keys not injected | Match users; keep `pve-cloudinit` on; check the VM's cloud-init log (`/var/log/cloud-init-output.log`) |
 | Data disk missing in guest | wrong storage id on the row | Check the name with `pvesm status` |
 | `Create` fails with `data disk setup failed` | the guest rejected the setup script — usually `mkfs.xfs` missing, or `sudo` prompting for a password | Read the guest output in the error, then fix the template (see the [dependency matrix](template-preparation.md#guest-dependencies-for-longhorn)) |
 | `Create` fails with `no block device with serial pvedata1` | the guest cannot see disk serials, e.g. an unusual SCSI controller in the template | Use `virtio-scsi-single` as in the template guide; verify with `lsblk -ndo NAME,SERIAL` |

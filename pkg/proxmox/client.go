@@ -391,6 +391,46 @@ func (c *Client) AddDisks(ctx context.Context, vmid int, specs []DiskSpec) ([]At
 	return attached, nil
 }
 
+// UsedVMIDs returns every VMID currently present anywhere in the cluster.
+//
+// The query is deliberately unfiltered: Proxmox shares one ID space between
+// QEMU VMs and LXC containers, and templates occupy IDs too, so filtering to
+// `type=vm` would happily hand back an ID an existing container is using.
+// Entries with no VMID (nodes, storages) report 0 and are skipped.
+func (c *Client) UsedVMIDs(ctx context.Context) (map[int]bool, error) {
+	var resources []struct {
+		VMID int `json:"vmid"`
+	}
+	if err := c.api.Get(ctx, "/cluster/resources", &resources); err != nil {
+		return nil, fmt.Errorf("proxmox: cannot list cluster resources: %w", err)
+	}
+	used := make(map[int]bool, len(resources))
+	for _, r := range resources {
+		if r.VMID > 0 {
+			used[r.VMID] = true
+		}
+	}
+	return used, nil
+}
+
+// NextFreeVMID returns the lowest unused VMID within [minID, maxID].
+//
+// This is inherently advisory: the ID is free when this returns and may be
+// taken by the time the caller clones into it, so callers creating several
+// machines at once must be prepared to retry.
+func (c *Client) NextFreeVMID(ctx context.Context, minID, maxID int) (int, error) {
+	used, err := c.UsedVMIDs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for id := minID; id <= maxID; id++ {
+		if !used[id] {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("proxmox: no free VMID in range %d-%d — every id in it is already in use", minID, maxID)
+}
+
 // Start powers on a VM, waiting for the start task to complete.
 func (c *Client) Start(ctx context.Context, vmid int) error {
 	vm, err := c.vm(ctx, vmid)
