@@ -39,12 +39,12 @@ nodeDriver:
   # Written automatically by .github/workflows/release.yml after it builds the
   # release, because the digest cannot be known until the binary exists. Do not
   # edit by hand.
-  checksum: "7ddaa8e2859d327f2985e5bf43294f33eded4a5d16dab2a520215f0fdf7b7073"
+  checksum: "3e93ea6634a629b58b09f2e1d63310a90f9d3455998b0d589775edff6381114b"
   # The driver version `checksum` was recorded for. The chart refuses to render
   # when this disagrees with the version being deployed, which turns a silent
   # checksum mismatch (the classic "driver stuck in Downloading forever") into
   # an explicit error. Written automatically alongside `checksum`.
-  checksumFor: "v0.3.1"
+  checksumFor: "v0.3.2"
 
   active: true
   addCloudCredential: true
