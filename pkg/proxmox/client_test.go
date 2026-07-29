@@ -1,6 +1,10 @@
 package proxmox
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestNetDeviceKey(t *testing.T) {
 	if got := netDeviceKey(""); got != "net0" {
@@ -85,4 +89,108 @@ func TestBuildNetValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildDiskValue(t *testing.T) {
+	tests := []struct {
+		name string
+		spec DiskSpec
+		want string
+	}{
+		{
+			name: "all options render in PVE key order",
+			spec: DiskSpec{Size: 100, Storage: "local-lvm", Label: "pvedata1", Discard: "on", IOThread: "1", Backup: "0"},
+			want: "local-lvm:100,serial=pvedata1,discard=on,iothread=1,backup=0",
+		},
+		{
+			name: "discard off and backup on are rendered, not dropped",
+			spec: DiskSpec{Size: 50, Storage: "ceph-rbd", Label: "pvedata2", Discard: "off", IOThread: "0", Backup: "1"},
+			want: "ceph-rbd:50,serial=pvedata2,discard=off,iothread=0,backup=1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildDiskValue(tt.spec); got != tt.want {
+				t.Errorf("buildDiskValue() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAllocateDiskSlots(t *testing.T) {
+	two := []DiskSpec{{Size: 10, Storage: "s"}, {Size: 20, Storage: "s"}}
+
+	tests := []struct {
+		name    string
+		cfg     map[string]interface{}
+		specs   []DiskSpec
+		want    []string
+		wantErr string
+	}{
+		{
+			name:  "boot disk only leaves scsi1 and scsi2",
+			cfg:   map[string]interface{}{"scsi0": "local-lvm:vm-100-disk-0", "ide2": "local-lvm:cloudinit"},
+			specs: two,
+			want:  []string{"scsi1", "scsi2"},
+		},
+		{
+			name:  "occupied slots are skipped",
+			cfg:   map[string]interface{}{"scsi0": "x", "scsi1": "x", "scsi3": "x"},
+			specs: two,
+			want:  []string{"scsi2", "scsi4"},
+		},
+		{
+			name:  "explicit device is honoured and never reused by allocation",
+			cfg:   map[string]interface{}{"scsi0": "x"},
+			specs: []DiskSpec{{Size: 10, Storage: "s", Device: "scsi1"}, {Size: 10, Storage: "s"}},
+			want:  []string{"scsi1", "scsi2"},
+		},
+		{
+			name:    "explicit device that is already in use is an error",
+			cfg:     map[string]interface{}{"scsi0": "x", "scsi5": "x"},
+			specs:   []DiskSpec{{Size: 10, Storage: "s", Device: "scsi5"}},
+			wantErr: "scsi5",
+		},
+		{
+			name:    "running out of slots is an error",
+			cfg:     fullSCSIConfig(),
+			specs:   []DiskSpec{{Size: 10, Storage: "s"}},
+			wantErr: "no free SCSI slot",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := allocateDiskSlots(tt.cfg, tt.specs)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("allocateDiskSlots() = nil error, want one mentioning %q", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("allocateDiskSlots() error = %q, want it to mention %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("allocateDiskSlots() returned error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("allocateDiskSlots() = %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("slot %d = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// fullSCSIConfig returns a config map with every SCSI slot occupied.
+func fullSCSIConfig() map[string]interface{} {
+	cfg := map[string]interface{}{}
+	for i := 0; i <= 30; i++ {
+		cfg[fmt.Sprintf("scsi%d", i)] = "occupied"
+	}
+	return cfg
 }
