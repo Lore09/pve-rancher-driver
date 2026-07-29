@@ -52,7 +52,8 @@ apt-get install -y libguestfs-tools
 # install them anyway if you build from a smaller variant.
 virt-customize -a debian-13-genericcloud-amd64.qcow2 \
   --install qemu-guest-agent \
-  --run-command 'systemctl enable qemu-guest-agent'
+  --run-command 'systemctl enable qemu-guest-agent' \
+  --truncate /etc/machine-id
 
 # Optional: grow the base disk so nodes have room for container images.
 qemu-img resize debian-13-genericcloud-amd64.qcow2 20G
@@ -127,7 +128,8 @@ virt-ls -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 /usr/sbin/ \
 # qemu-guest-agent is installed but not necessarily enabled; enable it.
 # /etc on Leap Micro is a writable overlay, so the symlink edit persists.
 virt-customize -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 \
-  --run-command 'systemctl enable qemu-guest-agent'
+  --run-command 'systemctl enable qemu-guest-agent' \
+  --truncate /etc/machine-id
 
 qemu-img resize openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 20G
 ```
@@ -232,7 +234,8 @@ virt-customize -a <image>.qcow2 \
   --run-command 'systemctl enable some.service' \
   --run-command 'echo some_module > /etc/modules-load.d/mine.conf' \
   --copy-in ./my-file.conf:/etc/somewhere/ \
-  --mkdir /etc/somewhere/else
+  --mkdir /etc/somewhere/else \
+  --truncate /etc/machine-id
 ```
 
 The options you will actually use:
@@ -247,11 +250,49 @@ The options you will actually use:
 | `--delete <path>` | Removes a path |
 | `--root-password password:<pw>` | Sets a root password. Rarely wanted — the driver logs in as the cloud-init user with a key |
 
-Four things that trip people up:
+### Always end with `--truncate /etc/machine-id`
+
+`virt-customize` writes a fresh, concrete machine ID into the image before it
+runs your operations — you will see it in the output:
+
+```
+[   4.0] Setting the machine ID in /etc/machine-id
+```
+
+For a one-off VM that is correct. For a **template it is exactly wrong**: that
+one ID gets baked in, and every clone Rancher creates boots claiming to be the
+same host. `machine-id(5)` documents the golden-image rule — the file should be
+**empty**, and systemd then generates a unique ID on each first boot. Truncating
+it last undoes what the preamble did.
+
+What a shared machine ID actually costs you:
+
+- **DHCP, sometimes.** `systemd-networkd` derives its DHCP DUID from the machine
+  ID, so identical IDs mean identical DUIDs and your DHCP server can hand
+  several nodes the same lease. `dhclient`, which Debian's cloud images
+  generally use, keys on the MAC instead and does not collide — so you may never
+  see this symptom on Debian. Do not rely on it.
+- **Kubernetes node identity.** `/etc/machine-id` is what a node reports as
+  `status.nodeInfo.machineID`. A cluster where every node claims the same ID is
+  at best confusing and at worst breaks tooling that assumes uniqueness.
+- **journald and host agents**, which use it as the stable host identifier.
+
+Verify without booting anything:
+
+```bash
+virt-cat -a <image>.qcow2 /etc/machine-id | wc -c    # expect 0
+```
+
+If you already built an image without it, you do not need to start over — run
+`virt-customize -a <image>.qcow2 --truncate /etc/machine-id` on its own, any
+time before `qm importdisk`.
+
+### Other things that trip people up
 
 - **Operations run in the order you write them.** Put `--install` before the
   `--run-command` that enables the service it just installed, or the enable
-  fails against a unit that does not exist yet.
+  fails against a unit that does not exist yet. This is also why `--truncate
+  /etc/machine-id` goes last.
 - **`systemctl enable` works; `systemctl start` does not.** Enabling only writes
   symlinks, which is a filesystem operation. Nothing is running inside the
   image, so there is no service to start. Anything that must happen at runtime
@@ -296,7 +337,8 @@ change into a new btrfs snapshot rather than the running root:
 ```bash
 virt-customize -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 \
   --run-command 'transactional-update -n pkg install <packages>' \
-  --run-command 'systemctl enable <service>'
+  --run-command 'systemctl enable <service>' \
+  --truncate /etc/machine-id
 ```
 
 `/etc` is a writable overlay on Leap Micro, so `--copy-in` to `/etc/...` and
@@ -346,7 +388,8 @@ virt-customize -a debian-13-genericcloud-amd64.qcow2 \
   --run-command 'systemctl enable qemu-guest-agent iscsid' \
   --run-command 'echo iscsi_tcp > /etc/modules-load.d/longhorn.conf' \
   --mkdir /etc/multipath/conf.d \
-  --run-command 'printf "blacklist {\n    devnode \"^sd[a-z0-9]+\"\n}\n" > /etc/multipath/conf.d/longhorn.conf'
+  --run-command 'printf "blacklist {\n    devnode \"^sd[a-z0-9]+\"\n}\n" > /etc/multipath/conf.d/longhorn.conf' \
+  --truncate /etc/machine-id
 ```
 
 This replaces the `--install qemu-guest-agent` call in [step A.1](#a1-download-and-customize-the-image);
@@ -361,7 +404,8 @@ and the change lands in a new snapshot:
 virt-customize -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 \
   --run-command 'transactional-update -n pkg install open-iscsi nfs-client cryptsetup xfsprogs' \
   --run-command 'systemctl enable qemu-guest-agent iscsid' \
-  --run-command 'echo iscsi_tcp > /etc/modules-load.d/longhorn.conf'
+  --run-command 'echo iscsi_tcp > /etc/modules-load.d/longhorn.conf' \
+  --truncate /etc/machine-id
 ```
 
 > An alternative for mutable hosts only is Longhorn's own
@@ -392,4 +436,6 @@ two mechanisms formatting the same device is a good way to lose data.
 - [ ] `lsblk -ndo NAME,SERIAL` on a clone shows the serial of a test disk.
 - [ ] If you use Longhorn: `iscsid` active, `iscsi_tcp` loaded, multipath
       blacklist in place.
+- [ ] `/etc/machine-id` is empty in the image (`virt-cat -a <image> /etc/machine-id | wc -c` = 0),
+      so clones do not all share one host identity.
 - [ ] The template VMID is written down — it is `pve-template-vmid`.
