@@ -10,7 +10,7 @@ two supported base images:
   workloads that want a container-focused, self-healing base.
 
 Both images were verified to contain everything the driver needs. Whichever
-you pick, the four hard requirements are:
+you pick, the five hard requirements are:
 
 1. **`qemu-guest-agent` baked into the image itself.** The driver discovers
    the clone's IP exclusively through the guest agent; installing it via a
@@ -23,9 +23,15 @@ you pick, the four hard requirements are:
    `PATH`.** Rancher's system-agent bootstrap runs over SSH as this user
    *after* the driver has finished; if sudo prompts for a password or `curl`
    is missing, the VM boots and the driver reports success, but the node
-   never reaches `Ready` in Rancher.
-4. **DHCP reachable on the bridge** used for `net0` (or a static
-   `--pve-ipconfig` you set yourself).
+   never reaches `Ready` in Rancher. The driver also uses this account to
+   format and mount data disks, so passwordless `sudo` is doubly load-bearing.
+4. **An address for the NIC** — either DHCP on the bridge used for `net0`, or a
+   static `--pve-ipconfig` you set yourself. See
+   [docs/networking.md](networking.md) for a controlled DHCP setup.
+5. **The packages your storage stack needs, baked into the image.** The driver
+   attaches, formats and mounts data disks itself, but it does not install
+   packages: `open-iscsi` and friends have to be in the template. See
+   [Guest dependencies for Longhorn](#guest-dependencies-for-longhorn) below.
 
 Everything below runs **on the PVE host** as root.
 
@@ -160,7 +166,6 @@ qm start 999
 # wait ~60-90s for first boot, then:
 qm agent 999 ping
 qm agent 999 network-get-interfaces | grep -A3 '"name" : "eth0"'
-qm destroy 999
 ```
 
 `network-get-interfaces` must return an IPv4 address on the NIC. If `qm agent
@@ -168,53 +173,88 @@ qm destroy 999
 the customize step; this is the single most common cause of the driver
 timing out in Rancher.
 
----
-
-## Optional: template-side setup for Longhorn (or other storage provisioners)
-
-The driver can attach an **extra blank disk** per node
-(`--pve-extra-disk-size` + `--pve-extra-disk-storage`), which shows up in the
-guest as `/dev/sdb` (boot disk is `sda` when you use the layout above). The
-driver deliberately does **not** format or mount it — that belongs to the
-guest, and the cleanest place is cloud-init in the template so every clone
-sets it up on first boot.
-
-Bake a small cloud-config drop-in into the image:
+Then check the storage prerequisites (skip if you are not using Longhorn) and
+prove that disk serials reach the guest — this is what the driver keys on to
+find a data disk, so if it does not work here it will not work in Rancher:
 
 ```bash
-cat > 99-longhorn-disk.cfg <<'EOF'
-#cloud-config
-# Formats the driver's extra disk (if present & unformatted) and mounts it
-# for Longhorn. disk_setup/fs_setup run once per instance (i.e. once per
-# clone); the fstab entry keeps the mount across reboots.
-disk_setup:
-  /dev/sdb:
-    table_type: gpt
-    layout: true
-    overwrite: false
-fs_setup:
-  - label: longhorn
-    filesystem: ext4
-    device: /dev/sdb
-    partition: 1
-    overwrite: false
-mounts:
-  - ["/dev/sdb1", "/var/lib/longhorn", "auto", "defaults,nofail,x-systemd.device-timeout=30s", "0", "2"]
-EOF
+qm guest exec 999 -- systemctl is-active iscsid
+qm guest exec 999 -- /bin/sh -c 'lsmod | grep iscsi_tcp'
 
-virt-customize -a <your-image>.qcow2 \
-  --mkdir /etc/cloud/cloud.cfg.d \
-  --copy-in 99-longhorn-disk.cfg:/etc/cloud/cloud.cfg.d/
+# Attach a throwaway 1GB disk with a serial, then look for it the way the
+# driver does. The disk is destroyed along with the test VM below.
+qm set 999 --scsi1 local-lvm:1,serial=pvedata1
+qm guest exec 999 -- lsblk -ndo NAME,SERIAL
+# expect a line whose SERIAL column reads pvedata1
+
+qm destroy 999
 ```
 
-Then in Rancher, set the machine pool fields `extra-disk-size: 100` and
-`extra-disk-storage: local-lvm` (see the
-[Rancher setup guide](rancher-setup.md#machine-pool-fields)) and Longhorn will
-find its dedicated device already mounted at `/var/lib/longhorn`.
+`qm guest exec` needs the guest agent, which requirement 1 already covers. If
+the `SERIAL` column is empty, the template is using a disk controller that does
+not pass serials through — use `virtio-scsi-single` as in the steps above.
 
-If you instead use raw disk passthrough or Ceph-backed storage classes served
-by an external provisioner, you don't need the extra disk at all — skip both
-the template drop-in and the driver flags.
+---
+
+## Guest dependencies for Longhorn
+
+The driver attaches each data disk, formats it and mounts it at the path you
+gave, before the node joins the cluster. What it does **not** do is install
+packages — that is the template's job, and doing it at provisioning time would
+make every node build depend on a package mirror.
+
+Longhorn needs the following in the guest:
+
+| Requirement | Why |
+|---|---|
+| `open-iscsi` installed and `iscsid` enabled | Longhorn attaches every volume over iSCSI to the node |
+| `iscsi_tcp` kernel module loaded at boot | the iSCSI initiator transport |
+| `nfs-common` (Debian) / `nfs-client` (SUSE) | RWX volumes are served through an NFS share-manager pod |
+| `cryptsetup` + `dm_crypt` | only for encrypted volumes |
+| a `multipathd` blacklist for Longhorn devices | multipath otherwise claims the device and Longhorn's mount fails |
+| `xfsprogs` | only if a data disk uses `fs=xfs` |
+
+### Debian 13
+
+```bash
+virt-customize -a debian-13-genericcloud-amd64.qcow2 \
+  --install qemu-guest-agent,open-iscsi,nfs-common,cryptsetup,xfsprogs \
+  --run-command 'systemctl enable qemu-guest-agent iscsid' \
+  --run-command 'echo iscsi_tcp > /etc/modules-load.d/longhorn.conf' \
+  --mkdir /etc/multipath/conf.d \
+  --run-command 'printf "blacklist {\n    devnode \"^sd[a-z0-9]+\"\n}\n" > /etc/multipath/conf.d/longhorn.conf'
+```
+
+This replaces the `--install qemu-guest-agent` call in [step A.1](#a1-download-and-customize-the-image);
+run one or the other, not both.
+
+### openSUSE Leap Micro 6.2
+
+Leap Micro is transactional, so packages go in through `transactional-update`
+and the change lands in a new snapshot:
+
+```bash
+virt-customize -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 \
+  --run-command 'transactional-update -n pkg install open-iscsi nfs-client cryptsetup xfsprogs' \
+  --run-command 'systemctl enable qemu-guest-agent iscsid' \
+  --run-command 'echo iscsi_tcp > /etc/modules-load.d/longhorn.conf'
+```
+
+> An alternative for mutable hosts only is Longhorn's own
+> `longhorn-iscsi-installation.yaml` and `longhorn-nfs-installation.yaml`
+> DaemonSets, which chroot the host and install the packages from inside the
+> cluster. They do not work on Leap Micro, and a node joins before they have
+> run, so volumes can fail to attach on a fresh node. Baking the packages in
+> avoids both problems.
+
+### Why there is no cloud-init disk drop-in any more
+
+Earlier versions of this guide baked a `disk_setup`/`fs_setup`/`mounts`
+cloud-config into the image to prepare a single `/dev/sdb`. That is gone: the
+driver now does the work itself, keyed on each disk's PVE **serial** rather
+than a kernel name, which is the only approach that survives a node having more
+than one data disk. If you still have that drop-in in an image, delete it —
+two mechanisms formatting the same device is a good way to lose data.
 
 ## Checklist before moving on
 
@@ -223,5 +263,9 @@ the template drop-in and the driver flags.
 - [ ] Template has a cloud-init drive (`ide2 ... cloudinit`).
 - [ ] You know which cloud-init user you'll use (`debian` for Debian,
       `rancher` via `ciuser` for Leap Micro) — it becomes `--ssh-user`.
-- [ ] `curl`, `bash`, passwordless `sudo` verified inside the image.
+- [ ] `curl`, `bash`, passwordless `sudo` verified inside the image — the last
+      one is what lets the driver format and mount data disks.
+- [ ] `lsblk -ndo NAME,SERIAL` on a clone shows the serial of a test disk.
+- [ ] If you use Longhorn: `iscsid` active, `iscsi_tcp` loaded, multipath
+      blacklist in place.
 - [ ] The template VMID is written down — it is `pve-template-vmid`.

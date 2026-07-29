@@ -371,20 +371,40 @@ driver flag shows up as a form field; the ones that matter first:
 | Network device | `pve-net-device` | Which PVE NIC's MAC is used for IP discovery (`net0`), and the device the settings below rewrite |
 | Bridge | `pve-net-bridge` | e.g. `vmbr1`. Leave empty to inherit the template's network. See [per-pool networking](#per-pool-networking) |
 | NIC model / VLAN tag / MTU / firewall | `pve-net-model` / `pve-net-vlan-tag` / `pve-net-mtu` / `pve-net-firewall` | All require **Bridge** to be set |
-| Boot disk size | `pve-disk` | GB; grows the cloned boot disk. `0` = keep the template's size |
+| Boot disk size | `pve-boot-disk-size` | GB; grows the cloned boot disk. `0` = keep the template's size |
 | Boot disk device | `pve-boot-disk-device` | `scsi0` by default; match your template's boot disk |
 | Cloud-init | `pve-cloudinit` | Enable to push `ipconfig0`/`sshkeys`/`ciuser` |
 | IP config | `pve-ipconfig` | `ip=dhcp` or static `ip=10.0.0.5/24,gw=10.0.0.1` |
 | Cloud-init user | `pve-ciuser` | e.g. `rancher` for Leap Micro; leave empty for Debian's built-in `debian` user |
 | Extra SSH keys | `pve-sshkeys` | Optional additional public keys (the machine's own key is always injected) |
 | SSH user | `ssh-user` | **Must match the cloud-init user** — `debian` or `rancher` |
-| Extra disk size | `pve-extra-disk-size` | GB; `0` = none. See [Longhorn](#longhorn--extra-data-disks) |
-| Extra disk storage | `pve-extra-disk-storage` | e.g. `local-lvm`, required when size > 0 |
+| Data Disks | `pve-data-disk` | One row per disk; repeatable. See [Data disks](#data-disks) below |
 | Agent timeout | `pve-agent-timeout` | Seconds to wait for the guest-agent IP (default 300) |
 | On boot | `pve-onboot` | Autostart VM with the PVE host |
 
 One pool per role (control-plane, etcd, worker) is normal; workers are where
-extra disks usually go.
+data disks usually go.
+
+### Data disks
+
+The **Data Disks** section takes one row per disk. Add as many as the pool
+needs:
+
+| Column | Meaning |
+|---|---|
+| Size (GB) | Required, must be greater than 0 |
+| Storage | PVE storage id, picked from the dropdown (or typed if the API is unreachable) |
+| Filesystem | `ext4`, `xfs`, or `none` |
+| Mount Path | Absolute path, e.g. `/var/lib/longhorn`. Required unless the filesystem is `none`, which attaches the disk raw and leaves the guest alone |
+| Include in PVE backups | Off by default — a replicated Longhorn volume gains nothing from a host-level backup |
+
+Unless the filesystem is `none`, the driver formats the disk and mounts it
+before the node joins the cluster, so **Cloud-init must be enabled** on the pool
+— that is how the driver's SSH key reaches the guest. A pool that asks for a
+filesystem with cloud-init off is rejected before any VM is cloned.
+
+Mount paths may only contain `A-Z a-z 0-9 . _ / -`; the driver refuses anything
+else, since the path is interpolated into the setup script it runs as root.
 
 ## 5. Watch provisioning
 
@@ -392,17 +412,20 @@ The driver flow per node is:
 
 ```
 clone template → configure (agent=1, cpu/mem/cloud-init, [network])
-  → [grow boot disk] → [optional extra disk] → start
+  → [grow boot disk] → [attach data disks] → start
   → capture NIC MAC → poll guest agent for IPv4 (MAC-matched)
+  → [SSH in, format and mount the data disks]
   → report created → Rancher system-agent bootstraps over SSH
 ```
 
-The order is deliberate in two places. The boot disk is grown *before* the
-extra disk is attached, because the extra disk lands in the first free
-`scsi<N>` slot. And the NIC MAC is captured *after* the configure step,
-because rewriting the net device (when `pve-net-bridge` is set) makes PVE
-generate a fresh MAC — reading it earlier would pin IP discovery to the
-template's old address.
+The order is deliberate in three places. The boot disk is grown *before* the
+data disks are attached, because slot allocation scans the live config for free
+`scsi<N>` keys. The NIC MAC is captured *after* the configure step, because
+rewriting the net device (when `pve-net-bridge` is set) makes PVE generate a
+fresh MAC — reading it earlier would pin IP discovery to the template's old
+address. And the disks are mounted *before* `Create` returns, so a node can
+never join the cluster with its storage directory unmounted — the storage
+provisioner would otherwise start filling the root filesystem.
 
 Useful places to look while a node provisions:
 
@@ -419,17 +442,20 @@ qm list ; qm agent <vmid> ping ; qm agent <vmid> network-get-interfaces
 
 Typical timing: 5–8 minutes from `+` to `Ready` on a warm template.
 
-## Longhorn / extra data disks
+## Longhorn / data disks
 
-- Set `pve-extra-disk-size` (e.g. `100`) and `pve-extra-disk-storage` on the
-  worker pool. The driver attaches a blank SCSI disk at the first free slot
-  (`scsi1` when the boot disk is `scsi0`), which the guest sees as `/dev/sdb`.
-- The driver does **not** format or mount it. Bake the cloud-config drop-in
-  from [template-preparation.md](template-preparation.md#optional-template-side-setup-for-longhorn-or-other-storage-provisioners)
-  into the template so every clone formats/mounts it at `/var/lib/longhorn`
-  on first boot.
-- Only attach the extra disk to pools that actually run Longhorn storage
-  (usually workers); control-plane/etcd pools should stay on the boot disk.
+- Add a Data Disks row on the worker pool: size `100`, your storage, `ext4`,
+  mount `/var/lib/longhorn`. The driver attaches it at the first free SCSI slot,
+  stamps the disk's serial so the guest can find it regardless of `sd*`
+  ordering, then formats and mounts it before the node joins.
+- Bake Longhorn's guest packages into the template first — `open-iscsi` with
+  `iscsid` enabled, `nfs-common`, and the multipath blacklist. See
+  [template-preparation.md](template-preparation.md#guest-dependencies-for-longhorn).
+  The driver mounts disks but never installs packages.
+- Only give data disks to pools that actually run Longhorn storage (usually
+  workers); control-plane/etcd pools should stay on the boot disk.
+- There is no cloud-init disk drop-in any more. If an older template still has
+  one, remove it: two mechanisms formatting the same device can lose data.
 
 ## Per-pool networking
 
@@ -464,7 +490,7 @@ Notes:
 
 ## Boot disk sizing
 
-`pve-disk` grows the cloned boot disk. It defaults to `0`, meaning the
+`pve-boot-disk-size` grows the cloned boot disk. It defaults to `0`, meaning the
 template's own disk size is kept.
 
 **PVE can only grow a disk, never shrink it.** A value smaller than the
@@ -544,10 +570,14 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Create times out "waiting for guest agent IP" | **qemu-guest-agent not installed or not running inside the image.** The driver now sets `agent=1` on every clone, so the PVE-side channel is no longer a cause | Re-bake the image with `qemu-guest-agent` installed and enabled; verify with `qm agent <id> ping` |
 | VM boots but node never `Ready` | cloud-init user lacks passwordless sudo, or `curl`/`bash` missing | Fix template; verify `sudo -n true` works for the SSH user |
 | SSH permission denied during bootstrap | `ssh-user` doesn't match the cloud-init user, or keys not injected | Match users; keep `pve-cloudinit` on; check the VM's cloud-init log (`/var/log/cloud-init-output.log`) |
-| Extra disk missing in guest | `pve-extra-disk-storage` wrong/empty | Field is required when size > 0; check storage name with `pvesm status` |
+| Data disk missing in guest | wrong storage id on the row | Check the name with `pvesm status` |
+| `Create` fails with `data disk setup failed` | the guest rejected the setup script — usually `mkfs.xfs` missing, or `sudo` prompting for a password | Read the guest output in the error, then fix the template (see the [dependency matrix](template-preparation.md#guest-dependencies-for-longhorn)) |
+| `Create` fails with `no block device with serial pvedata1` | the guest cannot see disk serials, e.g. an unusual SCSI controller in the template | Use `virtio-scsi-single` as in the template guide; verify with `lsblk -ndo NAME,SERIAL` |
+| `Create` fails with `--pve-cloudinit is required to format and mount` | a data disk asks for a filesystem but cloud-init is off, so no SSH key reaches the guest | Enable cloud-init on the pool, or set the row's filesystem to `none` |
+| `Create` fails with `data disk setup did not finish within` | mkfs on a very large disk, or a slow first boot | Raise `pve-disk-setup-timeout` |
 | IP picked from wrong interface (docker0/cni) | First-IPv4 fallback was used | Ensure MAC capture succeeded (driver logs); set `pve-net-device` to the right `netN` |
 | "require --pve-net-bridge to be set" at save | A VLAN tag / MTU / firewall value was set without a bridge — those only apply while rewriting the net device | Set `pve-net-bridge`, or clear the other `pve-net-*` fields. See [per-pool networking](#per-pool-networking) |
-| Boot disk still the template's size | `pve-disk` left at `0`, or the guest did not grow its filesystem | Set `pve-disk`; check `lsblk` vs `df -h` in the guest — the block device grows, the filesystem only follows if the image runs `growpart` |
+| Boot disk still the template's size | `pve-boot-disk-size` left at `0`, or the guest did not grow its filesystem | Set `pve-boot-disk-size`; check `lsblk` vs `df -h` in the guest — the block device grows, the filesystem only follows if the image runs `growpart` |
 | Resize fails "disk ... does not exist" | Template does not boot from `scsi0` | Set `pve-boot-disk-device` to the template's actual boot disk key (`qm config <vmid>`) |
 | Node gets an unexpected IP after setting a bridge | Rewriting the net device assigns a new MAC, so DHCP reservations keyed to the old MAC no longer match | Re-key the reservation to the new MAC, or use `pve-ipconfig` for a static address |
 
