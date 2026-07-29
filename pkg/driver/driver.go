@@ -768,15 +768,14 @@ func (d *Driver) Start() error {
 	if err := d.init(); err != nil {
 		return err
 	}
-	ctx := context.Background()
-	st, err := d.client.State(ctx, d.VMID)
+	st, err := d.GetState()
 	if err != nil {
 		return err
 	}
-	if st == state.Running.String() {
+	if st == state.Running {
 		return nil
 	}
-	return d.client.Start(ctx, d.VMID)
+	return d.client.Start(context.Background(), d.VMID)
 }
 
 // Stop performs a graceful shutdown.
@@ -804,11 +803,38 @@ func (d *Driver) Restart() error {
 }
 
 // Remove destroys the VM and its disks.
+//
+// PVE refuses to destroy a running VM, and Rancher deletes a machine without
+// stopping it first — so without the force-stop below, deleting a cluster took
+// away every Rancher resource and left the VMs running in Proxmox, with
+// nothing left pointing at them.
+//
+// The stop is a hard power-off rather than a graceful shutdown: the guest is
+// about to be deleted, and waiting on an ACPI shutdown that an unhealthy node
+// may never honour would just stall the deletion.
 func (d *Driver) Remove() error {
 	if err := d.init(); err != nil {
 		return err
 	}
-	return d.client.Remove(context.Background(), d.VMID)
+	if d.VMID == 0 {
+		// Create failed before a VMID was assigned; there is nothing to remove.
+		return nil
+	}
+	ctx := context.Background()
+
+	switch st, err := d.GetState(); {
+	case err != nil:
+		// Most likely already gone. Fall through to Remove, which treats a
+		// missing VM as success.
+		log.Warnf("pve: could not read state of VM %d before removal: %v", d.VMID, err)
+	case st != state.Stopped:
+		log.Infof("pve: stopping VM %d before removal", d.VMID)
+		if err := d.client.Kill(ctx, d.VMID); err != nil {
+			log.Warnf("pve: force-stop of VM %d failed: %v; attempting removal anyway", d.VMID, err)
+		}
+	}
+
+	return d.client.Remove(ctx, d.VMID)
 }
 
 // GetState returns the current VM state.
@@ -820,15 +846,32 @@ func (d *Driver) GetState() (state.State, error) {
 	if err != nil {
 		return state.Error, err
 	}
-	switch st {
-	case state.Running.String():
-		return state.Running, nil
-	case state.Paused.String():
-		return state.Paused, nil
-	case state.Stopped.String():
-		return state.Stopped, nil
+	return pveStatusToState(st), nil
+}
+
+// pveStatusToState maps PVE's QEMU status vocabulary onto libmachine's state
+// enum.
+//
+// The two do not share a vocabulary and, crucially, do not share a case: PVE
+// reports "running", libmachine's state.Running stringifies to "Running".
+// Comparing the raw strings therefore never matches, GetState reports
+// state.Error for a perfectly healthy VM, and libmachine's post-create
+// "Waiting for machine to be running" spins until it gives up with
+// "Maximum number of retries (60) exceeded".
+func pveStatusToState(status string) state.State {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "running":
+		return state.Running
+	case "paused", "suspended":
+		return state.Paused
+	case "stopped":
+		return state.Stopped
+	case "prelaunch":
+		// Briefly reported between `qm start` and the guest actually running.
+		return state.Starting
+	default:
+		return state.Error
 	}
-	return state.Error, nil
 }
 
 // GetURL returns the docker host URL. docker-machine uses this to identify the

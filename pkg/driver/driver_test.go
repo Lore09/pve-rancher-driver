@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/docker/machine/libmachine/drivers"
+	"github.com/docker/machine/libmachine/state"
 )
 
 func TestParseNetFirewall(t *testing.T) {
@@ -396,5 +397,32 @@ func TestPVEURLEncodeMultipleKeys(t *testing.T) {
 	}
 	if !strings.Contains(got, "%0A") {
 		t.Errorf("newline between keys should be percent-encoded, got %q", got)
+	}
+}
+
+// PVE reports "running"; libmachine's state.Running stringifies to "Running".
+// Comparing them directly never matches, which made GetState report Error for
+// a healthy VM and libmachine's post-create wait time out after 60 retries.
+func TestPVEStatusToState(t *testing.T) {
+	tests := []struct {
+		status string
+		want   state.State
+	}{
+		{"running", state.Running},
+		{"RUNNING", state.Running},
+		{" running ", state.Running},
+		{"stopped", state.Stopped},
+		{"paused", state.Paused},
+		{"suspended", state.Paused},
+		{"prelaunch", state.Starting},
+		{"", state.Error},
+		{"something-new", state.Error},
+	}
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			if got := pveStatusToState(tt.status); got != tt.want {
+				t.Errorf("pveStatusToState(%q) = %v, want %v", tt.status, got, tt.want)
+			}
+		})
 	}
 }
