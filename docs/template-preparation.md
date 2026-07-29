@@ -31,7 +31,9 @@ you pick, the five hard requirements are:
 5. **The packages your storage stack needs, baked into the image.** The driver
    attaches, formats and mounts data disks itself, but it does not install
    packages: `open-iscsi` and friends have to be in the template. See
-   [Guest dependencies for Longhorn](#guest-dependencies-for-longhorn) below.
+   [Adding your own packages to the image](#adding-your-own-packages-to-the-image)
+   for the mechanism and [Guest dependencies for Longhorn](#guest-dependencies-for-longhorn)
+   for the specific list.
 
 Everything below runs **on the PVE host** as root.
 
@@ -55,6 +57,12 @@ virt-customize -a debian-13-genericcloud-amd64.qcow2 \
 # Optional: grow the base disk so nodes have room for container images.
 qemu-img resize debian-13-genericcloud-amd64.qcow2 20G
 ```
+
+> This installs the bare minimum. If the nodes will run Longhorn, or you need
+> your own packages, a CA or kernel modules in the image, extend this one
+> `virt-customize` call rather than adding a second — see
+> [Adding your own packages to the image](#adding-your-own-packages-to-the-image)
+> and [Guest dependencies for Longhorn](#guest-dependencies-for-longhorn).
 
 > Use **`genericcloud`**, not `nocloud`: the `nocloud` variant omits
 > cloud-init itself. The genericcloud image ships the `debian` user with
@@ -82,7 +90,8 @@ Notes:
 - `vmbr0` must be a bridge whose network hands out DHCP leases, unless you
   plan to pass static `--pve-ipconfig` per node.
 - Do **not** set `--ciuser` for Debian: the image's default `debian` user is
-  already correct. Set `--ssh-user debian` on the Rancher side.
+  already correct. Set **VM User** to `debian` on the machine pool — that one
+  field drives both the cloud-init user and the SSH login.
 - The template's DHCP/ssh config comes from the image; the driver adds
   `ipconfig0` and `sshkeys` per clone.
 
@@ -123,6 +132,10 @@ virt-customize -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 \
 qemu-img resize openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 20G
 ```
 
+> Leap Micro is transactional, so extra packages go in through
+> `transactional-update` rather than a plain install — see
+> [Adding your own packages to the image](#adding-your-own-packages-to-the-image).
+
 ### B.2 Create the template VM
 
 ```bash
@@ -140,19 +153,22 @@ qm set $TMPL --ciuser rancher
 qm template $TMPL
 ```
 
-The important difference from Debian: **Leap Micro has no default login
-user**, so the template sets `--ciuser rancher`. PVE's cloud-init then creates
-the `rancher` user (with passwordless sudo) on every clone, applies the
-driver-injected SSH keys to it, and clones inherit the `ciuser` setting from
-the template. Match it on the Rancher side with `--ssh-user rancher` (or set
-`--pve-ciuser rancher` on the node template — either works; the driver flag
-wins if both are set).
+The important difference from Debian: **Leap Micro has no default login user**,
+so the template sets `--ciuser rancher`. PVE's cloud-init then creates the
+`rancher` user (with passwordless sudo) on every clone, applies the
+driver-injected SSH keys to it, and clones inherit the `ciuser` setting from the
+template. Set **VM User** to `rancher` on the machine pool to match.
+
+The account does not have to pre-exist in the image — cloud-init creates
+whatever you name. That is what makes an image with no login user usable at all,
+and it means you can pick your own account name here instead of `rancher`.
 
 > Leap Micro is immutable: system packages are managed with
 > `transactional-update`. Kubernetes itself runs as RKE2/K3s binaries +
-> containers, so nothing extra needs installing for the Rancher use case —
-> but if you need host-level tooling, bake it into the image the same way as
-> above, never at runtime.
+> containers, so nothing extra is needed for the plain Rancher use case — but
+> host-level tooling such as Longhorn's iSCSI client must be baked into the
+> image, never installed at runtime. See
+> [Immutable images (Leap Micro)](#immutable-images-leap-micro).
 
 ---
 
@@ -196,7 +212,115 @@ not pass serials through — use `virtio-scsi-single` as in the steps above.
 
 ---
 
+## Adding your own packages to the image
+
+Anything a node needs at the OS level — storage clients, monitoring agents, a
+corporate CA, kernel modules — goes into the image **before** it becomes a
+template. The driver installs nothing: it clones, configures, attaches disks and
+mounts them, and that is deliberate. Installing at provisioning time would make
+every node build depend on a reachable package mirror, add a minute or more per
+node, and simply not work on an immutable OS like Leap Micro.
+
+The tool is `virt-customize`, from `libguestfs-tools`, run **on the PVE host**
+against the downloaded `.qcow2` before `qm importdisk`.
+
+### The general shape
+
+```bash
+virt-customize -a <image>.qcow2 \
+  --install pkg-one,pkg-two,pkg-three \
+  --run-command 'systemctl enable some.service' \
+  --run-command 'echo some_module > /etc/modules-load.d/mine.conf' \
+  --copy-in ./my-file.conf:/etc/somewhere/ \
+  --mkdir /etc/somewhere/else
+```
+
+The options you will actually use:
+
+| Option | What it does |
+|---|---|
+| `--install a,b,c` | Installs packages with the guest's own package manager. Comma-separated, no spaces |
+| `--update` | Applies pending updates. Slow, and it makes the image less reproducible — prefer pinning a newer base image |
+| `--run-command '<sh>'` | Runs a shell command inside the image |
+| `--copy-in <local>:<dir>` | Copies a file or directory in from the host. The **destination is a directory**, not a filename |
+| `--mkdir <dir>` | Creates a directory, parents included |
+| `--delete <path>` | Removes a path |
+| `--root-password password:<pw>` | Sets a root password. Rarely wanted — the driver logs in as the cloud-init user with a key |
+
+Four things that trip people up:
+
+- **Operations run in the order you write them.** Put `--install` before the
+  `--run-command` that enables the service it just installed, or the enable
+  fails against a unit that does not exist yet.
+- **`systemctl enable` works; `systemctl start` does not.** Enabling only writes
+  symlinks, which is a filesystem operation. Nothing is running inside the
+  image, so there is no service to start. Anything that must happen at runtime
+  belongs in a systemd unit you enable here.
+- **The package manager is non-interactive already.** `--install` handles that
+  for you. If you shell out to `apt-get` in a `--run-command`, add `-y` and
+  `DEBIAN_FRONTEND=noninteractive` yourself.
+- **One command, not five.** Each `virt-customize` invocation boots a small
+  appliance to do its work. Combining the operations into a single call is
+  noticeably faster and keeps the image build in one reviewable place.
+
+### Kernel modules and sysctls
+
+Modules that must be present at boot go in `/etc/modules-load.d/`, and tunables
+in `/etc/sysctl.d/`. Both are read at boot, so neither needs a running system:
+
+```bash
+virt-customize -a <image>.qcow2 \
+  --run-command 'printf "br_netfilter\noverlay\n" > /etc/modules-load.d/k8s.conf' \
+  --run-command 'printf "net.bridge.bridge-nf-call-iptables=1\nnet.ipv4.ip_forward=1\n" > /etc/sysctl.d/99-k8s.conf'
+```
+
+RKE2 and K3s set the sysctls they need themselves, so this is only for tuning
+beyond their defaults.
+
+### A private CA or an internal registry
+
+```bash
+virt-customize -a <image>.qcow2 \
+  --copy-in ./corp-ca.crt:/usr/local/share/ca-certificates/ \
+  --run-command 'update-ca-certificates'
+```
+
+On SUSE the path is `/etc/pki/trust/anchors/` and the command is
+`update-ca-certificates` as well.
+
+### Immutable images (Leap Micro)
+
+The same idea, but packages go through `transactional-update`, which applies the
+change into a new btrfs snapshot rather than the running root:
+
+```bash
+virt-customize -a openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 \
+  --run-command 'transactional-update -n pkg install <packages>' \
+  --run-command 'systemctl enable <service>'
+```
+
+`/etc` is a writable overlay on Leap Micro, so `--copy-in` to `/etc/...` and
+`systemctl enable` behave normally. Everything under `/usr` does not — that is
+what `transactional-update` is for.
+
+### Checking what you built, without booting
+
+```bash
+virt-ls   -a <image>.qcow2 /usr/sbin/ | grep -E 'qemu-ga|iscsid'
+virt-cat  -a <image>.qcow2 /etc/modules-load.d/k8s.conf
+virt-cat  -a <image>.qcow2 /etc/os-release
+```
+
+Then, once the template exists, the [smoke test](#verify-the-template-works-before-pointing-rancher-at-it)
+confirms the same things on a real clone — which is the check that actually
+counts, since it exercises the boot path rather than the filesystem.
+
+---
+
 ## Guest dependencies for Longhorn
+
+This is the worked example of the section above: the packages Longhorn needs,
+and why each one is there.
 
 The driver attaches each data disk, formats it and mounts it at the path you
 gave, before the node joins the cluster. What it does **not** do is install
