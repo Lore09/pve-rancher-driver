@@ -487,6 +487,12 @@ func (c *Client) Restart(ctx context.Context, vmid int) error {
 func (c *Client) Remove(ctx context.Context, vmid int) error {
 	vm, err := c.vm(ctx, vmid)
 	if err != nil {
+		// Deleting something already gone is a success, not a failure:
+		// otherwise a VM removed by hand leaves Rancher retrying its machine
+		// deletion forever.
+		if IsNotFound(err) {
+			return nil
+		}
 		return err
 	}
 	task, err := vm.Delete(ctx)
@@ -494,6 +500,22 @@ func (c *Client) Remove(ctx context.Context, vmid int) error {
 		return err
 	}
 	return c.waitTask(ctx, task)
+}
+
+// IsNotFound reports whether an error means the VM does not exist.
+//
+// PVE has no machine-readable "not found" for this: a missing VM surfaces as
+// a 500 whose message names the absent config file. Matching on that text is
+// fragile, so it is used only to turn a delete into a no-op — never to
+// suppress an error that might mean something else.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "no such vm") ||
+		strings.Contains(msg, "not found")
 }
 
 // State returns the current running state of a VM ("running", "stopped", ...).

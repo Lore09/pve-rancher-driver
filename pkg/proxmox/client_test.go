@@ -194,3 +194,37 @@ func fullSCSIConfig() map[string]interface{} {
 	}
 	return cfg
 }
+
+// A delete must succeed against a VM that is already gone, or Rancher retries
+// the machine deletion forever.
+func TestIsNotFound(t *testing.T) {
+	notFound := []string{
+		"proxmox: node \"pve\" not reachable: 500 Configuration file 'nodes/pve/qemu-server/480.conf' does not exist",
+		"No such VM 480",
+		"vm not found",
+	}
+	for _, msg := range notFound {
+		if !IsNotFound(errString(msg)) {
+			t.Errorf("IsNotFound(%q) = false, want true", msg)
+		}
+	}
+
+	other := []string{
+		"unable to destroy VM 480 - VM is running",
+		"not authorized to access endpoint",
+		"proxmox: cannot read vm 480 config: connection refused",
+	}
+	for _, msg := range other {
+		if IsNotFound(errString(msg)) {
+			t.Errorf("IsNotFound(%q) = true, want false — a real failure must not be swallowed", msg)
+		}
+	}
+
+	if IsNotFound(nil) {
+		t.Error("IsNotFound(nil) = true, want false")
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
