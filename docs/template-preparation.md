@@ -72,22 +72,33 @@ qemu-img resize debian-13-genericcloud-amd64.qcow2 20G
 ### A.2 Create the template VM
 
 ```bash
-export TMPL=9000
+export TMPL=9000              # VMID for the template
+export STORAGE=local-lvm      # PVE storage holding the disks; yours may differ
 qm create $TMPL --name debian-13-tmpl --memory 2048 --cores 2 \
   --net0 virtio,bridge=vmbr0 \
   --scsihw virtio-scsi-single --agent 1 \
   --serial0 socket --vga serial0 --ostype l26
 
-qm importdisk $TMPL debian-13-genericcloud-amd64.qcow2 local-lvm
-qm set $TMPL --scsi0 local-lvm:vm-$TMPL-disk-0,discard=on,ssd=1 \
+qm importdisk $TMPL debian-13-genericcloud-amd64.qcow2 $STORAGE
+qm set $TMPL --scsi0 $STORAGE:vm-$TMPL-disk-0,discard=on,ssd=1 \
   --boot order=scsi0
-qm set $TMPL --ide2 local-lvm:cloudinit
+qm set $TMPL --ide2 $STORAGE:cloudinit
 ```
+
+> **`$TMPL` and `$STORAGE` only live for the current shell.** If you reconnect,
+> open a second terminal, or paste these blocks one at a time across sessions,
+> they are unset — and `qm set` then fails with `400 not enough arguments`,
+> because the VMID it needed expanded to nothing. Check with
+> `echo "[$TMPL] [$STORAGE]"`, re-run both `export`s, or use literal values
+> (`qm set 9000 --ide2 VM-Storage:cloudinit`). `qm config 9000` shows what
+> actually landed on the VM.
 
 Notes:
 
 - `--agent 1` tells PVE to expect the QEMU guest agent (matches requirement 1).
-- `--ide2 local-lvm:cloudinit` attaches the cloud-init drive (requirement 2).
+- `--ide2 $STORAGE:cloudinit` attaches the cloud-init drive (requirement 2). The
+  storage must have the **Images** content type enabled — `pvesm status` lists
+  what each one allows.
 - `vmbr0` must be a bridge whose network hands out DHCP leases, unless you
   plan to pass static `--pve-ipconfig` per node.
 - Do **not** set `--ciuser` for Debian: the image's default `debian` user is
@@ -141,16 +152,17 @@ qemu-img resize openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 20G
 ### B.2 Create the template VM
 
 ```bash
-export TMPL=9001
+export TMPL=9001              # same shell-scope caveat as Option A
+export STORAGE=local-lvm
 qm create $TMPL --name leapmicro-62-tmpl --memory 2048 --cores 2 \
   --net0 virtio,bridge=vmbr0 \
   --scsihw virtio-scsi-single --agent 1 \
   --serial0 socket --vga serial0 --ostype l26
 
-qm importdisk $TMPL openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 local-lvm
-qm set $TMPL --scsi0 local-lvm:vm-$TMPL-disk-0,discard=on,ssd=1 \
+qm importdisk $TMPL openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 $STORAGE
+qm set $TMPL --scsi0 $STORAGE:vm-$TMPL-disk-0,discard=on,ssd=1 \
   --boot order=scsi0
-qm set $TMPL --ide2 local-lvm:cloudinit
+qm set $TMPL --ide2 $STORAGE:cloudinit
 qm set $TMPL --ciuser rancher
 qm template $TMPL
 ```
@@ -176,9 +188,13 @@ and it means you can pick your own account name here instead of `rancher`.
 
 ## Verify the template works before pointing Rancher at it
 
-Clone once by hand and confirm the guest agent answers:
+Clone once by hand and confirm the guest agent answers. This section uses the
+same two variables, so re-export them if you are in a fresh shell:
 
 ```bash
+export TMPL=9000              # or 9001 for Leap Micro
+export STORAGE=local-lvm      # whatever you used above
+
 qm clone $TMPL 999 --name driver-smoke-test --full 1
 qm start 999
 # wait ~60-90s for first boot, then:
@@ -201,7 +217,7 @@ qm guest exec 999 -- /bin/sh -c 'lsmod | grep iscsi_tcp'
 
 # Attach a throwaway 1GB disk with a serial, then look for it the way the
 # driver does. The disk is destroyed along with the test VM below.
-qm set 999 --scsi1 local-lvm:1,serial=pvedata1
+qm set 999 --scsi1 $STORAGE:1,serial=pvedata1
 qm guest exec 999 -- lsblk -ndo NAME,SERIAL
 # expect a line whose SERIAL column reads pvedata1
 
