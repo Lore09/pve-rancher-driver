@@ -601,6 +601,11 @@ var requiredPrivs = map[int][]string{
 		"VM.GuestAgent.Audit",
 		"Datastore.AllocateSpace", "Datastore.Audit",
 		"SDN.Use", "Pool.Allocate",
+		// Sys.Audit is needed for GET /nodes/{node}/status, which the client
+		// calls before touching any VM. Without it every operation fails with
+		// "not authorized to access endpoint" *after* PreCreateCheck has
+		// passed, i.e. with a half-created machine, so it belongs here.
+		"Sys.Audit",
 	},
 	8: {
 		"VM.Clone", "VM.Allocate", "VM.Audit", "VM.PowerMgmt",
@@ -609,6 +614,8 @@ var requiredPrivs = map[int][]string{
 		"VM.Monitor",
 		"Datastore.AllocateSpace", "Datastore.Audit",
 		"SDN.Use", "Pool.Allocate",
+		// See the PVE 9 set above: required for /nodes/{node}/status.
+		"Sys.Audit",
 	},
 }
 
