@@ -377,7 +377,8 @@ driver flag shows up as a form field; the ones that matter first:
 | IP config | `pve-ipconfig` | `ip=dhcp` or static `ip=10.0.0.5/24,gw=10.0.0.1` |
 | Cloud-init user | `pve-ciuser` | e.g. `rancher` for Leap Micro; leave empty for Debian's built-in `debian` user |
 | Extra SSH keys | `pve-sshkeys` | Optional additional public keys (the machine's own key is always injected) |
-| SSH user | `ssh-user` | **Must match the cloud-init user** — `debian` or `rancher` |
+| SSH user | `ssh-user` | **Must match the cloud-init user** — `debian` or `rancher`. Defaults to `root`, which neither documented template permits: leave it at the default and the node provisions and then never reaches `Ready` |
+| VM name prefix | `pve-vmname-prefix` | Optional. Rendered as `<prefix>-<machine name>`, e.g. `k8s-mycluster-pool1-x7k2p`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only |
 | Data Disks | `pve-data-disk` | One row per disk; repeatable. See [Data disks](#data-disks) below |
 | Agent timeout | `pve-agent-timeout` | Seconds to wait for the guest-agent IP (default 300) |
 | On boot | `pve-onboot` | Autostart VM with the PVE host |
