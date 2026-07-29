@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,7 +22,14 @@ import (
 	"github.com/lore09/pve-rancher-driver/pkg/proxmox"
 )
 
+// vmNamePrefixPattern is the subset of DNS-label characters a VM name prefix
+// may use: it must start and end alphanumeric, with hyphens only in between.
+var vmNamePrefixPattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$`)
+
 const (
+	// maxVMNameLen is the DNS label limit PVE enforces on a VM name.
+	maxVMNameLen = 63
+
 	driverName     = "pve"
 	defaultSSHUser = "root"
 	// defaultAgentTimeout is how long the driver waits for the QEMU guest
@@ -53,7 +61,7 @@ type Driver struct {
 	Node             string
 	VMID             int
 	TemplateVMID     int
-	VMName           string
+	VMNamePrefix     string
 	Cores            int
 	Sockets          int
 	MemoryMB         int
@@ -92,7 +100,6 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 			SSHUser:     defaultSSHUser,
 			SSHPort:     22,
 		},
-		VMName:           hostName,
 		Cores:            2,
 		Sockets:          1,
 		MemoryMB:         2048,
@@ -155,9 +162,9 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  0,
 		},
 		mcnflag.StringFlag{
-			Name:   "pve-vmname",
-			EnvVar: "PVE_VMNAME",
-			Usage:  "Override the name assigned to the PVE VM. Defaults to the machine name",
+			Name:   "pve-vmname-prefix",
+			EnvVar: "PVE_VMNAME_PREFIX",
+			Usage:  "Prefix prepended to the PVE VM name as <prefix>-<machine name>. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name",
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-cores",
@@ -307,7 +314,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.Node = flags.String("pve-node")
 	d.VMID = flags.Int("pve-vmid")
 	d.TemplateVMID = flags.Int("pve-template-vmid")
-	d.VMName = flags.String("pve-vmname")
+	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vmname-prefix"))
 	d.Cores = flags.Int("pve-cores")
 	d.Sockets = flags.Int("pve-sockets")
 	d.MemoryMB = flags.Int("pve-memory")
@@ -370,6 +377,9 @@ func (d *Driver) PreCreateCheck() error {
 	}
 	if d.TemplateVMID == 0 {
 		return errors.New("pve: --pve-template-vmid is required to clone a VM")
+	}
+	if err := d.validateVMNamePrefix(); err != nil {
+		return err
 	}
 	disks, err := ParseDataDisks(d.DataDiskEntries)
 	if err != nil {
@@ -452,10 +462,7 @@ func (d *Driver) Create() error {
 	}
 	ctx := context.Background()
 
-	vmName := d.VMName
-	if vmName == "" {
-		vmName = d.MachineName
-	}
+	vmName := d.resolveVMName()
 
 	// docker-machine/libmachine expects a keypair at GetSSHKeyPath() to log
 	// in after Create; the driver is responsible for creating it and for
@@ -569,6 +576,36 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		if err := d.setupGuestDisks(attached); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// resolveVMName builds the name given to the PVE VM: the machine name Rancher
+// generated, optionally prefixed. The prefix is deliberately not a full
+// override — every node in a machine pool would otherwise land in PVE under
+// the same name, distinguishable only by VMID.
+func (d *Driver) resolveVMName() string {
+	prefix := strings.TrimSpace(d.VMNamePrefix)
+	if prefix == "" {
+		return d.MachineName
+	}
+	return prefix + "-" + d.MachineName
+}
+
+// validateVMNamePrefix rejects a prefix that would produce a VM name PVE
+// refuses. PVE validates the name as a DNS name, so the usable character set is
+// narrower than it looks: no underscores, no dots, no leading or trailing
+// hyphen, and 63 characters for the whole label.
+func (d *Driver) validateVMNamePrefix() error {
+	prefix := strings.TrimSpace(d.VMNamePrefix)
+	if prefix == "" {
+		return nil
+	}
+	if !vmNamePrefixPattern.MatchString(prefix) {
+		return fmt.Errorf("pve: --pve-vmname-prefix %q must contain only letters, digits and inner hyphens (PVE validates the VM name as a DNS name)", prefix)
+	}
+	if n := len(d.resolveVMName()); n > maxVMNameLen {
+		return fmt.Errorf("pve: --pve-vmname-prefix %q makes the VM name %d characters long, over the %d-character DNS label limit; use a shorter prefix", prefix, n, maxVMNameLen)
 	}
 	return nil
 }

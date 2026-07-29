@@ -3,6 +3,8 @@ package driver
 import (
 	"strings"
 	"testing"
+
+	"github.com/docker/machine/libmachine/drivers"
 )
 
 func TestParseNetFirewall(t *testing.T) {
@@ -197,5 +199,79 @@ func TestGetCreateFlagsContainsDataDiskFlags(t *testing.T) {
 		if names[gone] {
 			t.Errorf("GetCreateFlags() still declares removed flag %q", gone)
 		}
+	}
+}
+
+func TestResolveVMName(t *testing.T) {
+	tests := []struct {
+		name    string
+		prefix  string
+		machine string
+		want    string
+	}{
+		{"no prefix keeps the machine name", "", "pool1-abc12-xyz", "pool1-abc12-xyz"},
+		{"prefix is prepended with a hyphen", "k8s", "pool1-abc12-xyz", "k8s-pool1-abc12-xyz"},
+		{"whitespace around the prefix is ignored", "  k8s  ", "node1", "k8s-node1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{VMNamePrefix: tt.prefix}
+			d.BaseDriver = &drivers.BaseDriver{MachineName: tt.machine}
+			if got := d.resolveVMName(); got != tt.want {
+				t.Errorf("resolveVMName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The prefix ends up in a PVE VM name, which PVE validates as a DNS name. A
+// bad prefix must fail before a VM is cloned, not after.
+func TestPreCreateCheckVMNamePrefix(t *testing.T) {
+	base := func(prefix string) *Driver {
+		d := &Driver{
+			APIUrl:         "https://pve.example:8006/api2/json",
+			APITokenID:     "rancher@pve!machine",
+			APITokenSecret: "secret",
+			TemplateVMID:   9000,
+			SkipPermCheck:  true,
+			VMNamePrefix:   prefix,
+		}
+		d.BaseDriver = &drivers.BaseDriver{MachineName: "pool1-abc12"}
+		return d
+	}
+
+	bad := []struct {
+		name    string
+		prefix  string
+		wantMsg string
+	}{
+		{"underscore is not a DNS character", "my_cluster", "letters, digits"},
+		{"leading hyphen", "-k8s", "letters, digits"},
+		{"trailing hyphen", "k8s-", "letters, digits"},
+		{"dot is not allowed", "k8s.prod", "letters, digits"},
+		{"space", "my cluster", "letters, digits"},
+		{"too long for a DNS label", strings.Repeat("a", 60), "63"},
+	}
+
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			err := base(tt.prefix).PreCreateCheck()
+			if err == nil {
+				t.Fatalf("PreCreateCheck() = nil error, want one mentioning %q", tt.wantMsg)
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("PreCreateCheck() error = %q, want it to mention %q", err, tt.wantMsg)
+			}
+		})
+	}
+
+	for _, prefix := range []string{"", "k8s", "prod1", "a", "my-cluster"} {
+		t.Run("accepts "+prefix, func(t *testing.T) {
+			err := base(prefix).PreCreateCheck()
+			if err != nil && strings.Contains(err.Error(), "--pve-vmname-prefix") {
+				t.Fatalf("PreCreateCheck() rejected valid prefix %q: %v", prefix, err)
+			}
+		})
 	}
 }
