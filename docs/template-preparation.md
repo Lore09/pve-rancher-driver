@@ -75,6 +75,7 @@ qemu-img resize debian-13-genericcloud-amd64.qcow2 20G
 export TMPL=9000              # VMID for the template
 export STORAGE=local-lvm      # PVE storage holding the disks; yours may differ
 qm create $TMPL --name debian-13-tmpl --memory 2048 --cores 2 \
+  --cpu x86-64-v2-AES \
   --net0 virtio,bridge=vmbr0 \
   --scsihw virtio-scsi-single --agent 1 \
   --serial0 socket --vga serial0 --ostype l26
@@ -88,6 +89,28 @@ qm set $TMPL --scsi0 "$(qm config $TMPL | sed -n 's/^unused0: //p'),discard=on,s
   --boot order=scsi0
 qm set $TMPL --ide2 $STORAGE:cloudinit
 ```
+
+> **`--cpu x86-64-v2-AES` is not cosmetic.** PVE defaults new VMs to `kvm64`,
+> which advertises only the 2003-era baseline x86-64 instruction set — no
+> SSE4.2, no POPCNT. glibc 2.34+ is compiled for **x86-64-v2** in most modern
+> container base images (SUSE BCI, recent Alpine/Debian derivatives), and on a
+> `kvm64` guest those images abort at startup with:
+>
+> ```
+> Fatal glibc error: CPU does not support x86-64-v2
+> ```
+>
+> This surfaces as Rancher helm-operation and system-agent pods crash-looping
+> on a node that otherwise provisioned perfectly, so it is easy to misread as a
+> Rancher problem. `x86-64-v2-AES` is the portable fix: it still allows live
+> migration between hosts with different physical CPUs, which `--cpu host` does
+> not. Use `host` only if you never migrate, or need the guest to see every
+> feature of the physical CPU (AVX-512, nested virt).
+>
+> **Changing this on an existing template requires a power cycle of each node** —
+> the CPU model is fixed at VM start, so a reboot from inside the guest is not
+> enough. Existing VMs: `qm stop <vmid>` then `qm start <vmid>`, or just let
+> Rancher recreate them.
 
 > **`$TMPL` and `$STORAGE` only live for the current shell.** If you reconnect,
 > open a second terminal, or paste these blocks one at a time across sessions,
@@ -167,6 +190,7 @@ qemu-img resize openSUSE-Leap-Micro.x86_64-Default-qcow.qcow2 20G
 export TMPL=9001              # same shell-scope caveat as Option A
 export STORAGE=local-lvm
 qm create $TMPL --name leapmicro-62-tmpl --memory 2048 --cores 2 \
+  --cpu x86-64-v2-AES \
   --net0 virtio,bridge=vmbr0 \
   --scsihw virtio-scsi-single --agent 1 \
   --serial0 socket --vga serial0 --ostype l26
