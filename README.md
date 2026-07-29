@@ -222,7 +222,7 @@ docker-machine create --driver pve \
 | `pve-node` | *(first online)* | Target PVE node name |
 | `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned |
 | `pve-template-vmid` | *(required)* | Template VMID to clone from |
-| `pve-vmname` | machine name | Override the PVE VM name |
+| `pve-vmname-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name |
 | `pve-cores` | `2` | CPU cores per socket |
 | `pve-sockets` | `1` | CPU sockets |
 | `pve-memory` | `2048` | RAM in MB |
