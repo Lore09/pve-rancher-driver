@@ -460,7 +460,7 @@ two mechanisms formatting the same device is a good way to lose data.
 - [ ] `network-get-interfaces` shows an IPv4 on the clone's NIC.
 - [ ] Template has a cloud-init drive (`ide2 ... cloudinit`).
 - [ ] You know which cloud-init user you'll use (`debian` for Debian,
-      `rancher` via `ciuser` for Leap Micro) — it becomes `--ssh-user`.
+      `rancher` via `ciuser` for Leap Micro) — it becomes `--pve-ssh-user`.
 - [ ] `curl`, `bash`, passwordless `sudo` verified inside the image — the last
       one is what lets the driver format and mount data disks.
 - [ ] `lsblk -ndo NAME,SERIAL` on a clone shows the serial of a test disk.
