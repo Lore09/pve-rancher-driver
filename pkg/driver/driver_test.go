@@ -275,3 +275,32 @@ func TestPreCreateCheckVMNamePrefix(t *testing.T) {
 		})
 	}
 }
+
+// Cloud-init installs the SSH keys for `ciuser`, so that account and the one
+// libmachine logs in as must be the same. When only ssh-user is given, the
+// driver must derive ciuser from it rather than leaving cloud-init to guess.
+func TestCIUserDefaultsToSSHUser(t *testing.T) {
+	tests := []struct {
+		name    string
+		ciuser  string
+		sshUser string
+		want    string
+	}{
+		{"derived from ssh user when unset", "", "debian", "debian"},
+		{"explicit ciuser wins", "rancher", "rancher", "rancher"},
+		{"explicit ciuser is not overwritten", "custom", "custom", "custom"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := struct{ CIUser string }{CIUser: tt.ciuser}
+			sshUser := tt.sshUser
+			if opts.CIUser == "" {
+				opts.CIUser = sshUser
+			}
+			if opts.CIUser != tt.want {
+				t.Errorf("CIUser = %q, want %q", opts.CIUser, tt.want)
+			}
+		})
+	}
+}

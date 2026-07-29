@@ -515,6 +515,13 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		NetMTU:      d.NetMTU,
 		NetFirewall: firewall,
 	}
+	// The cloud-init user and the SSH user are the same account by definition:
+	// cloud-init installs the keys for `ciuser`, and that is the only account
+	// the driver or Rancher can then log into. Defaulting one from the other
+	// removes a whole class of "provisions fine, never reaches Ready" failures.
+	if opts.CIUser == "" {
+		opts.CIUser = d.SSHUser
+	}
 	if d.CloudInit {
 		keys, err := d.combinedSSHKeys()
 		if err != nil {
