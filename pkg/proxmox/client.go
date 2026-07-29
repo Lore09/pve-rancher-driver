@@ -283,55 +283,112 @@ func (c *Client) ResizeBootDisk(ctx context.Context, vmid int, disk string, size
 	return nil
 }
 
-// AddDisk attaches a new disk to the VM at the first free SCSI slot
-// (scsi0..scsi30) and returns the slot that was used (e.g. "scsi1").
-// sizeGB is the size in gigabytes; storage is a PVE storage name such as
-// "local-lvm". The typical use is giving a node a dedicated raw block
-// device for a storage provisioner like Longhorn; the guest is expected to
-// format and mount it (via the template's cloud-init/systemd hooks).
-func (c *Client) AddDisk(ctx context.Context, vmid int, storage string, sizeGB int) (string, error) {
-	if storage == "" {
-		return "", errors.New("proxmox: storage is required to add a disk")
+// buildDiskValue renders the PVE config value for one data disk. The key order
+// is fixed so the value is stable and diffable in tests and in PVE's UI.
+//
+// serial= is the load-bearing part: it is what the guest sees at
+// /dev/disk/by-id and in `lsblk -o NAME,SERIAL`, which is how the driver finds
+// the disk again without depending on sd* ordering.
+func buildDiskValue(spec DiskSpec) string {
+	return fmt.Sprintf("%s:%d,serial=%s,discard=%s,iothread=%s,backup=%s",
+		spec.Storage, spec.Size, spec.Label, spec.Discard, spec.IOThread, spec.Backup)
+}
+
+// allocateDiskSlots decides which scsi<N> key each spec gets. Specs naming a
+// device keep it; the rest are filled from the lowest free slot upwards.
+// scsi0 is never allocated — that is the boot disk.
+func allocateDiskSlots(cfg map[string]interface{}, specs []DiskSpec) ([]string, error) {
+	used := make(map[string]bool, len(cfg))
+	for key := range cfg {
+		used[key] = true
 	}
-	if sizeGB <= 0 {
-		return "", errors.New("proxmox: disk size must be greater than 0")
+	slots := make([]string, len(specs))
+
+	// Explicit requests are claimed first so automatic allocation cannot steal
+	// a slot a later spec asked for by name.
+	for i, spec := range specs {
+		if spec.Device == "" {
+			continue
+		}
+		if used[spec.Device] {
+			return nil, fmt.Errorf("proxmox: disk slot %s is already in use", spec.Device)
+		}
+		used[spec.Device] = true
+		slots[i] = spec.Device
+	}
+
+	next := 1
+	for i := range specs {
+		if slots[i] != "" {
+			continue
+		}
+		for ; next <= 30; next++ {
+			name := fmt.Sprintf("scsi%d", next)
+			if !used[name] {
+				used[name] = true
+				slots[i] = name
+				break
+			}
+		}
+		if slots[i] == "" {
+			return nil, errors.New("proxmox: no free SCSI slot left for data disks")
+		}
+	}
+	return slots, nil
+}
+
+// AddDisks attaches every data disk in one config update and reports which slot
+// each one landed on. Doing it in a single PUT means one PVE task to wait for
+// and no window where a VM carries half its disks.
+//
+// Call it before starting the VM so the guest sees all disks at boot.
+func (c *Client) AddDisks(ctx context.Context, vmid int, specs []DiskSpec) ([]AttachedDisk, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	for _, spec := range specs {
+		if spec.Storage == "" {
+			return nil, errors.New("proxmox: storage is required to add a disk")
+		}
+		if spec.Size <= 0 {
+			return nil, errors.New("proxmox: disk size must be greater than 0")
+		}
+		if spec.Label == "" {
+			return nil, errors.New("proxmox: disk label is required; it becomes the disk serial")
+		}
 	}
 	node, err := c.ResolveNode(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	// Read the raw config map so we can scan scsi<N> keys without enumerating
 	// the 31 individual struct fields on VirtualMachineConfig.
 	raw := map[string]interface{}{}
 	if err := c.api.Get(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), &raw); err != nil {
-		return "", fmt.Errorf("proxmox: cannot read vm %d config: %w", vmid, err)
+		return nil, fmt.Errorf("proxmox: cannot read vm %d config: %w", vmid, err)
 	}
-	slot := ""
-	for i := 0; i <= 30; i++ {
-		name := fmt.Sprintf("scsi%d", i)
-		if _, exists := raw[name]; !exists {
-			slot = name
-			break
-		}
-	}
-	if slot == "" {
-		return "", fmt.Errorf("proxmox: vm %d has no free SCSI slot", vmid)
+	slots, err := allocateDiskSlots(raw, specs)
+	if err != nil {
+		return nil, err
 	}
 	vm, err := c.vm(ctx, vmid)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	task, err := vm.Config(ctx, proxmox.VirtualMachineOption{
-		Name:  slot,
-		Value: fmt.Sprintf("%s:%d", storage, sizeGB),
-	})
+	opts := make([]proxmox.VirtualMachineOption, 0, len(specs))
+	attached := make([]AttachedDisk, 0, len(specs))
+	for i, spec := range specs {
+		opts = append(opts, proxmox.VirtualMachineOption{Name: slots[i], Value: buildDiskValue(spec)})
+		attached = append(attached, AttachedDisk{Device: slots[i], Spec: spec})
+	}
+	task, err := vm.Config(ctx, opts...)
 	if err != nil {
-		return "", fmt.Errorf("proxmox: add disk %s=%s:%d failed: %w", slot, storage, sizeGB, err)
+		return nil, fmt.Errorf("proxmox: attaching %d data disk(s) to vm %d failed: %w", len(specs), vmid, err)
 	}
 	if err := c.waitTask(ctx, task); err != nil {
-		return "", err
+		return nil, fmt.Errorf("proxmox: data disk task for vm %d did not complete: %w", vmid, err)
 	}
-	return slot, nil
+	return attached, nil
 }
 
 // Start powers on a VM, waiting for the start task to complete.

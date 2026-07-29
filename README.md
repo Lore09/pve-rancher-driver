@@ -20,18 +20,23 @@ PVE REST API ◄──┘       ├─ Resolve target node (or first online node
                         ├─ Apply overrides (cores, sockets, memory, onboot,
                         │   optional cloud-init ipconfig0 / ciuser / sshkeys
                         │   incl. the generated public key)
-                        ├─ Optionally attach an extra data disk (Longhorn)
+                        ├─ Attach the declared data disks (serial-tagged)
                         ├─ Start the VM
-                        └─ Capture the NIC MAC, then poll the QEMU guest
-                            agent for the IPv4 on that exact interface
-                            → returns "created" once the agent answers
+                        ├─ Capture the NIC MAC, then poll the QEMU guest
+                        │   agent for the IPv4 on that exact interface
+                        └─ SSH in and format/mount the data disks
+                            → returns "created" once the disks are mounted
 ```
 
 Detailed guides live in [`docs/`](docs/):
 
 - **[docs/template-preparation.md](docs/template-preparation.md)** — build a
   ready-to-clone PVE template from **Debian 13 (trixie)** or
-  **openSUSE Leap Micro 6.2** (immutable), plus template-side Longhorn setup.
+  **openSUSE Leap Micro 6.2** (immutable), plus the guest packages Longhorn
+  needs.
+- **[docs/networking.md](docs/networking.md)** — a controlled DHCP node network
+  on a PVE host whose LAN bridge is served by a virtualized OPNsense, either as
+  a host-local bridge or a tagged VLAN.
 - **[docs/rancher-setup.md](docs/rancher-setup.md)** — register the driver,
   create the cloud credential, size machine pools, and troubleshoot.
 
@@ -112,22 +117,37 @@ Step-by-step recipes, including a smoke test to run before involving Rancher:
 - **[Debian 13 (trixie) genericcloud](docs/template-preparation.md#option-a--debian-13-trixie)** — recommended default
 - **[openSUSE Leap Micro 6.2 Default-qcow](docs/template-preparation.md#option-b--opensuse-leap-micro-62-immutable)** — immutable/transactional base
 
-### Extra data disks (Longhorn etc.)
+### Data disks (Longhorn etc.)
 
-**Yes — supported since the extra-disk flags were added.** The driver can
-attach an additional blank disk per node:
+A machine pool can declare any number of data disks. Each one is attached to the
+cloned VM and, unless you ask for `fs=none`, formatted and mounted by the driver
+before `Create` returns — so a node never joins the cluster with its storage
+directory unmounted:
 
 ```bash
---pve-extra-disk-size 100 --pve-extra-disk-storage local-lvm
+--pve-data-disk size=100,storage=local-lvm,fs=ext4,mount=/var/lib/longhorn \
+--pve-data-disk size=50,storage=ceph-rbd,fs=xfs,mount=/var/lib/rancher
 ```
 
-The disk lands on the first free SCSI slot (typically `scsi1`, visible in the
-guest as `/dev/sdb`). The driver deliberately does **not** format or mount it
-— the guest should do that on first boot, e.g. with the cloud-config drop-in
-in [docs/template-preparation.md](docs/template-preparation.md#optional-template-side-setup-for-longhorn-or-other-storage-provisioners),
-which mounts it at `/var/lib/longhorn` for Longhorn to pick up. Only attach
-extra disks to pools that run the storage provisioner (workers), not to
-control-plane/etcd pools.
+Each disk is stamped with a PVE disk `serial` (its `label`, `pvedata<N>` by
+default), which is how the driver finds it in the guest — kernel names like
+`sdb` and `sdc` are assigned in discovery order and are not stable once a VM has
+more than one data disk. Formatting happens over SSH with the keypair
+cloud-init injects, so `--pve-cloudinit` is required for any disk that gets a
+filesystem; `PreCreateCheck` rejects the combination rather than cloning a VM it
+cannot finish.
+
+The operation is idempotent: a disk that already carries a filesystem is never
+reformatted, and an fstab entry is never duplicated. Data disks default to
+`backup=0`, since a replicated Longhorn volume gains nothing from a host-level
+backup; set `backup=1` per disk when PVE should back it up.
+
+Use `fs=none` to attach a raw block device and leave the guest untouched.
+
+Only give data disks to pools that run the storage provisioner (workers), not to
+control-plane/etcd pools. The template still has to carry the packages the
+storage stack needs — see
+[docs/template-preparation.md](docs/template-preparation.md#guest-dependencies-for-longhorn).
 
 ## Build
 
@@ -206,10 +226,10 @@ docker-machine create --driver pve \
 | `pve-cores` | `2` | CPU cores per socket |
 | `pve-sockets` | `1` | CPU sockets |
 | `pve-memory` | `2048` | RAM in MB |
-| `pve-disk` | `0` | Grow the cloned boot disk to this size in GB (`0` = keep the template's size). PVE can only grow a disk, never shrink it |
-| `pve-boot-disk-device` | `scsi0` | PVE config key of the boot disk grown by `pve-disk` (`scsi0`, `virtio0`, `sata0`, ...) |
-| `pve-extra-disk-size` | `0` | Extra blank disk in GB for storage provisioners (0 = none) |
-| `pve-extra-disk-storage` | *(empty)* | PVE storage for the extra disk (required when size > 0) |
+| `pve-boot-disk-size` | `0` | Grow the cloned boot disk to this size in GB (`0` = keep the template's size). PVE can only grow a disk, never shrink it |
+| `pve-boot-disk-device` | `scsi0` | PVE config key of the boot disk grown by `pve-boot-disk-size` (`scsi0`, `virtio0`, `sata0`, ...) |
+| `pve-data-disk` | *(empty)* | Data disk to attach; **repeatable**. `size=<GB>,storage=<pve-storage>[,fs=ext4\|xfs\|none][,mount=<abs path>][,label=<name>][,device=scsi1..scsi30][,discard=on\|off][,iothread=0\|1][,backup=0\|1]`. Unless `fs=none`, the driver formats the disk and mounts it at `mount=` |
+| `pve-disk-setup-timeout` | `300` | Seconds to wait for SSH plus formatting and mounting of the data disks |
 | `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface name |
 | `pve-net-device` | `net0` | PVE config device (`net0`..`net31`) whose MAC pins down IP discovery, and which the `pve-net-*` settings below are written to |
 | `pve-net-bridge` | *(empty)* | PVE bridge to attach the NIC to, e.g. `vmbr1`. **Empty leaves the template's network untouched**; setting it rewrites `pve-net-device` |
