@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -131,5 +132,119 @@ func TestNeedsGuestSetup(t *testing.T) {
 	}
 	if (proxmox.DiskSpec{FS: proxmox.FSNone}).NeedsGuestSetup() != false {
 		t.Error("fs=none disk should not need guest setup")
+	}
+}
+
+func TestParseDataDisksNormalizesMount(t *testing.T) {
+	tests := []struct {
+		entry string
+		want  string
+	}{
+		{"size=10,storage=s,fs=ext4,mount=/data/", "/data"},
+		{"size=10,storage=s,fs=ext4,mount=/data//sub//", "/data/sub"},
+		{"size=10,storage=s,fs=ext4,mount=/var/lib/longhorn", "/var/lib/longhorn"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.entry, func(t *testing.T) {
+			got, err := ParseDataDisks([]string{tt.entry})
+			if err != nil {
+				t.Fatalf("ParseDataDisks() returned error: %v", err)
+			}
+			if got[0].Mount != tt.want {
+				t.Errorf("mount = %q, want %q", got[0].Mount, tt.want)
+			}
+		})
+	}
+}
+
+// Mounting a freshly formatted disk over a system directory breaks the node in
+// ways that look like a Rancher fault, so these must never reach a guest.
+func TestParseDataDisksRejectsSystemMounts(t *testing.T) {
+	forbidden := []string{
+		"/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
+		"/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var",
+		"/etc/kubernetes", "/usr/local", "/dev/sdb", "/proc/self", "/boot/efi",
+	}
+	for _, mount := range forbidden {
+		t.Run(mount, func(t *testing.T) {
+			_, err := ParseDataDisks([]string{"size=10,storage=s,fs=ext4,mount=" + mount})
+			if err == nil {
+				t.Fatalf("ParseDataDisks(mount=%q) = nil error, want a rejection", mount)
+			}
+		})
+	}
+
+	// Trailing slashes and duplicate separators must not smuggle one through.
+	for _, mount := range []string{"/", "//", "/var/", "/etc//"} {
+		t.Run("normalized "+mount, func(t *testing.T) {
+			if _, err := ParseDataDisks([]string{"size=10,storage=s,fs=ext4,mount=" + mount}); err == nil {
+				t.Fatalf("ParseDataDisks(mount=%q) = nil error, want a rejection", mount)
+			}
+		})
+	}
+}
+
+func TestParseDataDisksAllowsSensibleMounts(t *testing.T) {
+	allowed := []string{
+		"/var/lib/longhorn", "/var/lib/rancher", "/data", "/mnt/data",
+		"/opt/data", "/srv/storage", "/var/lib/docker",
+	}
+	for _, mount := range allowed {
+		t.Run(mount, func(t *testing.T) {
+			if _, err := ParseDataDisks([]string{"size=10,storage=s,fs=ext4,mount=" + mount}); err != nil {
+				t.Errorf("ParseDataDisks(mount=%q) rejected a valid mount: %v", mount, err)
+			}
+		})
+	}
+}
+
+func TestParseDataDisksRejectsTraversal(t *testing.T) {
+	for _, mount := range []string{"/data/../etc", "/var/lib/../../usr", "/.."} {
+		t.Run(mount, func(t *testing.T) {
+			if _, err := ParseDataDisks([]string{"size=10,storage=s,fs=ext4,mount=" + mount}); err == nil {
+				t.Fatalf("ParseDataDisks(mount=%q) = nil error, want a rejection", mount)
+			}
+		})
+	}
+}
+
+func TestParseDataDisksRejectsNestedMounts(t *testing.T) {
+	tests := [][]string{
+		{"size=10,storage=s,fs=ext4,mount=/data", "size=10,storage=s,fs=ext4,mount=/data/sub"},
+		{"size=10,storage=s,fs=ext4,mount=/data/sub", "size=10,storage=s,fs=ext4,mount=/data"},
+	}
+	for i, entries := range tests {
+		t.Run(fmt.Sprintf("case %d", i), func(t *testing.T) {
+			_, err := ParseDataDisks(entries)
+			if err == nil {
+				t.Fatal("ParseDataDisks() = nil error for nested mounts, want a rejection")
+			}
+			if !strings.Contains(err.Error(), "nested") {
+				t.Errorf("error = %q, want it to mention nesting", err)
+			}
+		})
+	}
+
+	// Sibling paths that merely share a prefix are fine.
+	if _, err := ParseDataDisks([]string{
+		"size=10,storage=s,fs=ext4,mount=/data1",
+		"size=10,storage=s,fs=ext4,mount=/data2",
+	}); err != nil {
+		t.Errorf("sibling mounts rejected: %v", err)
+	}
+}
+
+// Normalization must happen before the duplicate check, or /data and /data/
+// both pass while naming the same mount point.
+func TestParseDataDisksDuplicateAfterNormalization(t *testing.T) {
+	_, err := ParseDataDisks([]string{
+		"size=10,storage=s,fs=ext4,mount=/data",
+		"size=10,storage=s,fs=ext4,mount=/data/",
+	})
+	if err == nil {
+		t.Fatal("ParseDataDisks() = nil error, want a duplicate-mount rejection")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error = %q, want it to mention a duplicate", err)
 	}
 }

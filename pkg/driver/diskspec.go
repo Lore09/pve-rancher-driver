@@ -22,6 +22,41 @@ var safeShellValue = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 // excluded on purpose: that is the boot disk.
 var dataDiskDevice = regexp.MustCompile(`^scsi([1-9]|[12][0-9]|30)$`)
 
+// forbiddenMounts are paths a data disk must never be mounted at. Mounting a
+// freshly formatted, empty filesystem over any of these shadows the running
+// system: the node either fails to boot or comes up missing the binaries,
+// configuration or state it needs, and the failure looks like a Rancher problem
+// rather than a disk one.
+//
+// /var is listed but /var/lib/longhorn is fine — only the exact path is
+// refused, since shadowing all of /var takes out the logs, the container
+// runtime state and the package database at once.
+var forbiddenMounts = map[string]bool{
+	"/":      true,
+	"/bin":   true,
+	"/boot":  true,
+	"/dev":   true,
+	"/etc":   true,
+	"/home":  true,
+	"/lib":   true,
+	"/lib64": true,
+	"/proc":  true,
+	"/root":  true,
+	"/run":   true,
+	"/sbin":  true,
+	"/sys":   true,
+	"/usr":   true,
+	"/var":   true,
+}
+
+// forbiddenMountTrees are subtrees that are off limits in their entirety: there
+// is no legitimate reason to put a data disk anywhere inside them, and several
+// are kernel-managed virtual filesystems where a mount would simply break.
+var forbiddenMountTrees = []string{
+	"/bin/", "/boot/", "/dev/", "/etc/", "/lib/", "/lib64/",
+	"/proc/", "/sbin/", "/sys/", "/usr/",
+}
+
 // ParseDataDisks turns the raw --pve-data-disk entries into validated specs.
 //
 // Each entry is a comma-separated list of key=value pairs, e.g.
@@ -128,6 +163,11 @@ func parseDataDisk(entry string, position int) (proxmox.DiskSpec, error) {
 		if !safeShellValue.MatchString(spec.Mount) {
 			return spec, fmt.Errorf("pve: --pve-data-disk entry %q: mount contains characters outside A-Za-z0-9._/-", entry)
 		}
+		normalized, err := normalizeMount(spec.Mount)
+		if err != nil {
+			return spec, fmt.Errorf("pve: --pve-data-disk entry %q: %w", entry, err)
+		}
+		spec.Mount = normalized
 	}
 	if !safeShellValue.MatchString(spec.Label) {
 		return spec, fmt.Errorf("pve: --pve-data-disk entry %q: label contains characters outside A-Za-z0-9._/-", entry)
@@ -147,6 +187,40 @@ func parseDataDisk(entry string, position int) (proxmox.DiskSpec, error) {
 	return spec, nil
 }
 
+// normalizeMount canonicalises a mount path and refuses the ones that would
+// damage the guest.
+//
+// Normalising first matters for the duplicate check: "/data" and "/data/" are
+// the same mount point, and comparing the raw strings would let both through.
+func normalizeMount(path string) (string, error) {
+	// Collapse repeated separators and strip the trailing one, so /data//sub/
+	// and /data/sub compare equal. Root stays "/" and is rejected below.
+	for strings.Contains(path, "//") {
+		path = strings.ReplaceAll(path, "//", "/")
+	}
+	if path != "/" {
+		path = strings.TrimSuffix(path, "/")
+	}
+
+	// The shell-safety charset permits dots, so ".." segments are reachable and
+	// would let a path escape the directory it appears to name.
+	for _, segment := range strings.Split(path, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("mount %q must not contain '..' segments", path)
+		}
+	}
+
+	if forbiddenMounts[path] {
+		return "", fmt.Errorf("mount %q is a system directory; mounting a data disk there would shadow the running system (use a subdirectory such as %s/data)", path, strings.TrimSuffix(path, "/"))
+	}
+	for _, tree := range forbiddenMountTrees {
+		if strings.HasPrefix(path, tree) {
+			return "", fmt.Errorf("mount %q is inside the system directory %s, which a data disk must not occupy", path, strings.TrimSuffix(tree, "/"))
+		}
+	}
+	return path, nil
+}
+
 // checkDataDiskCollisions rejects the combinations that would make two disks
 // fight over the same identity: the same mount point, the same label (and so
 // the same serial and fstab key) or the same explicit slot.
@@ -158,6 +232,17 @@ func checkDataDiskCollisions(specs []proxmox.DiskSpec) error {
 		if s.Mount != "" {
 			if mounts[s.Mount] {
 				return fmt.Errorf("pve: --pve-data-disk has a duplicate mount path %q", s.Mount)
+			}
+			// Nesting one data disk inside another is legal in Linux but depends
+			// on mount order: `mount -a` follows fstab order, so the parent can
+			// end up mounted over the child, silently hiding it.
+			for existing := range mounts {
+				if strings.HasPrefix(s.Mount, existing+"/") {
+					return fmt.Errorf("pve: --pve-data-disk mount %q is nested inside %q; mounting one data disk under another depends on mount order and can hide the inner one", s.Mount, existing)
+				}
+				if strings.HasPrefix(existing, s.Mount+"/") {
+					return fmt.Errorf("pve: --pve-data-disk mount %q is nested inside %q; mounting one data disk under another depends on mount order and can hide the inner one", existing, s.Mount)
+				}
 			}
 			mounts[s.Mount] = true
 		}
