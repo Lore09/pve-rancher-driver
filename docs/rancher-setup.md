@@ -6,7 +6,7 @@ cluster whose nodes are Proxmox VE VMs. It assumes:
 - Rancher **v2.x** (management.cattle.io/v3 NodeDriver support) and `kubectl`
   access to the **local** (management) cluster.
 - A Proxmox VE cluster reachable from the Rancher pods, with the API token
-  from the [README](../README.md#proxmox-ve-api-token) and a template from
+  from the [README](../README.md#prepare-proxmox-ve) and a template from
   [template-preparation.md](template-preparation.md).
 - This repo checked out, or the release artifacts downloaded.
 
