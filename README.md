@@ -14,6 +14,8 @@ a PVE API token — no root password ever lands in a cloud credential.
 - **DHCP addressing** with discovery through the QEMU guest agent, MAC-matched
   to the right interface.
 
+![PVE node driver](./docs/res/new-pve-cluster.png)
+
 ## Install
 
 Two charts on the Rancher **local** cluster: the driver, and the UI extension
