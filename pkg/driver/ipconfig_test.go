@@ -129,16 +129,24 @@ func TestBuildIPConfigStatic(t *testing.T) {
 			wantErr: "below",
 		},
 		{
-			name: "an address past the end of the subnet is rejected",
+			// The subnet, not the VMID range, caps the pool — so running off the
+			// end is reported as exhaustion with a machine count, which is what
+			// the operator can act on.
+			name: "an address past the end of the subnet is pool exhaustion",
 			base: "10.10.20.250/24", gw: "10.10.20.1", vmid: 210, vmidMin: 200,
-			// Several errors say "outside the subnet"; this one is the
-			// per-VMID mapping error and nothing else says "maps to".
-			wantErr: "maps to 10.10.21.4, which is outside the subnet",
+			wantErr: "static IP pool exhausted: --pve-ip-base 10.10.20.250/24 leaves room for 5 machines",
 		},
 		{
-			name: "the broadcast address is rejected",
+			// .250 on a /24 leaves .250-.254 usable, so offset 5 would land on
+			// the broadcast address and is caught by the capacity check first.
+			name: "the address that would be the broadcast address is pool exhaustion",
 			base: "10.10.20.250/24", gw: "10.10.20.1", vmid: 205, vmidMin: 200,
-			wantErr: "broadcast",
+			wantErr: "needs offset 5",
+		},
+		{
+			name: "the last usable host in the subnet is accepted",
+			base: "10.10.20.250/24", gw: "10.10.20.1", vmid: 204, vmidMin: 200,
+			want: "ip=10.10.20.254/24,gw=10.10.20.1",
 		},
 		{
 			name: "the network address is rejected",
@@ -179,9 +187,11 @@ func TestBuildIPConfigStatic(t *testing.T) {
 	}
 }
 
-// This is the check that earns the feature: without it, a pool whose address
-// space is too small for its VMID range provisions happily until the machine
-// that runs off the end, with nothing pointing at the cause.
+// validateStaticSpan is a save-time sanity check on the base and gateway. It
+// deliberately does NOT require the subnet to cover the whole VMID range:
+// NextFreeVMID hands out the lowest free id, so machines cluster at the bottom
+// of the range and the subnet only has to hold the machines that exist at once.
+// Capacity is enforced per machine by buildIPConfig instead.
 func TestValidateStaticSpan(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -193,8 +203,22 @@ func TestValidateStaticSpan(t *testing.T) {
 		{name: "a range that fits", base: "10.10.20.10/24", gw: "10.10.20.1", lo: 200, hi: 299},
 		{name: "a range that exactly reaches the last host", base: "10.10.20.10/24", gw: "10.10.20.1", lo: 200, hi: 444},
 		{
-			name: "a range that runs past the subnet", base: "10.10.20.200/24", gw: "10.10.20.1", lo: 200, hi: 299,
-			wantErr: "cannot cover the VMID range 200-299",
+			// Accepted on purpose. A VMID range wider than the subnet is a normal
+			// way to keep id headroom; the subnet simply caps how many machines
+			// can exist. Requiring full coverage demanded a /25 to run three
+			// nodes with a 100-wide range.
+			name: "a VMID range wider than the subnet is accepted", base: "10.10.20.200/24", gw: "10.10.20.1", lo: 200, hi: 299,
+		},
+		{
+			name: "a /30 base with a wide VMID range is accepted", base: "10.10.20.9/30", gw: "10.10.20.10", lo: 200, hi: 299,
+		},
+		{
+			name: "a base that is the network address is rejected", base: "10.10.20.0/24", gw: "10.10.20.1", lo: 200, hi: 299,
+			wantErr: "is the network address",
+		},
+		{
+			name: "a base with no room before the end of the subnet is rejected", base: "10.10.20.255/24", gw: "10.10.20.1", lo: 200, hi: 299,
+			wantErr: "is the broadcast address",
 		},
 		{
 			name: "a gateway outside the subnet", base: "10.10.20.10/24", gw: "10.10.99.1", lo: 200, hi: 299,
@@ -258,20 +282,58 @@ func TestPreCreateCheckStaticRequiresVMIDRange(t *testing.T) {
 	}
 }
 
-func TestPreCreateCheckStaticRejectsUndersizedSubnet(t *testing.T) {
+// A subnet smaller than the VMID range is a legitimate config: the subnet caps
+// how many machines the pool can hold, and NextFreeVMID fills from the bottom
+// of the range. A /30 with a 100-wide VMID range must save cleanly and run two
+// nodes — requiring full coverage made small subnets unusable.
+func TestPreCreateCheckAcceptsSubnetSmallerThanVMIDRange(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.200/24"
-	d.Gateway = "10.10.20.1"
+	d.IPBase = "10.10.20.9/30"
+	d.Gateway = "10.10.20.10"
 	d.VMIDRange = "200-299"
 
-	err := d.PreCreateCheck()
-	if err == nil {
-		t.Fatal("PreCreateCheck() = nil, want an error about the subnet")
+	if err := d.PreCreateCheck(); err != nil {
+		t.Fatalf("PreCreateCheck() returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "outside the subnet") {
-		t.Errorf("error = %q, want it to mention the subnet overflow", err)
+}
+
+// The capacity limit is enforced per machine instead, once the VMID is known.
+func TestStaticPoolExhaustionIsReportedPerMachine(t *testing.T) {
+	d := newValidatedDriver()
+	d.CloudInit = true
+	d.IPMode = "static"
+	d.IPBase = "10.10.20.9/30"
+	d.Gateway = "10.10.20.10"
+	d.VMIDRange = "200-299"
+
+	// .9 on a /30 (.8-.11) leaves .9 and .10 usable, so two machines fit.
+	for vmid, want := range map[int]string{
+		200: "ip=10.10.20.9/30,gw=10.10.20.10",
+		201: "ip=10.10.20.10/30,gw=10.10.20.10",
+	} {
+		d.VMID = vmid
+		got, err := d.resolveIPConfig()
+		if err != nil {
+			t.Fatalf("resolveIPConfig() for VMID %d returned error: %v", vmid, err)
+		}
+		if got != want {
+			t.Errorf("resolveIPConfig() for VMID %d = %q, want %q", vmid, got, want)
+		}
+	}
+
+	// The third machine has no address left.
+	d.VMID = 202
+	_, err := d.resolveIPConfig()
+	if err == nil {
+		t.Fatal("resolveIPConfig() = nil error for the third machine, want pool exhaustion")
+	}
+	if !strings.Contains(err.Error(), "static IP pool exhausted") {
+		t.Errorf("error = %q, want it to report pool exhaustion", err)
+	}
+	if !strings.Contains(err.Error(), "room for 2 machines") {
+		t.Errorf("error = %q, want it to state the capacity so the operator can act on it", err)
 	}
 }
 

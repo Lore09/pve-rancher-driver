@@ -265,7 +265,7 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.BoolFlag{
 			Name:   "pve-cloudinit",
 			EnvVar: "PVE_CLOUDINIT",
-			Usage:  "Configure cloud-init (ipconfig0/sshkeys) on the cloned VM",
+			Usage:  "Deprecated and always on. Cloud-init delivers the SSH key, the address and the DNS settings, so the driver enables it regardless of this flag",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-ip-mode",
@@ -371,7 +371,20 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.NetVlanTag = flags.Int("pve-net-vlan-tag")
 	d.NetMTU = flags.Int("pve-net-mtu")
 	d.NetFirewall = strings.TrimSpace(flags.String("pve-net-firewall"))
-	d.CloudInit = flags.Bool("pve-cloudinit")
+	// Cloud-init is not optional. It is the only channel that delivers the SSH
+	// key the driver needs to format data disks and that Rancher's system-agent
+	// needs to bootstrap the node, plus ipconfig0 for static addressing and the
+	// nameserver/searchdomain options. A node provisioned without it comes up
+	// and then never reaches Ready, which reads as a Rancher fault.
+	//
+	// The flag stays declared rather than being deleted: removing it would drop
+	// the field from the generated CRD schema while existing machine pools still
+	// carry it, and Rancher would then pass --pve-cloudinit to a driver that no
+	// longer defines it ("flag provided but not defined").
+	if !flags.Bool("pve-cloudinit") {
+		log.Warnf("pve: --pve-cloudinit was not set; enabling it anyway because the driver cannot provision a working node without it")
+	}
+	d.CloudInit = true
 	d.IPMode = strings.TrimSpace(flags.String("pve-ip-mode"))
 	d.IPBase = strings.TrimSpace(flags.String("pve-ip-base"))
 	d.Gateway = strings.TrimSpace(flags.String("pve-gateway"))
