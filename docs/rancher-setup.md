@@ -208,7 +208,7 @@ driver flag shows up as a form field; the ones that matter first:
 | NIC model / VLAN tag / MTU / firewall | `pve-net-model` / `pve-net-vlan-tag` / `pve-net-mtu` / `pve-net-firewall` | All require **Bridge** to be set |
 | Boot disk size | `pve-boot-disk-size` | GB; grows the cloned boot disk. `0` = keep the template's size |
 | Boot disk device | `pve-boot-disk-device` | `scsi0` by default; match your template's boot disk |
-| Cloud-init | `pve-cloudinit` | Enable to push `ipconfig0`/`sshkeys`/`ciuser` |
+| Cloud-init | `pve-cloudinit` | Always on. The driver enables it regardless: it is the only channel for the SSH key, the static address and the DNS settings |
 | Addressing | `pve-ip-mode` | `DHCP` or `Static` |
 | Base address | `pve-ip-base` | Static only. First address of the pool, e.g. `10.10.20.10/24` |
 | Gateway | `pve-gateway` | Static only. Must be in the base subnet |
@@ -426,7 +426,8 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Pods crash-loop with `Fatal glibc error: CPU does not support x86-64-v2` (often first seen in a `helm-operation-*` pod) | The template was created with PVE's default `kvm64` CPU model, which lacks SSE4.2/POPCNT. Modern container images built against glibc 2.34+ target x86-64-v2 and abort immediately. The node itself provisions fine, so this reads as a Rancher fault rather than a VM one | Set `--cpu x86-64-v2-AES` on the template (see [template preparation](template-preparation.md#a2-create-the-template-vm)). Existing nodes need a full `qm stop` + `qm start` — the CPU model is fixed at VM start, so an in-guest reboot will not pick it up |
 | Node gets an unexpected IP after setting a bridge | Rewriting the net device assigns a new MAC, so DHCP reservations keyed to the old MAC no longer match | Re-key the reservation to the new MAC, or set `pve-ip-mode` to static, which does not depend on DHCP reservations at all |
 | `--pve-ip-mode static requires --pve-vmid-range` | The address is derived from the machine position in the VMID range, so without a range there is no offset to compute | Set a VMID range on the pool, e.g. `200-299` |
-| `--pve-ip-base ... cannot cover the VMID range` | The subnet has fewer usable addresses than the VMID range has ids | Widen the prefix, lower the base address, or shrink the VMID range |
+| `static IP pool exhausted: ... leaves room for N machines` | The subnet is full. It caps the pool, not the VMID range, and machines fill it upward from the base | Widen the prefix, lower the base address, or scale the pool down. A VMID range wider than the subnet is fine on its own |
+| `--pve-ip-base ... is the network address` / `is the broadcast address` | The base cannot be assigned to a machine | Use the next address up, e.g. `10.10.20.1/24` rather than `10.10.20.0/24` |
 | Two pools get the same addresses | They share both a VMID range and an IP base | Give each pool its own VMID range |
 | `--pve-nameservers and --pve-searchdomain need --pve-cloudinit` | DNS reaches the guest as a cloud-init option | Enable cloud-init on the pool, or clear the DNS fields |
 

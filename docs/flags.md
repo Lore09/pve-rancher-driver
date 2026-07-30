@@ -161,8 +161,24 @@ pools with **different** range minima but the **same** `pve-ip-base`. With
 both compute offset 0 and both claim `10.10.20.10`. So either give each pool a
 distinct base, or let pools share the range *and* the base.
 
-`PreCreateCheck` refuses a range the subnet cannot cover, so this fails when
-the pool is saved rather than at the machine that runs off the end.
+**The subnet caps the pool, not the VMID range.** VMIDs are handed out
+lowest-free-first, so machines fill the subnet upward from the base and the
+subnet only has to hold the machines that exist at once. A VMID range *wider*
+than the subnet is therefore normal and accepted — it just supplies ids. With
+`pve-ip-base 10.10.20.9/30` (a `/30` spans `.8`–`.11`, so `.9` and `.10` are
+usable) and `pve-vmid-range 200-299`, the pool holds **two** machines; the third
+fails with:
+
+```
+pve: static IP pool exhausted: --pve-ip-base 10.10.20.9/30 leaves room for
+2 machines from 10.10.20.9, and VMID 202 needs offset 2
+```
+
+Earlier versions demanded the subnet cover the *whole* VMID range, which forced
+a `/25` just to run three nodes with a 100-wide range. `PreCreateCheck` now only
+rejects a base that is unusable outright — the network or broadcast address, or
+one with no room left before the end of its subnet — and logs the real capacity
+when the VMID range exceeds it.
 
 DNS (`pve-nameservers`, `pve-searchdomain`) requires `pve-cloudinit` in either
 mode, because PVE applies `nameserver`/`searchdomain` as cloud-init options and

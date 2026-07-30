@@ -243,8 +243,9 @@ Requirements and rules:
 
 - **`pve-vmid-range` is required.** Without it the VMID comes from
   `/cluster/nextid`, is unbounded, and the offset is meaningless.
-- **`pve-cloudinit` is required.** The address is delivered through cloud-init
+- **Cloud-init is always on.** The address is delivered through cloud-init
   `ipconfig0`, and cloud-init writes it persistently, so it survives reboots.
+  The driver enables cloud-init unconditionally, so there is nothing to set.
 - **`pve-gateway` must be inside the subnet of `pve-ip-base`.** A gateway the
   nodes cannot reach is almost always a typo, so it is rejected.
 - **Give each pool its own `pve-ip-base`.** VMIDs are unique cluster-wide (the
@@ -259,13 +260,26 @@ Requirements and rules:
   100-wide VMID range stays clear of it. Overlap means DHCP eventually hands a
   static node's address to something else.
 
-`PreCreateCheck` refuses a VMID range the subnet cannot cover, and refuses a
-range that maps onto the network or broadcast address, so this fails when the
-pool is saved rather than partway through a scale-up.
+### The subnet caps the pool, not the VMID range
+
+VMIDs are handed out lowest-free-first, so machines fill the subnet upward from
+the base and the subnet only ever has to hold the machines running at once. A
+VMID range **wider** than the subnet is therefore normal and accepted — it just
+supplies ids.
+
+So size the subnet by how many nodes you intend to run, and the VMID range by
+how much id headroom you want. With `pve-ip-base 10.10.20.9/30` (a `/30` spans
+`.8`–`.11`, leaving `.9` and `.10` usable) and `pve-vmid-range 200-299`, the pool
+holds two machines. The third fails with `static IP pool exhausted: ... leaves
+room for 2 machines`, naming the capacity so it is actionable.
+
+`PreCreateCheck` rejects only a base that is unusable outright — the network or
+broadcast address of its subnet, or one with no room before the subnet ends —
+and logs the real capacity when the VMID range exceeds it.
 
 Machine pool: **Addressing (`pve-ip-mode`) = `static`**, **Base address
 (`pve-ip-base`)**, **Gateway (`pve-gateway`)**, plus a **VMID range
-(`pve-vmid-range`)** and **cloud-init (`pve-cloudinit`)** enabled.
+(`pve-vmid-range`)**.
 
 ## Addressing comparison
 
