@@ -124,7 +124,11 @@ See [networking.md](networking.md) for how to build the node network itself.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `pve-cloudinit` | `false` | Push `ipconfig0` / `ciuser` / `sshkeys` to the cloned VM. **Required** for any data disk with a filesystem |
-| `pve-ipconfig` | `ip=dhcp` | Cloud-init `ipconfig0` value. The UI forces DHCP; the driver discovers the resulting address through the guest agent |
+| `pve-ip-mode` | `dhcp` | `dhcp` or `static`. Static derives each machine's address from its VMID, so it requires `pve-vmid-range` |
+| `pve-ip-base` | — | First address of the static pool in CIDR form, e.g. `10.10.20.10/24`. The lowest VMID in the range gets this address; each later VMID gets the next |
+| `pve-gateway` | — | Default gateway for static addressing. Must be inside the subnet of `pve-ip-base` |
+| `pve-nameservers` | — | DNS servers, space- or comma-separated. Applies in both modes; empty keeps the DHCP-supplied resolver |
+| `pve-searchdomain` | — | DNS search domain, e.g. `cluster.lan`. Applies in both modes |
 | `pve-ciuser` | *(empty)* | Cloud-init user to create and install the keys for. Empty means "same as `pve-ssh-user`", which is nearly always what you want |
 | `pve-sshkeys` | *(empty)* | Extra OpenSSH public keys, one per line. The machine's own generated key is always injected as well |
 | `pve-ssh-user` | `root` | Account the driver and Rancher log in as. **Must be a user that exists in the guest** — `debian` for Debian's cloud image, `rancher` for Leap Micro. The `root` default works with neither |
@@ -134,6 +138,35 @@ See [networking.md](networking.md) for how to build the node network itself.
 keys for `ciuser`, and that is the only account anything can subsequently log
 into. Leaving `pve-ciuser` empty derives it from `pve-ssh-user`, which is why the
 UI exposes a single **VM User** field.
+
+### How static addresses are allocated
+
+The driver is a separate process per machine with no shared state, so there is
+nothing to allocate against. The address is derived instead:
+
+```
+address = pve-ip-base + (vmid - <low end of pve-vmid-range>)
+```
+
+With `pve-vmid-range 200-299` and `pve-ip-base 10.10.20.10/24`, VMID 200 gets
+`10.10.20.10`, VMID 201 gets `10.10.20.11`, and so on. Deleting a machine frees
+its VMID and therefore its address.
+
+**Give each pool its own `pve-ip-base`.** VMIDs are unique across the whole
+cluster — the driver picks one by scanning `/cluster/resources` — so two pools
+drawing from the *same* VMID range always get different VMIDs and therefore
+different addresses. That case is safe. The collision is the opposite one: two
+pools with **different** range minima but the **same** `pve-ip-base`. With
+`200-299` and `300-399` both based at `10.10.20.10/24`, VMID 200 and VMID 300
+both compute offset 0 and both claim `10.10.20.10`. So either give each pool a
+distinct base, or let pools share the range *and* the base.
+
+`PreCreateCheck` refuses a range the subnet cannot cover, so this fails when
+the pool is saved rather than at the machine that runs off the end.
+
+DNS (`pve-nameservers`, `pve-searchdomain`) requires `pve-cloudinit` in either
+mode, because PVE applies `nameserver`/`searchdomain` as cloud-init options and
+would otherwise drop them silently.
 
 ## Debugging
 
