@@ -79,7 +79,11 @@ type Driver struct {
 	NetMTU           int
 	NetFirewall      string
 	CloudInit        bool
-	IPConfig         string
+	IPMode           string
+	IPBase           string
+	Gateway          string
+	Nameservers      string
+	SearchDomain     string
 	CIUser           string
 	SSHKeys          string
 	Onboot           bool
@@ -108,7 +112,7 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		BootDiskDevice:   defaultBootDiskDevice,
 		NetDevice:        "net0",
 		NetModel:         defaultNetModel,
-		IPConfig:         "ip=dhcp",
+		IPMode:           string(ipModeDHCP),
 		Onboot:           false,
 		AgentTimeout:     defaultAgentTimeout,
 		DiskSetupTimeout: defaultDiskSetupTimeout,
@@ -264,10 +268,30 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Configure cloud-init (ipconfig0/sshkeys) on the cloned VM",
 		},
 		mcnflag.StringFlag{
-			Name:   "pve-ipconfig",
-			EnvVar: "PVE_IPCONFIG",
-			Usage:  "cloud-init ipconfig0 string, e.g. ip=dhcp or ip=192.0.2.10/24,gw=192.0.2.1",
-			Value:  "ip=dhcp",
+			Name:   "pve-ip-mode",
+			EnvVar: "PVE_IP_MODE",
+			Usage:  "How the machine gets its address: dhcp (default) or static. static requires --pve-ip-base, --pve-gateway and --pve-vmid-range",
+			Value:  string(ipModeDHCP),
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-ip-base",
+			EnvVar: "PVE_IP_BASE",
+			Usage:  "First address of the static pool, in CIDR form, e.g. 10.10.20.10/24. The machine with the lowest VMID in --pve-vmid-range gets this address; each later VMID gets the next one",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-gateway",
+			EnvVar: "PVE_GATEWAY",
+			Usage:  "Default gateway for static addressing, e.g. 10.10.20.1. Must be inside the subnet of --pve-ip-base",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-nameservers",
+			EnvVar: "PVE_NAMESERVERS",
+			Usage:  "DNS servers, space- or comma-separated. Applies in both dhcp and static mode; leave empty to keep the resolver DHCP supplies",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-searchdomain",
+			EnvVar: "PVE_SEARCHDOMAIN",
+			Usage:  "DNS search domain, e.g. cluster.lan. Applies in both dhcp and static mode",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-ciuser",
@@ -348,7 +372,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.NetMTU = flags.Int("pve-net-mtu")
 	d.NetFirewall = strings.TrimSpace(flags.String("pve-net-firewall"))
 	d.CloudInit = flags.Bool("pve-cloudinit")
-	d.IPConfig = flags.String("pve-ipconfig")
+	d.IPMode = strings.TrimSpace(flags.String("pve-ip-mode"))
+	d.IPBase = strings.TrimSpace(flags.String("pve-ip-base"))
+	d.Gateway = strings.TrimSpace(flags.String("pve-gateway"))
+	d.Nameservers = strings.TrimSpace(flags.String("pve-nameservers"))
+	d.SearchDomain = strings.TrimSpace(flags.String("pve-searchdomain"))
 	d.CIUser = flags.String("pve-ciuser")
 	d.SSHKeys = flags.String("pve-sshkeys")
 	d.Onboot = flags.Bool("pve-onboot")
@@ -399,6 +427,9 @@ func (d *Driver) PreCreateCheck() error {
 	}
 	if d.VMIDRange != "" && d.VMID != 0 {
 		return fmt.Errorf("pve: --pve-vmid %d and --pve-vmid-range %q are mutually exclusive; an explicit id makes the range meaningless (and cannot work for a pool of more than one machine)", d.VMID, d.VMIDRange)
+	}
+	if err := d.validateAddressing(); err != nil {
+		return err
 	}
 	disks, err := ParseDataDisks(d.DataDiskEntries)
 	if err != nil {
@@ -514,25 +545,31 @@ func (d *Driver) Create() error {
 // the rollback in Create covers every failure mode with one cleanup path.
 func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	onboot := d.Onboot
+	ipConfig, err := d.resolveIPConfig()
+	if err != nil {
+		return err
+	}
 	firewall, err := parseNetFirewall(d.NetFirewall)
 	if err != nil {
 		return err
 	}
 	opts := proxmox.VMOptions{
-		Name:        vmName,
-		Cores:       uint16(d.Cores),
-		Sockets:     uint16(d.Sockets),
-		Memory:      uint32(d.MemoryMB),
-		Onboot:      &onboot,
-		CloudInit:   d.CloudInit,
-		IPConfig:    d.IPConfig,
-		CIUser:      d.CIUser,
-		NetDevice:   d.NetDevice,
-		NetBridge:   d.NetBridge,
-		NetModel:    d.NetModel,
-		NetVlanTag:  d.NetVlanTag,
-		NetMTU:      d.NetMTU,
-		NetFirewall: firewall,
+		Name:         vmName,
+		Cores:        uint16(d.Cores),
+		Sockets:      uint16(d.Sockets),
+		Memory:       uint32(d.MemoryMB),
+		Onboot:       &onboot,
+		CloudInit:    d.CloudInit,
+		IPConfig:     ipConfig,
+		Nameserver:   d.Nameservers,
+		SearchDomain: d.SearchDomain,
+		CIUser:       d.CIUser,
+		NetDevice:    d.NetDevice,
+		NetBridge:    d.NetBridge,
+		NetModel:     d.NetModel,
+		NetVlanTag:   d.NetVlanTag,
+		NetMTU:       d.NetMTU,
+		NetFirewall:  firewall,
 	}
 	opts.CIUser = d.resolveCIUser()
 	if d.CloudInit {
@@ -548,6 +585,9 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	}
 	if err := d.client.Configure(ctx, d.VMID, opts); err != nil {
 		return err
+	}
+	if ipConfig != "ip=dhcp" {
+		log.Infof("pve: VM %d configured with static %s", d.VMID, ipConfig)
 	}
 
 	// Grow the boot disk before AddDisks: slot allocation scans the live config
