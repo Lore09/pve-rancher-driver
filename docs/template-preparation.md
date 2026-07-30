@@ -25,9 +25,10 @@ you pick, the five hard requirements are:
    is missing, the VM boots and the driver reports success, but the node
    never reaches `Ready` in Rancher. The driver also uses this account to
    format and mount data disks, so passwordless `sudo` is doubly load-bearing.
-4. **An address for the NIC** — either DHCP on the bridge used for `net0`, or a
-   static `--pve-ipconfig` you set yourself. See
-   [docs/networking.md](networking.md) for a controlled DHCP setup.
+4. **An address for the NIC** — either DHCP on the bridge used for `net0`, or
+   driver-assigned static addressing (`--pve-ip-mode static` with
+   `--pve-ip-base` and `--pve-gateway`). See
+   [docs/networking.md](networking.md) for both.
 5. **The packages your storage stack needs, baked into the image.** The driver
    attaches, formats and mounts data disks itself, but it does not install
    packages: `open-iscsi` and friends have to be in the template. See
@@ -135,7 +136,8 @@ Notes:
   entirely, letting PVE name the volume:
   `qm set $TMPL --scsi0 $STORAGE:0,import-from=/abs/path/to/image.qcow2,discard=on,ssd=1`
 - `vmbr0` must be a bridge whose network hands out DHCP leases, unless you
-  plan to pass static `--pve-ipconfig` per node.
+  plan to use `--pve-ip-mode static`, where the driver derives each node's
+  address from its VMID instead.
 - Do **not** set `--ciuser` for Debian: the image's default `debian` user is
   already correct. Set **VM User** to `debian` on the machine pool — that one
   field drives both the cloud-init user and the SSH login.

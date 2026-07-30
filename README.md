@@ -145,7 +145,7 @@ idempotent — a disk that already carries a filesystem is never reformatted.
 |---|---|
 | [installation.md](docs/installation.md) | Chart values, Helm/manifest/air-gapped installs, upgrades |
 | [template-preparation.md](docs/template-preparation.md) | Building the VM template; guest packages for Longhorn |
-| [networking.md](docs/networking.md) | A controlled DHCP node network, host-local bridge or tagged VLAN |
+| [networking.md](docs/networking.md) | Choosing a node network segment, and how the nodes get addresses |
 | [rancher-setup.md](docs/rancher-setup.md) | Cloud credential, machine-pool fields, troubleshooting |
 | [flags.md](docs/flags.md) | Every driver flag, including the `pve-data-disk` grammar |
 | [development.md](docs/development.md) | Building, testing, releasing, adding a flag |

@@ -6,8 +6,24 @@ import (
 	"testing"
 
 	"github.com/docker/machine/libmachine/drivers"
+	"github.com/docker/machine/libmachine/mcnflag"
 	"github.com/docker/machine/libmachine/state"
 )
+
+func flagName(f mcnflag.Flag) string {
+	switch v := f.(type) {
+	case mcnflag.StringFlag:
+		return v.Name
+	case mcnflag.IntFlag:
+		return v.Name
+	case mcnflag.BoolFlag:
+		return v.Name
+	case mcnflag.StringSliceFlag:
+		return v.Name
+	default:
+		return ""
+	}
+}
 
 func TestParseNetFirewall(t *testing.T) {
 	truthy := []string{"true", "1", "yes", "on", "TRUE", " True "}
@@ -424,5 +440,40 @@ func TestPVEStatusToState(t *testing.T) {
 				t.Errorf("pveStatusToState(%q) = %v, want %v", tt.status, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIPFlagsAreDeclared(t *testing.T) {
+	d := NewDriver("test", "/tmp").(*Driver)
+
+	want := map[string]bool{
+		"pve-ip-mode":      false,
+		"pve-ip-base":      false,
+		"pve-gateway":      false,
+		"pve-nameservers":  false,
+		"pve-searchdomain": false,
+	}
+	for _, f := range d.GetCreateFlags() {
+		name := flagName(f)
+		if _, ok := want[name]; ok {
+			want[name] = true
+		}
+		if name == "pve-ipconfig" {
+			t.Error("pve-ipconfig must be removed: one flag cannot express a per-machine address, so every node in a pool would receive the same one")
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("flag %q is not declared", name)
+		}
+	}
+}
+
+// dhcp is the default so that a pool created before this flag existed keeps
+// working unchanged.
+func TestIPModeDefaultsToDHCP(t *testing.T) {
+	d := NewDriver("test", "/tmp").(*Driver)
+	if d.IPMode != string(ipModeDHCP) {
+		t.Errorf("NewDriver().IPMode = %q, want %q", d.IPMode, ipModeDHCP)
 	}
 }

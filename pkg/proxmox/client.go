@@ -181,6 +181,12 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 		if opts.IPConfig != "" {
 			options = append(options, proxmox.VirtualMachineOption{Name: "ipconfig0", Value: opts.IPConfig})
 		}
+		if opts.Nameserver != "" {
+			options = append(options, proxmox.VirtualMachineOption{Name: "nameserver", Value: opts.Nameserver})
+		}
+		if opts.SearchDomain != "" {
+			options = append(options, proxmox.VirtualMachineOption{Name: "searchdomain", Value: opts.SearchDomain})
+		}
 		if opts.CIUser != "" {
 			options = append(options, proxmox.VirtualMachineOption{Name: "ciuser", Value: opts.CIUser})
 		}
@@ -577,14 +583,16 @@ func (c *Client) waitTask(ctx context.Context, task *proxmox.Task) error {
 // VMOptions is the subset of PVE VM attributes that the docker-machine driver
 // allows overriding when cloning from a template.
 type VMOptions struct {
-	Name      string
-	Cores     uint16
-	Sockets   uint16
-	Memory    uint32
-	Onboot    *bool
-	CloudInit bool
-	IPConfig  string
-	CIUser    string
+	Name         string
+	Cores        uint16
+	Sockets      uint16
+	Memory       uint32
+	Onboot       *bool
+	CloudInit    bool
+	IPConfig     string
+	Nameserver   string
+	SearchDomain string
+	CIUser       string
 	// SSHKeys must already be URL-encoded as PVE expects for the sshkeys
 	// config value (one OpenSSH key per line, percent-encoded).
 	SSHKeys string
