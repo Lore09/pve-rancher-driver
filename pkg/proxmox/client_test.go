@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	proxmox "github.com/luthermonson/go-proxmox"
 )
 
 func TestNetDeviceKey(t *testing.T) {
@@ -112,6 +114,103 @@ func TestBuildDiskValue(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := buildDiskValue(tt.spec); got != tt.want {
 				t.Errorf("buildDiskValue() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// node builds a NodeStatus for the selectNode tests below. maxMemGB/memGB
+// are in GB purely so test tables stay readable; freeMem works in bytes.
+func node(name, status string, maxMemGB, memGB uint64) *proxmox.NodeStatus {
+	const gb = 1024 * 1024 * 1024
+	return &proxmox.NodeStatus{Node: name, Status: status, MaxMem: maxMemGB * gb, Mem: memGB * gb}
+}
+
+func TestSelectNode(t *testing.T) {
+	tests := []struct {
+		name    string
+		nodes   proxmox.NodeStatuses
+		allowed []string
+		want    string
+		wantErr string
+	}{
+		{
+			// The only cluster shape this project's author can actually run
+			// against — a single online node must "just work" exactly like
+			// the old first-online-node logic did.
+			name:  "single online node is chosen regardless of load",
+			nodes: proxmox.NodeStatuses{node("pve1", "online", 32, 30)},
+			want:  "pve1",
+		},
+		{
+			name: "the node with the most free memory wins",
+			nodes: proxmox.NodeStatuses{
+				node("pve1", "online", 64, 60), // 4GB free
+				node("pve2", "online", 64, 16), // 48GB free
+				node("pve3", "online", 64, 40), // 24GB free
+			},
+			want: "pve2",
+		},
+		{
+			name: "offline nodes are never candidates",
+			nodes: proxmox.NodeStatuses{
+				node("pve1", "offline", 64, 4), // most free, but down
+				node("pve2", "online", 64, 32),
+			},
+			want: "pve2",
+		},
+		{
+			name: "allowed restricts the candidate set even when excluded nodes are less loaded",
+			nodes: proxmox.NodeStatuses{
+				node("pve1", "online", 64, 4),
+				node("pve2", "online", 64, 32),
+			},
+			allowed: []string{"pve2"},
+			want:    "pve2",
+		},
+		{
+			name:    "none of the allowed nodes online is an error naming them",
+			nodes:   proxmox.NodeStatuses{node("pve1", "offline", 64, 4)},
+			allowed: []string{"pve1"},
+			wantErr: "pve1",
+		},
+		{
+			name:    "no online node anywhere is an error",
+			nodes:   proxmox.NodeStatuses{node("pve1", "offline", 64, 4)},
+			wantErr: "no online",
+		},
+		{
+			name: "a tie on free memory breaks on node name for a deterministic result",
+			nodes: proxmox.NodeStatuses{
+				node("pve-b", "online", 64, 32),
+				node("pve-a", "online", 64, 32),
+			},
+			want: "pve-a",
+		},
+		{
+			name:  "mem reported above maxmem floors free at zero rather than going negative",
+			nodes: proxmox.NodeStatuses{node("pve1", "online", 32, 40)},
+			want:  "pve1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := selectNode(tt.nodes, tt.allowed)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("selectNode() = %q, nil error, want an error mentioning %q", got, tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("selectNode() error = %q, want it to mention %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selectNode() returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("selectNode() = %q, want %q", got, tt.want)
 			}
 		})
 	}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,8 +22,9 @@ import (
 // Client wraps the go-proxmox client with the small set of operations the
 // docker-machine driver needs.
 type Client struct {
-	api  *proxmox.Client
-	node string
+	api          *proxmox.Client
+	node         string
+	allowedNodes []string
 }
 
 // Config holds the connection parameters for a Proxmox VE endpoint.
@@ -34,8 +36,13 @@ type Config struct {
 	APITokenID string
 	// APITokenSecret is the secret portion of the API token.
 	APITokenSecret string
-	// Node is the target PVE node name. If empty the first online node is used.
+	// Node is the target PVE node name. If empty, ResolveNode picks
+	// automatically from AllowedNodes (or every node, if that is also empty).
 	Node string
+	// AllowedNodes restricts automatic node selection to this set. Ignored
+	// when Node is set. Empty means every online node in the cluster is a
+	// candidate.
+	AllowedNodes []string
 	// Insecure disables TLS certificate verification.
 	Insecure bool
 	// CACertPEM is an optional PEM-encoded CA certificate used to verify the
@@ -102,15 +109,23 @@ func New(cfg Config) (*Client, error) {
 		proxmox.WithAPIToken(cfg.APITokenID, cfg.APITokenSecret),
 	)
 
-	return &Client{api: api, node: cfg.Node}, nil
+	return &Client{api: api, node: cfg.Node, allowedNodes: cfg.AllowedNodes}, nil
 }
 
 func (c *Client) waitTimeout() time.Duration {
 	return 5 * time.Minute
 }
 
-// ResolveNode returns the node name to operate on. If the configured node is
-// empty it picks the first online node in the cluster.
+// ResolveNode returns the node this client operates against, resolving and
+// caching it on first use. If the configured node is empty it picks
+// automatically: the online node (restricted to AllowedNodes, if set) with
+// the most free memory. On a single-node install there is only ever one
+// candidate, so this is equivalent to the old "first online node" behaviour.
+//
+// The result is cached in c.node for the lifetime of the Client, so every
+// subsequent operation — including ones made by a later, separate driver
+// invocation that was configured with the node this resolved to — targets
+// the same node a VM was actually created on.
 func (c *Client) ResolveNode(ctx context.Context) (string, error) {
 	if c.node != "" {
 		return c.node, nil
@@ -119,17 +134,70 @@ func (c *Client) ResolveNode(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("proxmox: cannot list nodes: %w", err)
 	}
-	if len(nodes) == 0 {
-		return "", errors.New("proxmox: no nodes available")
+	chosen, err := selectNode(nodes, c.allowedNodes)
+	if err != nil {
+		return "", err
 	}
-	for _, n := range nodes {
-		if n.Status == "online" {
-			c.node = n.Node
-			return c.node, nil
-		}
-	}
-	c.node = nodes[0].Node
+	c.node = chosen
 	return c.node, nil
+}
+
+// CurrentNode returns the node ResolveNode has already resolved to, or "" if
+// it has not been called yet.
+func (c *Client) CurrentNode() string {
+	return c.node
+}
+
+// selectNode picks the best candidate node for a new VM: the online node
+// with the most free memory, restricted to allowed when it is non-empty.
+// Ties break on node name so the choice is deterministic.
+//
+// Proxmox does not forbid overcommitting a node's memory, so this never
+// hard-fails on a shortfall — it always returns the least-loaded candidate
+// and lets Proxmox itself accept or reject the clone.
+func selectNode(nodes proxmox.NodeStatuses, allowed []string) (string, error) {
+	allowSet := make(map[string]bool, len(allowed))
+	for _, n := range allowed {
+		allowSet[n] = true
+	}
+
+	var candidates proxmox.NodeStatuses
+	for _, n := range nodes {
+		if !strings.EqualFold(n.Status, "online") {
+			continue
+		}
+		if len(allowSet) > 0 && !allowSet[n.Node] {
+			continue
+		}
+		candidates = append(candidates, n)
+	}
+	if len(candidates) == 0 {
+		if len(allowSet) > 0 {
+			return "", fmt.Errorf("proxmox: none of --pve-allowed-nodes (%s) are online", strings.Join(allowed, ", "))
+		}
+		return "", errors.New("proxmox: no online PVE node available")
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		fi, fj := freeMem(candidates[i]), freeMem(candidates[j])
+		if fi != fj {
+			return fi > fj
+		}
+		return candidates[i].Node < candidates[j].Node
+	})
+	return candidates[0].Node, nil
+}
+
+// freeMem returns a node's unallocated memory in bytes, floored at 0 — PVE
+// can legitimately report Mem slightly above MaxMem transiently (e.g. right
+// after a balloon adjustment), and a negative "free" value would otherwise
+// make selectNode rank an overcommitted node as having headroom.
+func freeMem(n *proxmox.NodeStatus) int64 {
+	free := int64(n.MaxMem) - int64(n.Mem)
+	if free < 0 {
+		return 0
+	}
+	return free
 }
 
 func (c *Client) vm(ctx context.Context, vmid int) (*proxmox.VirtualMachine, error) {
@@ -144,33 +212,104 @@ func (c *Client) vm(ctx context.Context, vmid int) (*proxmox.VirtualMachine, err
 	return n.VirtualMachine(ctx, vmid)
 }
 
-// CloneFromTemplate clones the given template VMID into a new VM and returns
-// the assigned VMID. If newVMID is 0 the cluster assigns the next free ID.
+// clusterResources returns every resource (VMs, containers, storages,
+// nodes, ...) the cluster currently knows about, unfiltered. Callers filter
+// by Type/VMID/Node themselves.
+func (c *Client) clusterResources(ctx context.Context) ([]proxmox.ClusterResource, error) {
+	var resources []proxmox.ClusterResource
+	if err := c.api.Get(ctx, "/cluster/resources", &resources); err != nil {
+		return nil, fmt.Errorf("proxmox: cannot list cluster resources: %w", err)
+	}
+	return resources, nil
+}
+
+// nodeOf returns the node currently hosting vmid, discovered from cluster
+// resources rather than assumed from ResolveNode: a template's disk lives
+// wherever it was created, which may not be the node ResolveNode picks as
+// the *destination* for a new VM once node scheduling is in play.
+func (c *Client) nodeOf(ctx context.Context, vmid int) (string, error) {
+	resources, err := c.clusterResources(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, r := range resources {
+		if int(r.VMID) == vmid && r.Node != "" {
+			return r.Node, nil
+		}
+	}
+	return "", fmt.Errorf("proxmox: VMID %d not found anywhere in the cluster", vmid)
+}
+
+// CloneOptions configures a single template clone.
+type CloneOptions struct {
+	// NewID is the VMID to assign the clone. 0 lets Proxmox assign the next
+	// free id.
+	NewID int
+	// Name is the new VM's name.
+	Name string
+	// Linked selects a linked clone (a thin overlay referencing the
+	// template's disk) instead of a full clone (a complete byte-for-byte
+	// copy). A linked clone is created almost instantly regardless of the
+	// template's size, which matters when several machines in a pool clone
+	// at once and would otherwise contend for the same storage's I/O — but
+	// every linked clone stays dependent on the template disk for as long
+	// as it exists, and not every storage backend supports it.
+	Linked bool
+	// Pool, if set, places the new VM into this PVE resource pool as part
+	// of the clone call itself — atomically, so there is no window after
+	// creation where the VM exists but is not yet a pool member. This is
+	// what makes a pool-scoped API token ACL (rather than one granted on
+	// `/`) actually protect every other VM in the cluster: the token can
+	// only ever act on VMs inside the pool, and every VM this driver
+	// creates lands there from the moment it exists.
+	Pool string
+}
+
+// CloneFromTemplate clones the given template VMID into a new VM according
+// to opts and returns the assigned VMID.
 //
-// linked selects a linked clone (a thin overlay referencing the template's
-// disk) instead of a full clone (a complete byte-for-byte copy). A linked
-// clone is created almost instantly regardless of the template's size, which
-// matters when several machines in a pool clone at once and would otherwise
-// contend for the same storage's I/O — but every linked clone stays
-// dependent on the template disk for as long as it exists, and not every
-// storage backend supports it.
-func (c *Client) CloneFromTemplate(ctx context.Context, templateVMID, newVMID int, name string, linked bool) (int, error) {
-	vm, err := c.vm(ctx, templateVMID)
+// The clone's source node is wherever the template actually lives, which is
+// looked up independently of ResolveNode's destination: with node scheduling
+// in play the two can differ, in which case the destination is passed to PVE
+// as the clone's target node. PVE only allows that cross-node when the
+// template's disk is on shared storage — on local storage the clone fails
+// with a clear PVE-side error, which is the right outcome (there is no
+// client-side way to know in advance whether a given storage is shared).
+func (c *Client) CloneFromTemplate(ctx context.Context, templateVMID int, opts CloneOptions) (int, error) {
+	templateNode, err := c.nodeOf(ctx, templateVMID)
 	if err != nil {
 		return 0, fmt.Errorf("proxmox: template %d not found: %w", templateVMID, err)
 	}
+	n, err := c.api.Node(ctx, templateNode)
+	if err != nil {
+		return 0, fmt.Errorf("proxmox: node %q not reachable: %w", templateNode, err)
+	}
+	vm, err := n.VirtualMachine(ctx, templateVMID)
+	if err != nil {
+		return 0, fmt.Errorf("proxmox: template %d not found: %w", templateVMID, err)
+	}
+
+	target, err := c.ResolveNode(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	full := uint8(1)
-	if linked {
+	if opts.Linked {
 		full = 0
 	}
 	params := &proxmox.VirtualMachineCloneOptions{
-		NewID: newVMID,
-		Name:  name,
+		NewID: opts.NewID,
+		Name:  opts.Name,
 		Full:  full,
+		Pool:  opts.Pool,
+	}
+	if target != templateNode {
+		params.Target = target
 	}
 	assigned, task, err := vm.Clone(ctx, params)
 	if err != nil {
-		return 0, fmt.Errorf("proxmox: clone %d -> %d failed: %w", templateVMID, newVMID, err)
+		return 0, fmt.Errorf("proxmox: clone %d -> %d failed: %w", templateVMID, opts.NewID, err)
 	}
 	if task == nil {
 		return assigned, nil
@@ -209,6 +348,9 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 	}
 	if opts.Onboot != nil {
 		options = append(options, proxmox.VirtualMachineOption{Name: "onboot", Value: *opts.Onboot})
+	}
+	if opts.Tags != "" {
+		options = append(options, proxmox.VirtualMachineOption{Name: "tags", Value: opts.Tags})
 	}
 	if opts.CloudInit {
 		if opts.IPConfig != "" {
@@ -437,16 +579,14 @@ func (c *Client) AddDisks(ctx context.Context, vmid int, specs []DiskSpec) ([]At
 // `type=vm` would happily hand back an ID an existing container is using.
 // Entries with no VMID (nodes, storages) report 0 and are skipped.
 func (c *Client) UsedVMIDs(ctx context.Context) (map[int]bool, error) {
-	var resources []struct {
-		VMID int `json:"vmid"`
-	}
-	if err := c.api.Get(ctx, "/cluster/resources", &resources); err != nil {
-		return nil, fmt.Errorf("proxmox: cannot list cluster resources: %w", err)
+	resources, err := c.clusterResources(ctx)
+	if err != nil {
+		return nil, err
 	}
 	used := make(map[int]bool, len(resources))
 	for _, r := range resources {
 		if r.VMID > 0 {
-			used[r.VMID] = true
+			used[int(r.VMID)] = true
 		}
 	}
 	return used, nil
@@ -616,11 +756,15 @@ func (c *Client) waitTask(ctx context.Context, task *proxmox.Task) error {
 // VMOptions is the subset of PVE VM attributes that the docker-machine driver
 // allows overriding when cloning from a template.
 type VMOptions struct {
-	Name         string
-	Cores        uint16
-	Sockets      uint16
-	Memory       uint32
-	Onboot       *bool
+	Name    string
+	Cores   uint16
+	Sockets uint16
+	Memory  uint32
+	Onboot  *bool
+	// Tags is PVE's semicolon-separated `tags` config value. Purely
+	// informational to PVE itself, but it is how a VM created by this driver
+	// is identified/filtered in the PVE UI without opening it.
+	Tags         string
 	CloudInit    bool
 	IPConfig     string
 	Nameserver   string
