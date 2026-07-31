@@ -79,9 +79,9 @@ func TestNormalizeNameservers(t *testing.T) {
 }
 
 func TestBuildIPConfigDHCP(t *testing.T) {
-	// In dhcp mode the static fields are irrelevant and must be ignored, not
+	// In dhcp mode the pool fields are irrelevant and must be ignored, not
 	// validated: a pool that switches static -> dhcp may still carry them.
-	got, err := buildIPConfig(ipModeDHCP, "10.10.20.10/24", "10.10.20.1", 250, 200)
+	got, err := buildIPConfig(ipModeDHCP, "192.168.15.150", "192.168.15.159", "24", "192.168.15.1", 250, 200)
 	if err != nil {
 		t.Fatalf("buildIPConfig() returned error: %v", err)
 	}
@@ -89,9 +89,9 @@ func TestBuildIPConfigDHCP(t *testing.T) {
 		t.Errorf("buildIPConfig() = %q, want %q", got, "ip=dhcp")
 	}
 
-	got, err = buildIPConfig(ipModeDHCP, "", "", 0, 0)
+	got, err = buildIPConfig(ipModeDHCP, "", "", "", "", 0, 0)
 	if err != nil {
-		t.Fatalf("buildIPConfig() with empty static fields returned error: %v", err)
+		t.Fatalf("buildIPConfig() with empty pool fields returned error: %v", err)
 	}
 	if got != "ip=dhcp" {
 		t.Errorf("buildIPConfig() = %q, want %q", got, "ip=dhcp")
@@ -100,74 +100,107 @@ func TestBuildIPConfigDHCP(t *testing.T) {
 
 func TestBuildIPConfigStatic(t *testing.T) {
 	tests := []struct {
-		name    string
-		base    string
-		gw      string
-		vmid    int
-		vmidMin int
-		want    string
-		wantErr string
+		name                   string
+		start, end, prefix, gw string
+		vmid, vmidMin          int
+		want                   string
+		wantErr                string
 	}{
 		{
-			name: "the first VMID in the range gets the base address",
-			base: "10.10.20.10/24", gw: "10.10.20.1", vmid: 200, vmidMin: 200,
-			want: "ip=10.10.20.10/24,gw=10.10.20.1",
+			name:  "the first VMID in the range gets the start address",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			want: "ip=192.168.15.150/24,gw=192.168.15.1",
 		},
 		{
-			name: "the offset is added to the base",
-			base: "10.10.20.10/24", gw: "10.10.20.1", vmid: 202, vmidMin: 200,
-			want: "ip=10.10.20.12/24,gw=10.10.20.1",
+			name:  "the offset is added to the start address",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			vmid: 202, vmidMin: 200,
+			want: "ip=192.168.15.152/24,gw=192.168.15.1",
 		},
 		{
-			name: "the offset carries across an octet boundary on a /16",
-			base: "10.10.20.250/16", gw: "10.10.0.1", vmid: 210, vmidMin: 200,
+			name:  "the last address in the pool is usable",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			vmid: 209, vmidMin: 200,
+			want: "ip=192.168.15.159/24,gw=192.168.15.1",
+		},
+		{
+			// The pool, not the netmask, caps the machine count.
+			name:  "one machine past the end of the pool is exhaustion",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			vmid: 210, vmidMin: 200,
+			wantErr: "static IP pool exhausted: 192.168.15.150-192.168.15.159 holds 10 machines",
+		},
+		{
+			// The whole point of a separate prefix: a pool far from the gateway
+			// still gets the real network's netmask.
+			name:  "the offset carries across an octet boundary on a /16",
+			start: "10.10.20.250", end: "10.10.21.10", prefix: "16", gw: "10.10.0.1",
+			vmid: 210, vmidMin: 200,
 			want: "ip=10.10.21.4/16,gw=10.10.0.1",
 		},
 		{
-			name: "a VMID below the range minimum is rejected",
-			base: "10.10.20.10/24", gw: "10.10.20.1", vmid: 199, vmidMin: 200,
+			name:  "a VMID below the range minimum is rejected",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			vmid: 199, vmidMin: 200,
 			wantErr: "below",
 		},
 		{
-			// The subnet, not the VMID range, caps the pool — so running off the
-			// end is reported as exhaustion with a machine count, which is what
-			// the operator can act on.
-			name: "an address past the end of the subnet is pool exhaustion",
-			base: "10.10.20.250/24", gw: "10.10.20.1", vmid: 210, vmidMin: 200,
-			wantErr: "static IP pool exhausted: --pve-ip-base 10.10.20.250/24 leaves room for 5 machines",
+			name:  "an end below the start is rejected",
+			start: "192.168.15.159", end: "192.168.15.150", prefix: "24", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			wantErr: "--pve-ip-end 192.168.15.150 is below --pve-ip-start 192.168.15.159",
 		},
 		{
-			// .250 on a /24 leaves .250-.254 usable, so offset 5 would land on
-			// the broadcast address and is caught by the capacity check first.
-			name: "the address that would be the broadcast address is pool exhaustion",
-			base: "10.10.20.250/24", gw: "10.10.20.1", vmid: 205, vmidMin: 200,
-			wantErr: "needs offset 5",
+			// A prefix too narrow to hold both ends would give the machines a
+			// netmask that does not describe the network they are on.
+			name:  "a pool straddling two subnets is rejected",
+			start: "192.168.15.150", end: "192.168.15.170", prefix: "28", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			wantErr: "not in the same /28 subnet",
 		},
 		{
-			name: "the last usable host in the subnet is accepted",
-			base: "10.10.20.250/24", gw: "10.10.20.1", vmid: 204, vmidMin: 200,
-			want: "ip=10.10.20.254/24,gw=10.10.20.1",
-		},
-		{
-			name: "the network address is rejected",
-			base: "10.10.20.0/24", gw: "10.10.20.1", vmid: 200, vmidMin: 200,
+			name:  "a pool containing the network address is rejected",
+			start: "192.168.15.0", end: "192.168.15.10", prefix: "24", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
 			wantErr: "network address",
 		},
 		{
-			name: "an IPv6 base is rejected",
-			base: "2001:db8::10/64", gw: "2001:db8::1", vmid: 200, vmidMin: 200,
-			wantErr: "IPv4",
+			name:  "a pool containing the broadcast address is rejected",
+			start: "192.168.15.250", end: "192.168.15.255", prefix: "24", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			wantErr: "broadcast address",
 		},
 		{
-			name: "a base without a prefix is rejected",
-			base: "10.10.20.10", gw: "10.10.20.1", vmid: 200, vmidMin: 200,
-			wantErr: "--pve-ip-base",
+			name:  "an IPv6 start is rejected",
+			start: "2001:db8::10", end: "2001:db8::20", prefix: "24", gw: "2001:db8::1",
+			vmid: 200, vmidMin: 200,
+			wantErr: "IPv6",
+		},
+		{
+			name:  "a non-numeric prefix is rejected",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "/24bits", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			wantErr: "--pve-ip-prefix",
+		},
+		{
+			name:  "a prefix with no usable hosts is rejected",
+			start: "192.168.15.150", end: "192.168.15.150", prefix: "31", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			wantErr: "out of range",
+		},
+		{
+			// Written with a leading slash, as the UI placeholder shows it.
+			name:  "a prefix written as /24 is accepted",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "/24", gw: "192.168.15.1",
+			vmid: 200, vmidMin: 200,
+			want: "ip=192.168.15.150/24,gw=192.168.15.1",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := buildIPConfig(ipModeStatic, tt.base, tt.gw, tt.vmid, tt.vmidMin)
+			got, err := buildIPConfig(ipModeStatic, tt.start, tt.end, tt.prefix, tt.gw, tt.vmid, tt.vmidMin)
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatalf("buildIPConfig() = %q, want an error mentioning %q", got, tt.wantErr)
@@ -187,58 +220,65 @@ func TestBuildIPConfigStatic(t *testing.T) {
 	}
 }
 
-// validateStaticSpan is a save-time sanity check on the base and gateway. It
-// deliberately does NOT require the subnet to cover the whole VMID range:
-// NextFreeVMID hands out the lowest free id, so machines cluster at the bottom
-// of the range and the subnet only has to hold the machines that exist at once.
-// Capacity is enforced per machine by buildIPConfig instead.
-func TestValidateStaticSpan(t *testing.T) {
+// validateStaticPool is a save-time check on the pool and gateway. It
+// deliberately does NOT require the pool to be as large as the VMID range:
+// NextFreeVMID hands out the lowest free id, so machines fill the pool from its
+// start upward. Capacity is enforced per machine by buildIPConfig.
+func TestValidateStaticPool(t *testing.T) {
 	tests := []struct {
-		name    string
-		base    string
-		gw      string
-		lo, hi  int
-		wantErr string
+		name                   string
+		start, end, prefix, gw string
+		lo, hi                 int
+		wantErr                string
 	}{
-		{name: "a range that fits", base: "10.10.20.10/24", gw: "10.10.20.1", lo: 200, hi: 299},
-		{name: "a range that exactly reaches the last host", base: "10.10.20.10/24", gw: "10.10.20.1", lo: 200, hi: 444},
 		{
-			// Accepted on purpose. A VMID range wider than the subnet is a normal
-			// way to keep id headroom; the subnet simply caps how many machines
-			// can exist. Requiring full coverage demanded a /25 to run three
-			// nodes with a 100-wide range.
-			name: "a VMID range wider than the subnet is accepted", base: "10.10.20.200/24", gw: "10.10.20.1", lo: 200, hi: 299,
+			name:  "a pool smaller than the VMID range is accepted",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			lo: 200, hi: 299,
 		},
 		{
-			name: "a /30 base with a wide VMID range is accepted", base: "10.10.20.9/30", gw: "10.10.20.10", lo: 200, hi: 299,
+			// The case that started this: the gateway is outside the pool, which
+			// is normal, but inside the subnet, which is what matters.
+			name:  "a gateway outside the pool but inside the subnet is accepted",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "192.168.15.1",
+			lo: 200, hi: 209,
 		},
 		{
-			name: "a base that is the network address is rejected", base: "10.10.20.0/24", gw: "10.10.20.1", lo: 200, hi: 299,
-			wantErr: "is the network address",
+			// The /28 mistake: it narrows the subnet to .144-.159 so .1 is no
+			// longer on-link, and the node would boot with no default route.
+			// The pool stops at .158 here so the broadcast check does not fire
+			// first and mask the gateway error being tested.
+			name:  "a gateway outside the subnet is rejected",
+			start: "192.168.15.150", end: "192.168.15.158", prefix: "28", gw: "192.168.15.1",
+			lo: 200, hi: 299,
+			wantErr: "outside 192.168.15.144/28",
 		},
 		{
-			name: "a base with no room before the end of the subnet is rejected", base: "10.10.20.255/24", gw: "10.10.20.1", lo: 200, hi: 299,
-			wantErr: "is the broadcast address",
+			// The exact config that prompted this design: /28 also drags .159
+			// into being the broadcast address, which is caught first.
+			name:  "a /28 pool ending on the subnet broadcast is rejected",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "28", gw: "192.168.15.1",
+			lo: 200, hi: 299,
+			wantErr: "broadcast address of 192.168.15.144/28",
 		},
 		{
-			name: "a gateway outside the subnet", base: "10.10.20.10/24", gw: "10.10.99.1", lo: 200, hi: 299,
-			wantErr: "--pve-gateway 10.10.99.1 is outside the subnet",
-		},
-		{
-			name: "a malformed gateway", base: "10.10.20.10/24", gw: "not-an-ip", lo: 200, hi: 299,
+			name:  "a malformed gateway is rejected",
+			start: "192.168.15.150", end: "192.168.15.159", prefix: "24", gw: "not-an-ip",
+			lo: 200, hi: 299,
 			wantErr: "--pve-gateway",
 		},
 		{
-			name: "a prefix too small to hold hosts", base: "10.10.20.10/31", gw: "10.10.20.11", lo: 200, hi: 200,
-			wantErr: "/30",
+			name:  "a single-address pool is accepted",
+			start: "192.168.15.150", end: "192.168.15.150", prefix: "24", gw: "192.168.15.1",
+			lo: 200, hi: 299,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateStaticSpan(tt.base, tt.gw, tt.lo, tt.hi)
+			err := validateStaticPool(tt.start, tt.end, tt.prefix, tt.gw, tt.lo, tt.hi)
 			if tt.wantErr != "" {
 				if err == nil {
-					t.Fatalf("validateStaticSpan() = nil, want an error mentioning %q", tt.wantErr)
+					t.Fatalf("validateStaticPool() = nil, want an error mentioning %q", tt.wantErr)
 				}
 				if !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("error = %q, want it to mention %q", err, tt.wantErr)
@@ -246,7 +286,7 @@ func TestValidateStaticSpan(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("validateStaticSpan() returned error: %v", err)
+				t.Fatalf("validateStaticPool() returned error: %v", err)
 			}
 		})
 	}
@@ -262,6 +302,7 @@ func newValidatedDriver() *Driver {
 	d.APITokenSecret = "secret"
 	d.TemplateVMID = 9000
 	d.SkipPermCheck = true
+
 	return d
 }
 
@@ -269,7 +310,9 @@ func TestPreCreateCheckStaticRequiresVMIDRange(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true // validateAddressing checks cloud-init before the range
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.10/24"
+	d.IPStart = "10.10.20.10"
+	d.IPEnd = "10.10.20.109"
+	d.IPPrefix = "24"
 	d.Gateway = "10.10.20.1"
 	d.VMIDRange = "" // the offset is undefined without it
 
@@ -290,7 +333,9 @@ func TestPreCreateCheckAcceptsSubnetSmallerThanVMIDRange(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.9/30"
+	d.IPStart = "10.10.20.9"
+	d.IPEnd = "10.10.20.10"
+	d.IPPrefix = "24"
 	d.Gateway = "10.10.20.10"
 	d.VMIDRange = "200-299"
 
@@ -304,14 +349,16 @@ func TestStaticPoolExhaustionIsReportedPerMachine(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.9/30"
+	d.IPStart = "10.10.20.9"
+	d.IPEnd = "10.10.20.10"
+	d.IPPrefix = "24"
 	d.Gateway = "10.10.20.10"
 	d.VMIDRange = "200-299"
 
 	// .9 on a /30 (.8-.11) leaves .9 and .10 usable, so two machines fit.
 	for vmid, want := range map[int]string{
-		200: "ip=10.10.20.9/30,gw=10.10.20.10",
-		201: "ip=10.10.20.10/30,gw=10.10.20.10",
+		200: "ip=10.10.20.9/24,gw=10.10.20.10",
+		201: "ip=10.10.20.10/24,gw=10.10.20.10",
 	} {
 		d.VMID = vmid
 		got, err := d.resolveIPConfig()
@@ -332,7 +379,7 @@ func TestStaticPoolExhaustionIsReportedPerMachine(t *testing.T) {
 	if !strings.Contains(err.Error(), "static IP pool exhausted") {
 		t.Errorf("error = %q, want it to report pool exhaustion", err)
 	}
-	if !strings.Contains(err.Error(), "room for 2 machines") {
+	if !strings.Contains(err.Error(), "holds 2 machines") {
 		t.Errorf("error = %q, want it to state the capacity so the operator can act on it", err)
 	}
 }
@@ -340,14 +387,16 @@ func TestStaticPoolExhaustionIsReportedPerMachine(t *testing.T) {
 func TestPreCreateCheckRejectsStaticFieldsInDHCPMode(t *testing.T) {
 	d := newValidatedDriver()
 	d.IPMode = "dhcp"
-	d.IPBase = "10.10.20.10/24"
+	d.IPStart = "10.10.20.10"
+	d.IPEnd = "10.10.20.109"
+	d.IPPrefix = "24"
 
 	err := d.PreCreateCheck()
 	if err == nil {
-		t.Fatal("PreCreateCheck() = nil, want an error about --pve-ip-base in dhcp mode")
+		t.Fatal("PreCreateCheck() = nil, want an error about the pool fields in dhcp mode")
 	}
-	if !strings.Contains(err.Error(), "--pve-ip-base") {
-		t.Errorf("error = %q, want it to mention --pve-ip-base", err)
+	if !strings.Contains(err.Error(), "--pve-ip-start") {
+		t.Errorf("error = %q, want it to mention --pve-ip-start", err)
 	}
 }
 
@@ -371,7 +420,9 @@ func TestPreCreateCheckAcceptsValidStaticConfig(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.10/24"
+	d.IPStart = "10.10.20.10"
+	d.IPEnd = "10.10.20.109"
+	d.IPPrefix = "24"
 	d.Gateway = "10.10.20.1"
 	d.Nameservers = "10.10.20.1, 1.1.1.1"
 	d.SearchDomain = "cluster.lan"
@@ -393,7 +444,9 @@ func TestResolveIPConfigUsesFinalVMID(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.10/24"
+	d.IPStart = "10.10.20.10"
+	d.IPEnd = "10.10.20.109"
+	d.IPPrefix = "24"
 	d.Gateway = "10.10.20.1"
 	d.VMIDRange = "200-299"
 
@@ -417,7 +470,9 @@ func TestResolveIPConfigStaticWithoutVMIDRange(t *testing.T) {
 	d := newValidatedDriver()
 	d.CloudInit = true
 	d.IPMode = "static"
-	d.IPBase = "10.10.20.10/24"
+	d.IPStart = "10.10.20.10"
+	d.IPEnd = "10.10.20.109"
+	d.IPPrefix = "24"
 	d.Gateway = "10.10.20.1"
 	d.VMIDRange = ""
 	d.VMID = 202

@@ -123,10 +123,12 @@ See [networking.md](networking.md) for how to build the node network itself.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `pve-cloudinit` | `false` | Push `ipconfig0` / `ciuser` / `sshkeys` to the cloned VM. **Required** for any data disk with a filesystem |
+| `pve-cloudinit` | `true` | Deprecated and always on. Cloud-init is the only channel for the SSH key, the static address and the DNS settings, so the driver enables it regardless |
 | `pve-ip-mode` | `dhcp` | `dhcp` or `static`. Static derives each machine's address from its VMID, so it requires `pve-vmid-range` |
-| `pve-ip-base` | — | First address of the static pool in CIDR form, e.g. `10.10.20.10/24`. The lowest VMID in the range gets this address; each later VMID gets the next |
-| `pve-gateway` | — | Default gateway for static addressing. Must be inside the subnet of `pve-ip-base` |
+| `pve-ip-start` | — | First address of the static pool, e.g. `192.168.15.150`. The lowest VMID in the range gets this address; each later VMID gets the next |
+| `pve-ip-end` | — | Last address of the pool, e.g. `192.168.15.159`. The pool size caps how many machines the machine pool can hold |
+| `pve-ip-prefix` | — | Subnet prefix length the machines get, e.g. `24`. **The netmask, not the pool size** — see below |
+| `pve-gateway` | — | Default gateway. May sit outside the pool, but must be inside the subnet `pve-ip-prefix` describes |
 | `pve-nameservers` | — | DNS servers, space- or comma-separated. Applies in both modes; empty keeps the DHCP-supplied resolver |
 | `pve-searchdomain` | — | DNS search domain, e.g. `cluster.lan`. Applies in both modes |
 | `pve-ciuser` | *(empty)* | Cloud-init user to create and install the keys for. Empty means "same as `pve-ssh-user`", which is nearly always what you want |
@@ -139,46 +141,68 @@ keys for `ciuser`, and that is the only account anything can subsequently log
 into. Leaving `pve-ciuser` empty derives it from `pve-ssh-user`, which is why the
 UI exposes a single **VM User** field.
 
+### The prefix is the netmask, not the pool size
+
+This is the one thing worth reading twice. The pool is bounded by
+`pve-ip-start` and `pve-ip-end`; `pve-ip-prefix` is the netmask the machines
+get — what they use to decide whether an address is reachable directly or has to
+go via the gateway.
+
+They are separate fields because folding them into a single CIDR invites writing
+`/28` to mean "16 addresses". That does not bound the pool: it narrows the
+subnet to `192.168.15.144–.159`, so a gateway at `192.168.15.1` is no longer
+on-link, the default route cannot be installed, and the node boots unable to
+reach anything.
+
+So set `pve-ip-prefix` to the prefix of the **real network** — usually the same
+`/24` your LAN uses — and bound the pool with start and end:
+
+```
+pve-ip-start  = 192.168.15.150
+pve-ip-end    = 192.168.15.159
+pve-ip-prefix = 24
+pve-gateway   = 192.168.15.1
+```
+
+The gateway sits outside `.150–.159`, which is expected and fine. What is
+rejected is a gateway outside the `/24`.
+
 ### How static addresses are allocated
 
 The driver is a separate process per machine with no shared state, so there is
 nothing to allocate against. The address is derived instead:
 
 ```
-address = pve-ip-base + (vmid - <low end of pve-vmid-range>)
+address = pve-ip-start + (vmid - <low end of pve-vmid-range>)
 ```
 
-With `pve-vmid-range 200-299` and `pve-ip-base 10.10.20.10/24`, VMID 200 gets
-`10.10.20.10`, VMID 201 gets `10.10.20.11`, and so on. Deleting a machine frees
-its VMID and therefore its address.
+With `pve-vmid-range 200-299` and the pool above, VMID 200 gets
+`192.168.15.150`, VMID 201 gets `.151`, and so on. Deleting a machine frees its
+VMID and therefore its address.
 
-**Give each pool its own `pve-ip-base`.** VMIDs are unique across the whole
-cluster — the driver picks one by scanning `/cluster/resources` — so two pools
-drawing from the *same* VMID range always get different VMIDs and therefore
-different addresses. That case is safe. The collision is the opposite one: two
-pools with **different** range minima but the **same** `pve-ip-base`. With
-`200-299` and `300-399` both based at `10.10.20.10/24`, VMID 200 and VMID 300
-both compute offset 0 and both claim `10.10.20.10`. So either give each pool a
-distinct base, or let pools share the range *and* the base.
+**Give each pool its own address range.** VMIDs are unique across the whole
+cluster — the driver picks one by scanning `/cluster/resources` — so two machine
+pools drawing from the *same* VMID range always get different VMIDs and
+therefore different addresses. That case is safe. The collision is the opposite
+one: two pools with **different** range minima but the **same** `pve-ip-start`.
+With `200-299` and `300-399` both starting at `192.168.15.150`, VMID 200 and
+VMID 300 both compute offset 0 and both claim `.150`.
 
-**The subnet caps the pool, not the VMID range.** VMIDs are handed out
-lowest-free-first, so machines fill the subnet upward from the base and the
-subnet only has to hold the machines that exist at once. A VMID range *wider*
-than the subnet is therefore normal and accepted — it just supplies ids. With
-`pve-ip-base 10.10.20.9/30` (a `/30` spans `.8`–`.11`, so `.9` and `.10` are
-usable) and `pve-vmid-range 200-299`, the pool holds **two** machines; the third
-fails with:
+**The pool caps the machine count, not the VMID range.** VMIDs are handed out
+lowest-free-first, so machines fill the pool from the start upward and it only
+has to hold the machines running at once. A VMID range *wider* than the pool is
+therefore normal — it just supplies ids. With the ten-address pool above and
+`pve-vmid-range 200-299`, the eleventh machine fails with:
 
 ```
-pve: static IP pool exhausted: --pve-ip-base 10.10.20.9/30 leaves room for
-2 machines from 10.10.20.9, and VMID 202 needs offset 2
+pve: static IP pool exhausted: 192.168.15.150-192.168.15.159 holds 10 machines,
+and VMID 210 needs slot 11; widen the pool or scale down
 ```
 
-Earlier versions demanded the subnet cover the *whole* VMID range, which forced
-a `/25` just to run three nodes with a 100-wide range. `PreCreateCheck` now only
-rejects a base that is unusable outright — the network or broadcast address, or
-one with no room left before the end of its subnet — and logs the real capacity
-when the VMID range exceeds it.
+`PreCreateCheck` rejects a pool whose ends fall in different subnets, one that
+includes the subnet's network or broadcast address, an end below the start, or a
+gateway outside the subnet. It logs the real capacity when the VMID range
+exceeds it.
 
 DNS (`pve-nameservers`, `pve-searchdomain`) requires `pve-cloudinit` in either
 mode, because PVE applies `nameserver`/`searchdomain` as cloud-init options and

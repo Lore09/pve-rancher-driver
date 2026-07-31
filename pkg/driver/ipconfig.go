@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/docker/machine/libmachine/log"
@@ -78,22 +80,35 @@ func offsetAddr(addr netip.Addr, n int) (netip.Addr, error) {
 	return netip.AddrFrom4(out), nil
 }
 
-// capacityFrom returns how many machines can be addressed starting at the base,
-// counting up to but not including the subnet's broadcast address.
+// staticPool is the range of addresses a machine pool may hand out, plus the
+// netmask its machines get.
 //
-// This — not the width of the VMID range — is what caps a static pool. VMIDs
-// come from NextFreeVMID, which returns the *lowest* free id in the range, so
-// machines cluster at the bottom of the range and the subnet only ever has to
-// hold the machines that exist at once. Sizing the subnet to the whole VMID
-// range instead demanded a /25 to run three nodes with a 100-wide range.
-func capacityFrom(pfx netip.Prefix) (int, error) {
-	_, broadcast, err := networkAndBroadcast(pfx)
-	if err != nil {
-		return 0, err
-	}
-	first := pfx.Addr().As4()
-	last := broadcast.As4()
-	return int(binary.BigEndian.Uint32(last[:]) - binary.BigEndian.Uint32(first[:])), nil
+// Start and end are separate from the prefix on purpose. The prefix is the
+// node's *netmask* — what it uses to decide whether an address is on-link —
+// while start/end bound the pool. Folding the two into one CIDR made people
+// write /28 to mean "16 addresses", which silently narrowed the subnet until
+// the real gateway fell outside it and the node came up with no default route.
+type staticPool struct {
+	start netip.Addr
+	end   netip.Addr
+	bits  int
+}
+
+// prefix returns the subnet the machines believe they are on.
+func (p staticPool) prefix() netip.Prefix {
+	return netip.PrefixFrom(p.start, p.bits)
+}
+
+// capacity is how many machines the pool can address.
+//
+// This — not the width of the VMID range — is what caps a pool. VMIDs come
+// from NextFreeVMID, which returns the *lowest* free id, so machines fill the
+// pool from the start upward and it only ever has to hold the machines running
+// at once.
+func (p staticPool) capacity() int {
+	s := p.start.As4()
+	e := p.end.As4()
+	return int(binary.BigEndian.Uint32(e[:])-binary.BigEndian.Uint32(s[:])) + 1
 }
 
 // networkAndBroadcast returns the two addresses in pfx that must never be
@@ -109,37 +124,93 @@ func networkAndBroadcast(pfx netip.Prefix) (netip.Addr, netip.Addr, error) {
 	return network, broadcast, nil
 }
 
-// parseIPBase parses --pve-ip-base and rejects everything this design does not
-// support, with a message naming the flag.
-func parseIPBase(base string) (netip.Prefix, error) {
-	pfx, err := netip.ParsePrefix(strings.TrimSpace(base))
+// parseStaticAddr parses one IPv4 address, naming the flag it came from.
+func parseStaticAddr(flag, value string) (netip.Addr, error) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
 	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("pve: --pve-ip-base %q must be an IPv4 address with a prefix, e.g. 10.10.20.10/24", base)
+		return netip.Addr{}, fmt.Errorf("pve: %s %q must be an IPv4 address, e.g. 192.168.15.150", flag, value)
 	}
-	if !pfx.Addr().Is4() {
-		return netip.Prefix{}, fmt.Errorf("pve: --pve-ip-base %q must be IPv4; IPv6 addressing is not supported", base)
+	if !addr.Is4() {
+		return netip.Addr{}, fmt.Errorf("pve: %s %q must be IPv4; IPv6 addressing is not supported", flag, value)
 	}
-	if pfx.Bits() > minStaticPrefixBits {
-		return netip.Prefix{}, fmt.Errorf("pve: --pve-ip-base %q has no usable host addresses; use /30 or larger", base)
+	return addr, nil
+}
+
+// parsePrefixBits parses --pve-ip-prefix, accepting either "24" or "/24".
+func parsePrefixBits(value string) (int, error) {
+	s := strings.TrimPrefix(strings.TrimSpace(value), "/")
+	bits, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("pve: --pve-ip-prefix %q must be a number of bits, e.g. 24", value)
 	}
-	return pfx, nil
+	// Below /8 is never a node network, and above /30 leaves no usable hosts
+	// once the network and broadcast addresses are excluded.
+	if bits < 8 || bits > minStaticPrefixBits {
+		return 0, fmt.Errorf("pve: --pve-ip-prefix /%d is out of range; use a value between /8 and /%d", bits, minStaticPrefixBits)
+	}
+	return bits, nil
+}
+
+// parseStaticPool parses and validates the three pool fields together.
+//
+// The prefix is deliberately its own field. It is the netmask the machines get,
+// not the size of the pool: folding the two into one CIDR led people to write
+// /28 meaning "16 addresses", which narrowed the subnet until the gateway fell
+// outside it and the node booted with no usable default route.
+func parseStaticPool(start, end, prefix string) (staticPool, error) {
+	var p staticPool
+
+	bits, err := parsePrefixBits(prefix)
+	if err != nil {
+		return p, err
+	}
+	first, err := parseStaticAddr("--pve-ip-start", start)
+	if err != nil {
+		return p, err
+	}
+	last, err := parseStaticAddr("--pve-ip-end", end)
+	if err != nil {
+		return p, err
+	}
+	p = staticPool{start: first, end: last, bits: bits}
+
+	if last.Less(first) {
+		return staticPool{}, fmt.Errorf("pve: --pve-ip-end %s is below --pve-ip-start %s", last, first)
+	}
+	// Both ends must sit in the same subnet, or the machines at one end would get
+	// a netmask that does not describe the network they are actually on.
+	subnet := p.prefix().Masked()
+	if !subnet.Contains(last) {
+		return staticPool{}, fmt.Errorf("pve: --pve-ip-start %s and --pve-ip-end %s are not in the same /%d subnet (%s); widen --pve-ip-prefix or move one end", first, last, bits, subnet)
+	}
+	network, broadcast, err := networkAndBroadcast(p.prefix())
+	if err != nil {
+		return staticPool{}, err
+	}
+	if first == network || last == network {
+		return staticPool{}, fmt.Errorf("pve: the pool includes %s, the network address of %s, which cannot be assigned to a machine", network, subnet)
+	}
+	if first == broadcast || last == broadcast {
+		return staticPool{}, fmt.Errorf("pve: the pool includes %s, the broadcast address of %s, which cannot be assigned to a machine", broadcast, subnet)
+	}
+	return p, nil
 }
 
 // buildIPConfig renders the cloud-init ipconfig0 value for one machine.
 //
 // The static address is derived from the VMID rather than allocated, because
 // the driver is a stateless per-machine process with nothing to allocate
-// against. offset = vmid - vmidMin, so the VMID range and the address range
-// stay in lockstep with no coordination and no races.
+// against. offset = vmid - vmidMin, so machines fill the pool from its start
+// upward with no coordination and no races.
 //
 // IMPORTANT: callers must pass the *final* VMID. cloneFromTemplate retries when
 // it loses a VMID claim, so an address computed before the claim settles would
 // belong to a VMID this machine did not get.
-func buildIPConfig(mode ipMode, base, gateway string, vmid, vmidMin int) (string, error) {
+func buildIPConfig(mode ipMode, start, end, prefix, gateway string, vmid, vmidMin int) (string, error) {
 	if mode != ipModeStatic {
 		return "ip=dhcp", nil
 	}
-	pfx, err := parseIPBase(base)
+	pool, err := parseStaticPool(start, end, prefix)
 	if err != nil {
 		return "", err
 	}
@@ -147,84 +218,16 @@ func buildIPConfig(mode ipMode, base, gateway string, vmid, vmidMin int) (string
 	if offset < 0 {
 		return "", fmt.Errorf("pve: VMID %d is below the --pve-vmid-range minimum %d, so it has no address in the pool", vmid, vmidMin)
 	}
-	addr, err := offsetAddr(pfx.Addr(), offset)
+	// The pool, not the VMID range, is what bounds the machine count. Report
+	// exhaustion in those terms so the number is actionable.
+	if capacity := pool.capacity(); offset >= capacity {
+		return "", fmt.Errorf("pve: static IP pool exhausted: %s-%s holds %d machines, and VMID %d needs slot %d; widen the pool or scale down", pool.start, pool.end, capacity, vmid, offset+1)
+	}
+	addr, err := offsetAddr(pool.start, offset)
 	if err != nil {
 		return "", err
 	}
-	// The subnet, not the VMID range, is what bounds the pool. Report exhaustion
-	// in those terms: the operator needs to know how many machines the subnet
-	// can hold, not that some arithmetic left the prefix.
-	capacity, err := capacityFrom(pfx)
-	if err != nil {
-		return "", err
-	}
-	if offset >= capacity {
-		return "", fmt.Errorf("pve: static IP pool exhausted: --pve-ip-base %s leaves room for %d machines from %s, and VMID %d needs offset %d; widen the subnet, lower the base address, or scale the pool down", base, capacity, pfx.Addr(), vmid, offset)
-	}
-	if !pfx.Contains(addr) {
-		return "", fmt.Errorf("pve: VMID %d maps to %s, which is outside the subnet of --pve-ip-base %s", vmid, addr, base)
-	}
-	network, broadcast, err := networkAndBroadcast(pfx)
-	if err != nil {
-		return "", err
-	}
-	if addr == network {
-		return "", fmt.Errorf("pve: VMID %d maps to %s, which is the network address of %s", vmid, addr, base)
-	}
-	if addr == broadcast {
-		return "", fmt.Errorf("pve: VMID %d maps to %s, which is the broadcast address of %s", vmid, addr, base)
-	}
-	return fmt.Sprintf("ip=%s/%d,gw=%s", addr, pfx.Bits(), strings.TrimSpace(gateway)), nil
-}
-
-// validateStaticSpan checks the static addressing config at pool-save time.
-//
-// It deliberately does NOT require the subnet to cover the whole VMID range.
-// NextFreeVMID hands out the lowest free id in the range, so machines cluster
-// at the bottom of it and the subnet only ever has to hold the machines that
-// exist at once. Requiring full coverage forced absurd subnet sizes — a
-// 100-wide VMID range demanded a /25 even to run three nodes.
-//
-// What it does check is that the base address is usable at all, so the errors a
-// user can only hit by scaling are left to buildIPConfig, which reports them as
-// pool exhaustion with a machine count.
-func validateStaticSpan(base, gateway string, vmidMin, vmidMax int) error {
-	pfx, err := parseIPBase(base)
-	if err != nil {
-		return err
-	}
-	gw, err := netip.ParseAddr(strings.TrimSpace(gateway))
-	if err != nil || !gw.Is4() {
-		return fmt.Errorf("pve: --pve-gateway %q must be an IPv4 address", gateway)
-	}
-	if !pfx.Contains(gw) {
-		return fmt.Errorf("pve: --pve-gateway %s is outside the subnet of --pve-ip-base %s; a gateway the nodes cannot reach is almost always a typo", gateway, base)
-	}
-	network, broadcast, err := networkAndBroadcast(pfx)
-	if err != nil {
-		return err
-	}
-	if pfx.Addr() == network {
-		return fmt.Errorf("pve: --pve-ip-base %s is the network address of its subnet, which cannot be assigned to a machine; use the next address", base)
-	}
-	if pfx.Addr() == broadcast {
-		return fmt.Errorf("pve: --pve-ip-base %s is the broadcast address of its subnet, which cannot be assigned to a machine", base)
-	}
-	// The base must leave room for at least one machine. Anything beyond that is
-	// a capacity question, reported per machine by buildIPConfig.
-	capacity, err := capacityFrom(pfx)
-	if err != nil {
-		return err
-	}
-	if capacity < 1 {
-		return fmt.Errorf("pve: --pve-ip-base %s leaves no room for any machine before the end of its subnet; lower the base address or widen the subnet", base)
-	}
-	// Not an error: a VMID range wider than the subnet is a normal way to keep
-	// id headroom. Surface the real capacity so it is not a surprise later.
-	if size := vmidMax - vmidMin + 1; size > capacity {
-		log.Infof("pve: --pve-vmid-range %d-%d allows %d machines but --pve-ip-base %s addresses %d; the pool is capped at %d machines by the subnet", vmidMin, vmidMax, size, base, capacity, capacity)
-	}
-	return nil
+	return fmt.Sprintf("ip=%s/%d,gw=%s", addr, pool.bits, strings.TrimSpace(gateway)), nil
 }
 
 // resolveIPConfig renders the ipconfig0 value for this machine.
@@ -248,7 +251,40 @@ func (d *Driver) resolveIPConfig() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return buildIPConfig(mode, d.IPBase, d.Gateway, d.VMID, vmidMin)
+	return buildIPConfig(mode, d.IPStart, d.IPEnd, d.IPPrefix, d.Gateway, d.VMID, vmidMin)
+}
+
+// validateStaticPool checks the pool and gateway at pool-save time.
+//
+// It deliberately does NOT require the pool to be as large as the VMID range.
+// NextFreeVMID hands out the lowest free id, so machines fill the pool from its
+// start upward and it only has to hold the machines running at once. Requiring
+// full coverage forced absurd pool sizes — a 100-wide VMID range demanded 100
+// addresses even to run three nodes. Exhaustion is reported per machine by
+// buildIPConfig instead, with the pool size named.
+func validateStaticPool(start, end, prefix, gateway string, vmidMin, vmidMax int) error {
+	pool, err := parseStaticPool(start, end, prefix)
+	if err != nil {
+		return err
+	}
+	gw, err := parseStaticAddr("--pve-gateway", gateway)
+	if err != nil {
+		return err
+	}
+	// The gateway belongs to the subnet, not the pool: it is normal and expected
+	// for it to sit outside the pool's range. But a gateway outside the *subnet*
+	// is not reachable on-link, so the node would boot unable to install a
+	// default route.
+	subnet := pool.prefix().Masked()
+	if !subnet.Contains(gw) {
+		return fmt.Errorf("pve: --pve-gateway %s is outside %s, the subnet the machines get from --pve-ip-prefix /%d. The gateway may sit outside the pool %s-%s, but it must be inside the subnet or the node has no on-link route to it — widen --pve-ip-prefix to match the real network", gw, subnet, pool.bits, pool.start, pool.end)
+	}
+	// Not an error: a VMID range wider than the pool is a normal way to keep id
+	// headroom. Surface the real capacity so it is not a surprise later.
+	if capacity, size := pool.capacity(), vmidMax-vmidMin+1; size > capacity {
+		log.Infof("pve: --pve-vmid-range %d-%d allows %d machines but the pool %s-%s holds %d; the pool caps this machine pool at %d", vmidMin, vmidMax, size, pool.start, pool.end, capacity, capacity)
+	}
+	return nil
 }
 
 // validateAddressing checks every addressing and DNS field. It runs in
@@ -275,27 +311,38 @@ func (d *Driver) validateAddressing() error {
 	d.Nameservers = ns
 
 	if mode == ipModeDHCP {
-		// Rejected rather than ignored: a leftover base from a static config
-		// looks like it is in effect, and the node then comes up on a DHCP
+		// Rejected rather than ignored: leftover pool fields from a static config
+		// look like they are in effect, and the node then comes up on a DHCP
 		// address nobody expected.
 		var orphans []string
-		if d.IPBase != "" {
-			orphans = append(orphans, "--pve-ip-base")
-		}
-		if d.Gateway != "" {
-			orphans = append(orphans, "--pve-gateway")
+		for flag, value := range map[string]string{
+			"--pve-ip-start":  d.IPStart,
+			"--pve-ip-end":    d.IPEnd,
+			"--pve-ip-prefix": d.IPPrefix,
+			"--pve-gateway":   d.Gateway,
+		} {
+			if value != "" {
+				orphans = append(orphans, flag)
+			}
 		}
 		if len(orphans) > 0 {
+			sort.Strings(orphans) // map iteration order is random; keep the message stable
 			return fmt.Errorf("pve: %s only apply when --pve-ip-mode is static", strings.Join(orphans, ", "))
 		}
 		return nil
 	}
 
-	if d.IPBase == "" {
-		return errors.New("pve: --pve-ip-base is required when --pve-ip-mode is static")
-	}
-	if d.Gateway == "" {
-		return errors.New("pve: --pve-gateway is required when --pve-ip-mode is static")
+	// Ordered, not a map: the form reports the first missing field, and it should
+	// be the same one the driver names.
+	for _, f := range []struct{ flag, value string }{
+		{"--pve-ip-start", d.IPStart},
+		{"--pve-ip-end", d.IPEnd},
+		{"--pve-ip-prefix", d.IPPrefix},
+		{"--pve-gateway", d.Gateway},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return fmt.Errorf("pve: %s is required when --pve-ip-mode is static", f.flag)
+		}
 	}
 	if !d.CloudInit {
 		return errors.New("pve: --pve-ip-mode static needs --pve-cloudinit: the address is delivered through cloud-init ipconfig0")
@@ -309,5 +356,5 @@ func (d *Driver) validateAddressing() error {
 	if err != nil {
 		return err
 	}
-	return validateStaticSpan(d.IPBase, d.Gateway, vmidMin, vmidMax)
+	return validateStaticPool(d.IPStart, d.IPEnd, d.IPPrefix, d.Gateway, vmidMin, vmidMax)
 }

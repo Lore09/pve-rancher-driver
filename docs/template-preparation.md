@@ -27,7 +27,7 @@ you pick, the five hard requirements are:
    format and mount data disks, so passwordless `sudo` is doubly load-bearing.
 4. **An address for the NIC** — either DHCP on the bridge used for `net0`, or
    driver-assigned static addressing (`--pve-ip-mode static` with
-   `--pve-ip-base` and `--pve-gateway`). See
+   `--pve-ip-start`, `--pve-ip-end`, `--pve-ip-prefix` and `--pve-gateway`). See
    [docs/networking.md](networking.md) for both.
 5. **The packages your storage stack needs, baked into the image.** The driver
    attaches, formats and mounts data disks itself, but it does not install

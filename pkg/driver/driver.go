@@ -80,7 +80,9 @@ type Driver struct {
 	NetFirewall      string
 	CloudInit        bool
 	IPMode           string
-	IPBase           string
+	IPStart          string
+	IPEnd            string
+	IPPrefix         string
 	Gateway          string
 	Nameservers      string
 	SearchDomain     string
@@ -270,18 +272,28 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.StringFlag{
 			Name:   "pve-ip-mode",
 			EnvVar: "PVE_IP_MODE",
-			Usage:  "How the machine gets its address: dhcp (default) or static. static requires --pve-ip-base, --pve-gateway and --pve-vmid-range",
+			Usage:  "How the machine gets its address: dhcp (default) or static. static requires --pve-ip-start, --pve-ip-end, --pve-ip-prefix, --pve-gateway and --pve-vmid-range",
 			Value:  string(ipModeDHCP),
 		},
 		mcnflag.StringFlag{
-			Name:   "pve-ip-base",
-			EnvVar: "PVE_IP_BASE",
-			Usage:  "First address of the static pool, in CIDR form, e.g. 10.10.20.10/24. The machine with the lowest VMID in --pve-vmid-range gets this address; each later VMID gets the next one",
+			Name:   "pve-ip-start",
+			EnvVar: "PVE_IP_START",
+			Usage:  "First address of the static pool, e.g. 192.168.15.150. The machine with the lowest VMID in --pve-vmid-range gets this address; each later VMID gets the next one",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-ip-end",
+			EnvVar: "PVE_IP_END",
+			Usage:  "Last address of the static pool, e.g. 192.168.15.159. The pool size caps how many machines the machine pool can hold",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-ip-prefix",
+			EnvVar: "PVE_IP_PREFIX",
+			Usage:  "Subnet prefix length the machines get, e.g. 24. This is the netmask of the network they sit on, NOT the size of the pool — set it to the real network's prefix so the gateway stays reachable",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-gateway",
 			EnvVar: "PVE_GATEWAY",
-			Usage:  "Default gateway for static addressing, e.g. 10.10.20.1. Must be inside the subnet of --pve-ip-base",
+			Usage:  "Default gateway for static addressing, e.g. 192.168.15.1. It may sit outside the pool, but must be inside the subnet implied by --pve-ip-prefix",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-nameservers",
@@ -386,7 +398,9 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	}
 	d.CloudInit = true
 	d.IPMode = strings.TrimSpace(flags.String("pve-ip-mode"))
-	d.IPBase = strings.TrimSpace(flags.String("pve-ip-base"))
+	d.IPStart = strings.TrimSpace(flags.String("pve-ip-start"))
+	d.IPEnd = strings.TrimSpace(flags.String("pve-ip-end"))
+	d.IPPrefix = strings.TrimSpace(flags.String("pve-ip-prefix"))
 	d.Gateway = strings.TrimSpace(flags.String("pve-gateway"))
 	d.Nameservers = strings.TrimSpace(flags.String("pve-nameservers"))
 	d.SearchDomain = strings.TrimSpace(flags.String("pve-searchdomain"))

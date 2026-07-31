@@ -223,21 +223,55 @@ separate process per machine with no shared state, so there is nothing to
 allocate against — the address is **derived** from the VMID:
 
 ```
-address = pve-ip-base + (vmid - <low end of pve-vmid-range>)
+address = pve-ip-start + (vmid - <low end of pve-vmid-range>)
 ```
 
-Worked example, with `pve-vmid-range 200-299`, `pve-ip-base 10.10.20.10/24` and
-`pve-gateway 10.10.20.1`:
+The pool is written as three fields: **start**, **end**, and the **subnet
+prefix** the machines get. Worked example, with `pve-vmid-range 200-299`:
+
+```
+pve-ip-start  = 192.168.15.150
+pve-ip-end    = 192.168.15.159
+pve-ip-prefix = 24
+pve-gateway   = 192.168.15.1
+```
 
 | VMID | Address |
 |---|---|
-| 200 | `10.10.20.10/24` |
-| 201 | `10.10.20.11/24` |
-| 202 | `10.10.20.12/24` |
-| 299 | `10.10.20.109/24` |
+| 200 | `192.168.15.150/24` |
+| 201 | `192.168.15.151/24` |
+| 209 | `192.168.15.159/24` |
+| 210 | pool exhausted |
 
 Deleting a machine frees its VMID and therefore its address; the next machine
 reclaims both.
+
+### The prefix is the netmask, not the pool size
+
+The most common mistake, and the reason these are three fields rather than one
+CIDR. The pool is bounded by **start** and **end**. The **prefix** is the
+netmask each machine gets — what it uses to decide whether an address is
+reachable directly or must go via the gateway.
+
+Writing `/28` to mean "16 addresses" does not bound the pool. It narrows the
+subnet to `192.168.15.144`–`.159`, so a gateway at `192.168.15.1` is no longer
+on-link, the node cannot install a default route, and it boots unable to reach
+anything. Set the prefix to the **real network's** prefix — usually the same
+`/24` as your LAN — and bound the pool with start and end.
+
+The gateway sits outside the pool, which is normal and expected. What is
+rejected is a gateway outside the *subnet*.
+
+### The pool caps the machine count, not the VMID range
+
+VMIDs are handed out lowest-free-first, so machines fill the pool from the start
+upward and it only ever has to hold the machines running at once. A VMID range
+**wider** than the pool is therefore normal — it just supplies ids.
+
+Size the pool by how many nodes you intend to run, and the VMID range by how
+much id headroom you want. The eleventh machine in the ten-address pool above
+fails with `static IP pool exhausted: 192.168.15.150-192.168.15.159 holds 10
+machines`, naming the capacity so it is actionable.
 
 Requirements and rules:
 
@@ -246,39 +280,25 @@ Requirements and rules:
 - **Cloud-init is always on.** The address is delivered through cloud-init
   `ipconfig0`, and cloud-init writes it persistently, so it survives reboots.
   The driver enables cloud-init unconditionally, so there is nothing to set.
-- **`pve-gateway` must be inside the subnet of `pve-ip-base`.** A gateway the
-  nodes cannot reach is almost always a typo, so it is rejected.
-- **Give each pool its own `pve-ip-base`.** VMIDs are unique cluster-wide (the
-  driver scans `/cluster/resources`), so two pools sharing a VMID range get
-  different VMIDs and different addresses — that is safe. The collision is two
-  pools with *different* range minima but the *same* base: `200-299` and
-  `300-399` both based at `10.10.20.10/24` give VMID 200 and VMID 300 offset 0,
-  so both claim `10.10.20.10`. Use a distinct base per pool, or share both the
-  range and the base.
-- **Exclude the static block from the DHCP scope.** If the scope in Part 1
-  leases `10.10.20.50`–`10.10.20.250`, a static base of `10.10.20.10/24` with a
-  100-wide VMID range stays clear of it. Overlap means DHCP eventually hands a
-  static node's address to something else.
+- **Both ends must be in the same subnet**, and neither may be the subnet's
+  network or broadcast address.
+- **Give each machine pool its own address range.** VMIDs are unique
+  cluster-wide (the driver scans `/cluster/resources`), so two pools sharing a
+  VMID range get different VMIDs and different addresses — that is safe. The
+  collision is two pools with *different* range minima but the *same* start:
+  `200-299` and `300-399` both starting at `192.168.15.150` give VMID 200 and
+  VMID 300 offset 0, so both claim `.150`.
+- **Exclude the pool from the DHCP scope.** If the scope in Part 1 leases
+  `192.168.15.50`–`.149`, a pool of `.150`–`.159` stays clear of it. Overlap
+  means DHCP eventually hands a static node's address to something else — and
+  because the pool has an explicit end, this is now easy to keep exact.
 
-### The subnet caps the pool, not the VMID range
+`PreCreateCheck` rejects a pool straddling two subnets, one that includes the
+network or broadcast address, an end below the start, or a gateway outside the
+subnet. It logs the real capacity when the VMID range exceeds it.
 
-VMIDs are handed out lowest-free-first, so machines fill the subnet upward from
-the base and the subnet only ever has to hold the machines running at once. A
-VMID range **wider** than the subnet is therefore normal and accepted — it just
-supplies ids.
-
-So size the subnet by how many nodes you intend to run, and the VMID range by
-how much id headroom you want. With `pve-ip-base 10.10.20.9/30` (a `/30` spans
-`.8`–`.11`, leaving `.9` and `.10` usable) and `pve-vmid-range 200-299`, the pool
-holds two machines. The third fails with `static IP pool exhausted: ... leaves
-room for 2 machines`, naming the capacity so it is actionable.
-
-`PreCreateCheck` rejects only a base that is unusable outright — the network or
-broadcast address of its subnet, or one with no room before the subnet ends —
-and logs the real capacity when the VMID range exceeds it.
-
-Machine pool: **Addressing (`pve-ip-mode`) = `static`**, **Base address
-(`pve-ip-base`)**, **Gateway (`pve-gateway`)**, plus a **VMID range
+Machine pool: **Addressing (`pve-ip-mode`) = `static`**, **Start address**,
+**End address**, **Subnet prefix**, **Gateway**, plus a **VMID range
 (`pve-vmid-range`)**.
 
 ## Addressing comparison
@@ -346,6 +366,6 @@ Both segments can exist at the same time, so moving from the host-local bridge
 
 Addressing is an independent choice and **does not have to change with the
 segment**. A pool can move from `vmbr2` to the VLAN and stay on DHCP throughout.
-If it is on static addressing, the one thing that must change is `pve-ip-base`
+If it is on static addressing, the one thing that must change is the pool
 and `pve-gateway`, because the new segment is a different subnet — the VMID
 range, and therefore the ordering of the addresses, stays exactly as it was.
