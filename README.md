@@ -94,7 +94,8 @@ and tells you which one it wants:
 # The pool every VM this driver creates will land in. Add the template to it
 # too (replace 9000 with your template's VMID) — that is what lets one role
 # cover both cloning it and managing what gets cloned from it.
-pveum pool add rancher-managed --vms 9000
+pveum pool add rancher-managed
+pveum pool modify rancher-managed --vms 9000
 
 # Every privilege the token needs, scoped to that pool only.
 pveum role add RancherPVENode -privs "VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
