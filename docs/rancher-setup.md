@@ -34,9 +34,8 @@ cause.
 The NodeDriver manifest's annotations split the driver flags into a reusable
 credential and per-template options:
 
-- **public credential fields**: `apiUrl`, `apiTokenId`
+- **public credential fields**: `apiUrl`, `apiTokenId`, `apiInsecure`, `caCert`, `pool`
 - **private credential field**: `apiTokenSecret`
-- **optional**: `apiInsecure`, `caCert`
 
 In the UI: **Cluster Management → Cloud Credentials → Create → Proxmox VE (pve)**
 and fill in:
@@ -48,6 +47,12 @@ and fill in:
 | `API Token Secret` | The secret printed once by `pveum user token add` |
 | `Insecure TLS` | Only for lab/self-signed certs. Used by the **driver** when it provisions; it does not affect the UI's Test Connection — see [below](#make-rancher-trust-the-proxmox-ve-certificate) |
 | `CA Cert` | PEM content of your PVE CA (alternative to Insecure). Same scope as above: driver only |
+| `Resource Pool` | PVE pool new VMs are created into, e.g. `rancher-managed`. Set it to match the README's default ACL; leave empty only if the token is granted on `/`. See [Restricting the token to a resource pool](#restricting-the-token-to-a-resource-pool) |
+
+The resource pool lives on the credential rather than on each machine pool
+because it is a property of **this token's ACL**: scoping a token to
+`/pool/<name>` means every machine pool using that credential must target the
+same pool, so asking once is both less repetitive and harder to get wrong.
 
 When the cluster is created, Rancher stores the secret in a Kubernetes
 `Secret` and hands it to the driver per machine — the secret never appears in
@@ -203,7 +208,6 @@ driver flag shows up as a form field; the ones that matter first:
 | Linked clone | `pve-linked-clone` | Off by default (full clone). See the warning in the UI and [flags.md](flags.md#pve-linked-clone) before turning it on |
 | Node | `pve-node` | Leave empty to let the driver pick automatically. Mutually exclusive with Allowed nodes |
 | Allowed nodes | `pve-allowed-nodes` | Comma-separated node names the driver may place VMs on, e.g. `pve1,pve2`. Empty considers every online node. No effect on a single-node install |
-| Resource pool | `pve-pool` | PVE pool new VMs are created into. Set to `rancher-managed` to match the README's default ACL setup; leave empty only if you chose its unscoped alternative — see [Restricting the token to a resource pool](#restricting-the-token-to-a-resource-pool) |
 | Tags | `pve-tags` | Comma-separated PVE tags, e.g. `rancher,prod`. Informational only |
 | VMID | `pve-vmid` | `0` = PVE auto-assigns (recommended) |
 | Cores / Sockets / Memory | `pve-cores` / `pve-sockets` / `pve-memory` | Per-VM sizing |
@@ -350,7 +354,8 @@ README for the exact `pveum` commands; this section covers the trade-offs
 and how to verify it actually works.
 
 If you deliberately chose the README's unscoped alternative instead (granting
-everything on `/`, no `pve-pool`), the token can start, stop, reconfigure or
+everything on `/`, no **Resource Pool** on the credential), the token can
+start, stop, reconfigure or
 delete *any* VM or container in the cluster — not just the ones Rancher
 created. That is fine for a PVE host running nothing else, but worth knowing
 before assuming Rancher-created VMs are the only things it can touch.
@@ -419,7 +424,8 @@ pveum acl modify /                     -user  rancher@pve           -role Ranche
 pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster
 ```
 
-Everything else — the `pve-pool` field, PVE 8's `VM.Monitor` swap, the
+Everything else — the credential's **Resource Pool** field, PVE 8's
+`VM.Monitor` swap, the
 `VM.Audit` visibility trade-off above — is unchanged.
 
 ## Boot disk sizing

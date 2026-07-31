@@ -118,8 +118,9 @@ That is the **PVE 9** set. On PVE 8 replace `VM.GuestAgent.Audit` with
 secret is printed once — save it. Every ACL line above is required for both
 the user and the token: PVE tokens do not inherit the user's privileges.
 
-Every machine pool must then set **Resource Pool** to `rancher-managed` (the
-`pve-pool` field) to match — a pool created without it will fail to clone,
+Set **Resource Pool** to `rancher-managed` on the **cloud credential** to
+match. It lives on the credential, not on each machine pool, because it is a
+property of this token's ACL — a credential without it will fail to clone,
 since the token has no permission to create VMs outside `rancher-managed`.
 The trade-offs of this ACL and how to verify it actually blocks access to
 other VMs are in
@@ -133,7 +134,7 @@ Two variants, if the default above doesn't fit:
   [Keeping the template outside the pool](docs/rancher-setup.md#keeping-the-template-outside-the-pool).
 - Nothing else runs on this PVE host and isolation doesn't matter? Skip the
   pool entirely: grant `VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Sys.Audit,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate`
-  on `/` for both `-user` and `-token`, and leave `pve-pool` empty.
+  on `/` for both `-user` and `-token`, and leave **Resource Pool** empty.
 
 **A VM template** with `qemu-guest-agent` baked in, a cloud-init drive, and a
 login user with passwordless sudo. Recipes for Debian 13 and openSUSE Leap Micro

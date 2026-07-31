@@ -18,7 +18,14 @@ For which fields to set on a machine pool and why, see
 | `pve-api-token-secret` | *(required)* | PVE API token secret |
 | `pve-api-insecure` | `false` | Skip TLS certificate verification. Applies to the driver only — Rancher's UI proxy validates the certificate regardless |
 | `pve-ca-cert` | *(empty)* | PEM CA certificate content (not a path) to trust for the PVE API |
+| `pve-pool` | *(empty)* | PVE resource pool new VMs are created into. See [rancher-setup.md](rancher-setup.md#restricting-the-token-to-a-resource-pool) |
 | `pve-skip-permission-check` | `false` | Skip the token-privilege probe in `PreCreateCheck` |
+
+The first five are **cloud credential** fields in Rancher, not machine-pool
+fields: they are collected once on the credential and reused by every machine
+pool that references it. `pve-pool` is among them because which pool a VM may
+be created in is a property of the token's ACL — a token scoped to
+`/pool/<name>` can only ever create VMs there.
 
 ## Placement and identity
 
@@ -30,7 +37,6 @@ For which fields to set on a machine pool and why, see
 | `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned. Only meaningful for a single machine; mutually exclusive with `pve-vmid-range` |
 | `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
 | `pve-allowed-nodes` | *(empty)* | Comma-separated PVE node names the driver may place new VMs on, e.g. `pve1,pve2`. Empty considers every online node. Mutually exclusive with `pve-node`. See below |
-| `pve-pool` | *(empty)* | PVE resource pool new VMs are created into. See [rancher-setup.md](rancher-setup.md#restricting-the-token-to-a-resource-pool) |
 | `pve-tags` | *(empty)* | Comma-separated PVE tags applied to the VM, e.g. `rancher,prod`. Informational only — for finding/filtering VMs in the PVE UI |
 | `pve-vm-name-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
 | `pve-onboot` | `false` | Start the VM automatically when the PVE host boots |
