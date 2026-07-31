@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/mcnflag"
@@ -477,6 +478,31 @@ func TestIPModeDefaultsToDHCP(t *testing.T) {
 	d := NewDriver("test", "/tmp").(*Driver)
 	if d.IPMode != string(ipModeDHCP) {
 		t.Errorf("NewDriver().IPMode = %q, want %q", d.IPMode, ipModeDHCP)
+	}
+}
+
+// The delay is the only thing standing between a guest that opens SSH early
+// and a bootstrap command that runs before the network is configured, so it
+// defaults to non-zero — but 0 must stay explicitly selectable.
+func TestProvisionDelayDefaultsToNonZero(t *testing.T) {
+	d := NewDriver("test", "/tmp").(*Driver)
+	if d.ProvisionDelay != defaultProvisionDelay {
+		t.Errorf("NewDriver().ProvisionDelay = %v, want %v", d.ProvisionDelay, defaultProvisionDelay)
+	}
+
+	var declared *mcnflag.IntFlag
+
+	for _, f := range d.GetCreateFlags() {
+		if v, ok := f.(mcnflag.IntFlag); ok && v.Name == "pve-provision-delay" {
+			flag := v
+			declared = &flag
+		}
+	}
+	if declared == nil {
+		t.Fatal("flag \"pve-provision-delay\" is not declared")
+	}
+	if want := int(defaultProvisionDelay / time.Second); declared.Value != want {
+		t.Errorf("pve-provision-delay default = %d, want %d", declared.Value, want)
 	}
 }
 

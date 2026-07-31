@@ -50,6 +50,17 @@ const (
 	// once an IP is known, and covers mkfs on disks that can be large.
 	defaultDiskSetupTimeout = 5 * time.Minute
 	defaultNetModel         = "virtio"
+	// defaultProvisionDelay is how long Create waits, after the VM is up,
+	// before returning and handing the machine to Rancher's provisioning.
+	//
+	// It is deliberately non-zero: "sshd accepts a connection" is not the
+	// same as "the guest is ready", and several cloud images open port 22
+	// before cloud-init has finished writing the resolver and the default
+	// route. Rancher fires its first bootstrap command the moment SSH
+	// answers, so with no delay that command can run against a guest with no
+	// working DNS and fail on what is really a transient condition — and a
+	// failed bootstrap gets the whole machine deleted and recreated.
+	defaultProvisionDelay = 30 * time.Second
 )
 
 // Driver is the libmachine Driver implementation backed by Proxmox VE.
@@ -97,6 +108,7 @@ type Driver struct {
 	SSHKeys          string
 	Onboot           bool
 	AgentTimeout     time.Duration
+	ProvisionDelay   time.Duration
 	KeepOnFailure    bool
 	SkipPermCheck    bool
 	NetMAC           string
@@ -125,6 +137,7 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		Onboot:           false,
 		AgentTimeout:     defaultAgentTimeout,
 		DiskSetupTimeout: defaultDiskSetupTimeout,
+		ProvisionDelay:   defaultProvisionDelay,
 	}
 }
 
@@ -291,6 +304,12 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Seconds to wait for the QEMU guest agent to report the VM's IP",
 			Value:  int(defaultAgentTimeout / time.Second),
 		},
+		mcnflag.IntFlag{
+			Name:   "pve-provision-delay",
+			EnvVar: "PVE_PROVISION_DELAY",
+			Usage:  "Seconds to wait after the VM is up before handing it back to Rancher for provisioning. Defaults to 30 because several cloud images accept SSH before cloud-init has finished configuring DNS and the default route, which makes Rancher's first bootstrap command fail against a half-ready guest. Set to 0 to hand it back immediately",
+			Value:  int(defaultProvisionDelay / time.Second),
+		},
 		mcnflag.BoolFlag{
 			Name:   "pve-cloudinit",
 			EnvVar: "PVE_CLOUDINIT",
@@ -450,6 +469,14 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		d.DiskSetupTimeout = time.Duration(setupSec) * time.Second
 	} else {
 		d.DiskSetupTimeout = defaultDiskSetupTimeout
+	}
+	// Unlike the timeouts above, 0 is a meaningful value here (hand the
+	// machine back immediately), so it must not fall through to the default.
+	// Only a negative value — which cannot be honoured — resets it.
+	if delaySec := flags.Int("pve-provision-delay"); delaySec >= 0 {
+		d.ProvisionDelay = time.Duration(delaySec) * time.Second
+	} else {
+		d.ProvisionDelay = defaultProvisionDelay
 	}
 	d.SSHUser = flags.String("pve-ssh-user")
 	d.SSHPort = flags.Int("pve-ssh-port")
@@ -728,6 +755,22 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		if err := d.setupGuestDisks(attached); err != nil {
 			return err
 		}
+	}
+
+	// Last thing before Create returns, because returning is what hands the
+	// machine to Rancher: everything after this point (waiting for SSH,
+	// detecting the OS, running the bootstrap commands) is Rancher's own
+	// provisioning code, which the driver cannot hook into. Delaying here is
+	// therefore the only way to give a guest more time before that starts.
+	//
+	// It exists because "SSH accepts a connection" is not the same as "the
+	// guest is ready": several cloud images start sshd before cloud-init has
+	// finished configuring the network, so Rancher's first command can run
+	// against a guest with no working DNS or default route and fail on what
+	// is really a transient condition.
+	if d.ProvisionDelay > 0 {
+		log.Infof("pve: waiting %s before handing VM %d to Rancher for provisioning (--pve-provision-delay)", d.ProvisionDelay, d.VMID)
+		time.Sleep(d.ProvisionDelay)
 	}
 	return nil
 }
