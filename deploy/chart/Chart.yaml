@@ -12,8 +12,8 @@ apiVersion: v2
 name: pve-rancher-driver
 description: Registers the Proxmox VE node driver with Rancher so RKE2/K3s machine pools can provision PVE virtual machines
 type: application
-version: "0.6.1"
-appVersion: "0.6.1"
+version: "0.6.2"
+appVersion: "0.6.2"
 kubeVersion: ">=1.23.0-0"
 home: https://github.com/lore09/pve-rancher-driver
 sources:
