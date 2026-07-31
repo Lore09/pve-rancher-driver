@@ -19,9 +19,14 @@ kind: NodeDriver
 metadata:
   name: pve
   annotations:
-    publicCredentialFields: "apiUrl,apiTokenId"
+    # apiInsecure, caCert and pool are listed as *public* credential fields
+    # rather than under `optionalCredentialFields`. That annotation is
+    # accepted by the API but Rancher does not build the credential schema
+    # from it, so fields listed there are silently dropped on save — the
+    # symptom being TLS settings that never take effect. "Public" here means
+    # stored in the credential but not secret, which all three are.
+    publicCredentialFields: "apiUrl,apiTokenId,apiInsecure,caCert,pool"
     privateCredentialFields: "apiTokenSecret"
-    optionalCredentialFields: "apiInsecure,caCert"
     passwordFields: "apiTokenSecret"
 spec:
   displayName: "Proxmox VE (pve)"

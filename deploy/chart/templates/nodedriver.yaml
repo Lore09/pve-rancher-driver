@@ -64,7 +64,14 @@ metadata:
     #
     # They are "public" in the sense Rancher means: stored in the credential
     # but not secret. Neither a CA certificate nor a boolean is sensitive.
-    publicCredentialFields: "apiUrl,apiTokenId,apiInsecure,caCert"
+    #
+    # `pool` is a credential field for the same reason: which PVE resource
+    # pool VMs may be created in is a property of the API token's ACL, not of
+    # an individual machine pool. Scoping the token to /pool/<name> means
+    # every machine pool using that credential must target the same pool, so
+    # asking for it once per credential is both less repetitive and harder to
+    # get wrong than asking on every machine pool.
+    publicCredentialFields: "apiUrl,apiTokenId,apiInsecure,caCert,pool"
     privateCredentialFields: "apiTokenSecret"
     passwordFields: "apiTokenSecret"
   labels:
