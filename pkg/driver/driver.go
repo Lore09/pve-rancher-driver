@@ -62,6 +62,7 @@ type Driver struct {
 	VMID             int
 	VMIDRange        string
 	TemplateVMID     int
+	LinkedClone      bool
 	VMNamePrefix     string
 	Cores            int
 	Sockets          int
@@ -172,6 +173,11 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "PVE_TEMPLATE_VMID",
 			Usage:  "Existing PVE VM template VMID used to clone new VMs from",
 			Value:  0,
+		},
+		mcnflag.BoolFlag{
+			Name:   "pve-linked-clone",
+			EnvVar: "PVE_LINKED_CLONE",
+			Usage:  "Clone the template as a linked clone instead of a full clone. Much faster and lighter on storage I/O when several machines clone at once, but every linked clone stays dependent on the template's disk for as long as it exists (the template can never be deleted or modified while one remains), and not every storage backend supports it",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-vm-name-prefix",
@@ -363,6 +369,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.VMID = flags.Int("pve-vmid")
 	d.VMIDRange = strings.TrimSpace(flags.String("pve-vmid-range"))
 	d.TemplateVMID = flags.Int("pve-template-vmid")
+	d.LinkedClone = flags.Bool("pve-linked-clone")
 	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vm-name-prefix"))
 	d.Cores = flags.Int("pve-cores")
 	d.Sockets = flags.Int("pve-sockets")
@@ -687,7 +694,7 @@ func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, err
 		return 0, err
 	}
 	if d.VMID != 0 || d.VMIDRange == "" {
-		return d.client.CloneFromTemplate(ctx, d.TemplateVMID, d.VMID, vmName)
+		return d.client.CloneFromTemplate(ctx, d.TemplateVMID, d.VMID, vmName, d.LinkedClone)
 	}
 
 	var lastErr error
@@ -696,7 +703,7 @@ func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, err
 		if err != nil {
 			return 0, err
 		}
-		assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, id, vmName)
+		assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, id, vmName, d.LinkedClone)
 		if err == nil {
 			return assigned, nil
 		}

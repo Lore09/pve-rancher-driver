@@ -146,15 +146,27 @@ func (c *Client) vm(ctx context.Context, vmid int) (*proxmox.VirtualMachine, err
 
 // CloneFromTemplate clones the given template VMID into a new VM and returns
 // the assigned VMID. If newVMID is 0 the cluster assigns the next free ID.
-func (c *Client) CloneFromTemplate(ctx context.Context, templateVMID, newVMID int, name string) (int, error) {
+//
+// linked selects a linked clone (a thin overlay referencing the template's
+// disk) instead of a full clone (a complete byte-for-byte copy). A linked
+// clone is created almost instantly regardless of the template's size, which
+// matters when several machines in a pool clone at once and would otherwise
+// contend for the same storage's I/O — but every linked clone stays
+// dependent on the template disk for as long as it exists, and not every
+// storage backend supports it.
+func (c *Client) CloneFromTemplate(ctx context.Context, templateVMID, newVMID int, name string, linked bool) (int, error) {
 	vm, err := c.vm(ctx, templateVMID)
 	if err != nil {
 		return 0, fmt.Errorf("proxmox: template %d not found: %w", templateVMID, err)
 	}
+	full := uint8(1)
+	if linked {
+		full = 0
+	}
 	params := &proxmox.VirtualMachineCloneOptions{
 		NewID: newVMID,
 		Name:  name,
-		Full:  1,
+		Full:  full,
 	}
 	assigned, task, err := vm.Clone(ctx, params)
 	if err != nil {

@@ -26,6 +26,7 @@ For which fields to set on a machine pool and why, see
 |------|---------|-------------|
 | `pve-node` | *(first online)* | Target PVE node name |
 | `pve-template-vmid` | *(required)* | Template VMID to clone from |
+| `pve-linked-clone` | `false` | Clone as a linked clone instead of a full clone. See below |
 | `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned. Only meaningful for a single machine; mutually exclusive with `pve-vmid-range` |
 | `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
 | `pve-vm-name-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
@@ -47,6 +48,30 @@ the race is invisible in normal use. If the range fills up, provisioning fails
 with a clear error rather than silently spilling outside it.
 
 Valid ids are `100`-`999999999`; Proxmox reserves `1`-`99`.
+
+### `pve-linked-clone`
+
+By default the driver does a **full clone**: a complete, independent copy of
+the template's disk. That copy is real storage I/O proportional to the
+template's size, and when several machines in a pool provision at once, their
+clones contend for the same storage — under load this can push total
+provisioning time past Rancher's node-startup timeout, which then deletes and
+recreates the not-yet-ready machine, repeating indefinitely.
+
+`pve-linked-clone` clones as a **linked clone** instead: a thin overlay that
+only stores blocks that differ from the template, created almost instantly
+regardless of template size.
+
+**Before enabling it, understand the tradeoff:**
+
+- The template can never be deleted, and its disk can never be modified,
+  while any linked clone made from it still exists — Proxmox enforces this.
+- The template's storage becomes a dependency for every VM cloned from it: if
+  that storage degrades or saturates, every linked clone degrades with it.
+- Not every storage backend supports linked clones — it needs snapshot
+  capability (LVM-thin, ZFS, Ceph RBD, qcow2 on a snapshot-capable
+  filesystem). Plain LVM or raw NFS typically cannot do it, and the clone
+  will fail outright.
 
 ## Sizing
 

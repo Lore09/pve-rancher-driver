@@ -200,6 +200,7 @@ driver flag shows up as a form field; the ones that matter first:
 | Field (UI) | Flag | Notes |
 |---|---|---|
 | Template VMID | `pve-template-vmid` | From the [template guide](template-preparation.md), e.g. `9000` |
+| Linked clone | `pve-linked-clone` | Off by default (full clone). See the warning in the UI and [flags.md](flags.md#pve-linked-clone) before turning it on |
 | Node | `pve-node` | Leave empty to use the first online PVE node |
 | VMID | `pve-vmid` | `0` = PVE auto-assigns (recommended) |
 | Cores / Sockets / Memory | `pve-cores` / `pve-sockets` / `pve-memory` | Per-VM sizing |
