@@ -26,6 +26,9 @@ import (
 // may use: it must start and end alphanumeric, with hyphens only in between.
 var vmNamePrefixPattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$`)
 
+// pvePoolPattern is the character set PVE accepts for a pool id.
+var pvePoolPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
 const (
 	// maxVMNameLen is the DNS label limit PVE enforces on a VM name.
 	maxVMNameLen = 63
@@ -59,10 +62,13 @@ type Driver struct {
 	Insecure         bool
 	CACertPEM        string
 	Node             string
+	AllowedNodes     string
 	VMID             int
 	VMIDRange        string
 	TemplateVMID     int
 	LinkedClone      bool
+	Tags             string
+	Pool             string
 	VMNamePrefix     string
 	Cores            int
 	Sockets          int
@@ -155,7 +161,12 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.StringFlag{
 			Name:   "pve-node",
 			EnvVar: "PVE_NODE",
-			Usage:  "Target PVE node name. If empty, the first online node is used",
+			Usage:  "Target PVE node name. If empty, the driver picks automatically — see pve-allowed-nodes. Mutually exclusive with pve-allowed-nodes",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-allowed-nodes",
+			EnvVar: "PVE_ALLOWED_NODES",
+			Usage:  "Comma-separated PVE node names the driver may place new VMs on, e.g. pve1,pve2. Empty considers every online node in the cluster. Ignored (and rejected) if pve-node is set. The driver picks the candidate with the most free memory; on a single-node install this has no effect",
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-vmid",
@@ -183,6 +194,16 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "pve-vm-name-prefix",
 			EnvVar: "PVE_VM_NAME_PREFIX",
 			Usage:  "Prefix prepended to the PVE VM name as <prefix>-<machine name>. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-tags",
+			EnvVar: "PVE_TAGS",
+			Usage:  "Comma-separated PVE tags applied to the created VM, e.g. rancher,prod. Purely informational to PVE — lets a VM this driver created be identified and filtered in the PVE UI. Lowercase letters, digits, and _ + . - only",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-pool",
+			EnvVar: "PVE_POOL",
+			Usage:  "PVE resource pool new VMs are created into. Combined with an API token ACL granted on /pool/<name> instead of /, this is what lets the token manage the VMs it creates without being able to touch any other VM in the cluster — see the README's Proxmox VE ACL section. Empty creates VMs outside any pool, as before",
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-cores",
@@ -366,10 +387,13 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.Insecure = flags.Bool("pve-api-insecure")
 	d.CACertPEM = flags.String("pve-ca-cert")
 	d.Node = flags.String("pve-node")
+	d.AllowedNodes = strings.TrimSpace(flags.String("pve-allowed-nodes"))
 	d.VMID = flags.Int("pve-vmid")
 	d.VMIDRange = strings.TrimSpace(flags.String("pve-vmid-range"))
 	d.TemplateVMID = flags.Int("pve-template-vmid")
 	d.LinkedClone = flags.Bool("pve-linked-clone")
+	d.Tags = strings.TrimSpace(flags.String("pve-tags"))
+	d.Pool = strings.TrimSpace(flags.String("pve-pool"))
 	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vm-name-prefix"))
 	d.Cores = flags.Int("pve-cores")
 	d.Sockets = flags.Int("pve-sockets")
@@ -462,8 +486,19 @@ func (d *Driver) PreCreateCheck() error {
 	if d.VMIDRange != "" && d.VMID != 0 {
 		return fmt.Errorf("pve: --pve-vmid %d and --pve-vmid-range %q are mutually exclusive; an explicit id makes the range meaningless (and cannot work for a pool of more than one machine)", d.VMID, d.VMIDRange)
 	}
+	if d.Node != "" && d.AllowedNodes != "" {
+		return fmt.Errorf("pve: --pve-node %q and --pve-allowed-nodes %q are mutually exclusive; --pve-node already pins a single node", d.Node, d.AllowedNodes)
+	}
 	if err := d.validateAddressing(); err != nil {
 		return err
+	}
+	tags, err := normalizeTags(d.Tags)
+	if err != nil {
+		return err
+	}
+	d.Tags = tags
+	if d.Pool != "" && !pvePoolPattern.MatchString(d.Pool) {
+		return fmt.Errorf("pve: --pve-pool %q is not a valid PVE pool id; use letters, digits, and _ . -", d.Pool)
 	}
 	disks, err := ParseDataDisks(d.DataDiskEntries)
 	if err != nil {
@@ -523,12 +558,26 @@ func (d *Driver) init() error {
 		Insecure:       d.Insecure,
 		CACertPEM:      d.CACertPEM,
 		Node:           d.Node,
+		AllowedNodes:   parseNodeList(d.AllowedNodes),
 	})
 	if err != nil {
 		return err
 	}
 	d.client = client
 	return nil
+}
+
+// parseNodeList splits --pve-allowed-nodes on commas, trimming whitespace
+// and dropping empty entries. Returns nil for an empty string, which the
+// proxmox client treats as "every node is a candidate."
+func parseNodeList(s string) []string {
+	var nodes []string
+	for _, n := range strings.Split(s, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			nodes = append(nodes, n)
+		}
+	}
+	return nodes
 }
 
 // Create provisions a new VM by cloning a configured template, applying
@@ -560,7 +609,15 @@ func (d *Driver) Create() error {
 		return err
 	}
 	d.VMID = assigned
-	log.Infof("pve: cloned VM %d from template %d", assigned, d.TemplateVMID)
+	// Persist the node the clone actually landed on: with pve-allowed-nodes
+	// set, ResolveNode picked it dynamically, and every later invocation of
+	// this driver (Start, Stop, GetState, Remove, ...) is a fresh process
+	// that only knows d.Node from the state Rancher saved after Create. If
+	// this were left empty, that later invocation would run node selection
+	// again from scratch and could easily land on a different node than the
+	// one actually hosting the VM.
+	d.Node = d.client.CurrentNode()
+	log.Infof("pve: cloned VM %d from template %d onto node %s", assigned, d.TemplateVMID, d.Node)
 
 	if err := d.finalizeCreate(ctx, vmName); err != nil {
 		if !d.KeepOnFailure {
@@ -593,6 +650,7 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		Sockets:      uint16(d.Sockets),
 		Memory:       uint32(d.MemoryMB),
 		Onboot:       &onboot,
+		Tags:         d.Tags,
 		CloudInit:    d.CloudInit,
 		IPConfig:     ipConfig,
 		Nameserver:   d.Nameservers,
@@ -693,8 +751,14 @@ func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, err
 	if err != nil {
 		return 0, err
 	}
+	opts := proxmox.CloneOptions{
+		Name:   vmName,
+		Linked: d.LinkedClone,
+		Pool:   d.Pool,
+	}
 	if d.VMID != 0 || d.VMIDRange == "" {
-		return d.client.CloneFromTemplate(ctx, d.TemplateVMID, d.VMID, vmName, d.LinkedClone)
+		opts.NewID = d.VMID
+		return d.client.CloneFromTemplate(ctx, d.TemplateVMID, opts)
 	}
 
 	var lastErr error
@@ -703,7 +767,8 @@ func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, err
 		if err != nil {
 			return 0, err
 		}
-		assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, id, vmName, d.LinkedClone)
+		opts.NewID = id
+		assigned, err := d.client.CloneFromTemplate(ctx, d.TemplateVMID, opts)
 		if err == nil {
 			return assigned, nil
 		}

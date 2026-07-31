@@ -479,3 +479,101 @@ func TestIPModeDefaultsToDHCP(t *testing.T) {
 		t.Errorf("NewDriver().IPMode = %q, want %q", d.IPMode, ipModeDHCP)
 	}
 }
+
+// pve-node pins a single node explicitly; pve-allowed-nodes hands the choice
+// to the scheduler. Accepting both silently would mean one of them is
+// quietly ignored, so PreCreateCheck must reject the combination.
+func TestPreCreateCheckNodeAndAllowedNodesMutuallyExclusive(t *testing.T) {
+	base := func() *Driver {
+		return &Driver{
+			APIUrl:         "https://pve.example:8006/api2/json",
+			APITokenID:     "rancher@pve!machine",
+			APITokenSecret: "secret",
+			TemplateVMID:   9000,
+			SkipPermCheck:  true,
+		}
+	}
+
+	d := base()
+	d.Node = "pve1"
+	d.AllowedNodes = "pve1,pve2"
+	if err := d.PreCreateCheck(); err == nil {
+		t.Fatal("PreCreateCheck() = nil, want an error for pve-node with pve-allowed-nodes both set")
+	}
+
+	d = base()
+	d.Node = "pve1"
+	if err := d.PreCreateCheck(); err != nil {
+		t.Errorf("PreCreateCheck() with only --pve-node set returned error: %v", err)
+	}
+
+	d = base()
+	d.AllowedNodes = "pve1,pve2"
+	if err := d.PreCreateCheck(); err != nil {
+		t.Errorf("PreCreateCheck() with only --pve-allowed-nodes set returned error: %v", err)
+	}
+}
+
+func TestParseNodeList(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"  ", nil},
+		{"pve1", []string{"pve1"}},
+		{"pve1,pve2", []string{"pve1", "pve2"}},
+		{" pve1 , pve2 ,, pve3 ", []string{"pve1", "pve2", "pve3"}},
+	}
+	for _, tt := range tests {
+		got := parseNodeList(tt.in)
+		if len(got) != len(tt.want) {
+			t.Fatalf("parseNodeList(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("parseNodeList(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+func TestNormalizeTags(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr string
+	}{
+		{"empty is fine", "", "", ""},
+		{"single tag", "rancher", "rancher", ""},
+		{"multiple tags join with semicolons", "rancher,prod", "rancher;prod", ""},
+		{"whitespace around tags is trimmed", " rancher , prod ", "rancher;prod", ""},
+		{"mixed case is lowercased", "Rancher,PROD", "rancher;prod", ""},
+		{"blank entries between commas are dropped", "rancher,,prod,", "rancher;prod", ""},
+		{"duplicate tags collapse to one", "rancher,rancher,Rancher", "rancher", ""},
+		{"digits, underscore, plus, dot and hyphen are allowed", "k8s_1.2+beta-x", "k8s_1.2+beta-x", ""},
+		{"a space inside a tag is rejected", "prod cluster", "", "prod cluster"},
+		{"a character outside PVE's set is rejected", "prod!", "", "prod!"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeTags(tt.in)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("normalizeTags(%q) = %q, nil error, want an error mentioning %q", tt.in, got, tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("normalizeTags(%q) error = %q, want it to mention %q", tt.in, err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeTags(%q) returned error: %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("normalizeTags(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
