@@ -91,16 +91,13 @@ set differs between PVE 8 and 9; the driver probes the live server version
 and tells you which one it wants:
 
 ```bash
-# The pool every VM this driver creates will land in.
-pveum pool add rancher-managed
+# The pool every VM this driver creates will land in. Add the template to it
+# too (replace 9000 with your template's VMID) — that is what lets one role
+# cover both cloning it and managing what gets cloned from it.
+pveum pool add rancher-managed --vms 9000
 
-# Destructive/management privileges, scoped to that pool only.
-pveum role add RancherPVENode -privs "VM.Allocate,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
-
-# VM.Clone specifically on the template, and nothing else: the token can read
-# and clone it, but cannot start, stop, reconfigure or delete it. Replace
-# 9000 with your template's VMID.
-pveum role add RancherPVETemplateReader -privs "VM.Audit,VM.Clone"
+# Every privilege the token needs, scoped to that pool only.
+pveum role add RancherPVENode -privs "VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
 
 # Cluster-wide, but read-only or not VM-specific — granting these broadly
 # does not let the token touch another VM's lifecycle.
@@ -111,8 +108,6 @@ pveum user token add rancher@pve machine
 
 pveum acl modify /pool/rancher-managed -user  rancher@pve           -role RancherPVENode
 pveum acl modify /pool/rancher-managed -token 'rancher@pve!machine' -role RancherPVENode
-pveum acl modify /vms/9000             -user  rancher@pve           -role RancherPVETemplateReader
-pveum acl modify /vms/9000             -token 'rancher@pve!machine' -role RancherPVETemplateReader
 pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster --propagate 0
 pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster --propagate 0
 ```
@@ -125,16 +120,19 @@ the user and the token: PVE tokens do not inherit the user's privileges.
 Every machine pool must then set **Resource Pool** to `rancher-managed` (the
 `pve-pool` field) to match — a pool created without it will fail to clone,
 since the token has no permission to create VMs outside `rancher-managed`.
-The trade-offs of this ACL, migrating an already-running cluster onto it, and
-how to verify it actually blocks access to other VMs are in
+The trade-offs of this ACL and how to verify it actually blocks access to
+other VMs are in
 [docs/rancher-setup.md](docs/rancher-setup.md#restricting-the-token-to-a-resource-pool).
 
-If nothing else runs on this PVE host and isolation does not matter to you,
-you can skip the pool and grant everything on `/` instead: `pveum role add
-RancherPVENode -privs
-"VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Sys.Audit,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate"`,
-then `pveum acl modify / -user rancher@pve -role RancherPVENode` and the same
-for `-token`, and leave `pve-pool` empty.
+Two variants, if the default above doesn't fit:
+
+- Want the template itself off-limits to the token too — readable and
+  clonable, but never startable, deletable or reconfigurable? Keep it out of
+  the pool and grant it a narrower role instead; see
+  [Keeping the template outside the pool](docs/rancher-setup.md#keeping-the-template-outside-the-pool).
+- Nothing else runs on this PVE host and isolation doesn't matter? Skip the
+  pool entirely: grant `VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Sys.Audit,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate`
+  on `/` for both `-user` and `-token`, and leave `pve-pool` empty.
 
 **A VM template** with `qemu-guest-agent` baked in, a cloud-init drive, and a
 login user with passwordless sudo. Recipes for Debian 13 and openSUSE Leap Micro

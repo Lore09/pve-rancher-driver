@@ -338,14 +338,15 @@ Notes:
 ## Restricting the token to a resource pool
 
 The README's [Prepare Proxmox VE](../README.md#prepare-proxmox-ve) section is
-the canonical setup and already uses this: the token's destructive
-privileges are granted on a PVE resource pool (`/pool/rancher-managed`)
-rather than on `/`, and every VM this driver creates is placed into that pool
-as part of the clone call itself — there is no window where a VM exists
-outside it. Proxmox then refuses any operation the token attempts against a
-VM outside the pool, regardless of what Rancher asks the driver to do. Use
-the README for the exact `pveum` commands; this section covers the
-trade-offs and how to verify it actually works.
+the canonical setup and already uses this: the token's privileges are
+granted on a PVE resource pool (`/pool/rancher-managed`) rather than on `/`,
+and both the template and every VM this driver clones from it are members of
+that pool — the template because you added it by hand, new VMs because the
+clone call places them there itself, with no window where one exists outside
+it. Proxmox then refuses any operation the token attempts against a VM
+outside the pool, regardless of what Rancher asks the driver to do. Use the
+README for the exact `pveum` commands; this section covers the trade-offs
+and how to verify it actually works.
 
 If you deliberately chose the README's unscoped alternative instead (granting
 everything on `/`, no `pve-pool`), the token can start, stop, reconfigure or
@@ -354,17 +355,17 @@ created. That is fine for a PVE host running nothing else, but worth knowing
 before assuming Rancher-created VMs are the only things it can touch.
 
 **Trade-off worth knowing about:** `VM.Audit` is deliberately *not* granted
-broadly here, only on the template. That means `/cluster/resources` — which
-the driver calls both to avoid a VMID collision when `pve-vmid-range` is set
-and to locate the template when `pve-allowed-nodes` picks a node other than
-the template's own — only sees VMs inside the pool plus the template itself.
-In practice this is harmless: if the driver picks a VMID something outside
-its visibility is already using, Proxmox rejects the clone with "already
-exists" and the driver retries with another id (up to 5 times) exactly as it
-does for a same-pool race. If you would rather the driver see every VMID in
-the cluster to avoid that retry entirely, add `VM.Audit` to the
-`RancherPVECluster` role above — it is read-only, so doing so does not let
-the token modify or delete anything outside the pool.
+broadly here, only on the pool. That means `/cluster/resources` — which the
+driver calls both to avoid a VMID collision when `pve-vmid-range` is set and
+to locate the template when `pve-allowed-nodes` picks a node other than the
+template's own — only sees VMs inside the pool. In practice this is
+harmless: if the driver picks a VMID something outside its visibility is
+already using, Proxmox rejects the clone with "already exists" and the
+driver retries with another id (up to 5 times) exactly as it does for a
+same-pool race. If you would rather the driver see every VMID in the cluster
+to avoid that retry entirely, add `VM.Audit` to the `RancherPVECluster` role
+above — it is read-only, so doing so does not let the token modify or delete
+anything outside the pool.
 
 This is the suggested setup whenever Proxmox hosts anything besides this
 driver's VMs: it is the only one of the two that gives you actual resource
@@ -377,6 +378,48 @@ with the token's credentials) refuses to stop or delete it — a `403
 Permission check failed` is what "protected" looks like. Do this once after
 setup and again after any ACL change, rather than assuming the recipe above
 matches your exact PVE version's behavior.
+
+### Keeping the template outside the pool
+
+The default puts the template itself in `rancher-managed`, so `RancherPVENode`
+covers cloning it and managing what gets cloned from it with one role. The
+trade-off: the token can then also start, stop, reconfigure or delete the
+template — something the driver itself never does (it only ever calls those
+on the VMID a clone was assigned, never back on `pve-template-vmid`), but a
+misconfigured machine pool whose `pve-vmid` happened to match the template's
+own id would no longer be stopped by Proxmox rejecting the request.
+
+To close that off, leave the template out of the pool and give it its own
+narrow, read-only-plus-clone role instead:
+
+```bash
+# Do not add --vms to this pool add — the template stays out of it.
+pveum pool add rancher-managed
+
+# Destructive/management privileges, scoped to the pool only. No VM.Clone
+# here: that lives on the template's own path instead, below.
+pveum role add RancherPVENode -privs "VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
+
+# VM.Clone specifically on the template, and nothing else: the token can
+# read and clone it, but cannot start, stop, reconfigure or delete it.
+# Replace 9000 with your template's VMID.
+pveum role add RancherPVETemplateReader -privs "VM.Audit,VM.Clone"
+
+pveum role add RancherPVECluster -privs "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
+
+pveum user add rancher@pve
+pveum user token add rancher@pve machine
+
+pveum acl modify /pool/rancher-managed -user  rancher@pve           -role RancherPVENode
+pveum acl modify /pool/rancher-managed -token 'rancher@pve!machine' -role RancherPVENode
+pveum acl modify /vms/9000             -user  rancher@pve           -role RancherPVETemplateReader
+pveum acl modify /vms/9000             -token 'rancher@pve!machine' -role RancherPVETemplateReader
+pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster --propagate 0
+pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster --propagate 0
+```
+
+Everything else — the `pve-pool` field, PVE 8's `VM.Monitor` swap, the
+`VM.Audit` visibility trade-off above — is unchanged.
 
 ## Boot disk sizing
 
@@ -455,7 +498,7 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Test Connection warns that Rancher could not reach or verify the host, once allow-listed | Rancher server does not trust the PVE TLS certificate; the proxy always verifies it and ignores the credential's `Insecure TLS` / `CA Cert`. Confirm with the in-pod `curl` | [Make Rancher trust the PVE CA](#make-rancher-trust-the-proxmox-ve-certificate), or accept the warning and type the machine-pool fields by hand — provisioning does not use this proxy |
 | Machine pool dropdowns are text inputs instead of dropdowns | Expected fallback when the PVE API is unreachable through the proxy — usually the certificate trust issue above | Fill the four fields by hand, or fix trust to get discovery back |
 | Test Connection says the credentials are not allowed / unauthorized | Wrong `API Token ID` or secret (`/version` needs no privileges, so this is not an ACL problem). Before the fix in the UI extension, the token was sent in `Authorization`, which Rancher itself rejected with 401 | Re-check the token id is `user@realm!tokenid` and the secret is the one printed by `pveum user token add`; update the UI extension |
-| "API token is missing privileges" at save | Token ACL not granted to the token itself | Run every `pveum acl modify` line (user **and** `-token`, for all three roles) from the README |
+| "API token is missing privileges" at save | Token ACL not granted to the token itself | Run every `pveum acl modify` line (user **and** `-token`, for every role) from the README |
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
 | Create times out "waiting for guest agent IP" | **qemu-guest-agent not installed or not running inside the image.** The driver now sets `agent=1` on every clone, so the PVE-side channel is no longer a cause | Re-bake the image with `qemu-guest-agent` installed and enabled; verify with `qm agent <id> ping` |
 | VM boots but node never `Ready` | cloud-init user lacks passwordless sudo, or `curl`/`bash` missing | Fix template; verify `sudo -n true` works for the SSH user |
