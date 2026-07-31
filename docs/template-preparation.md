@@ -60,6 +60,21 @@ virt-customize -a debian-13-genericcloud-amd64.qcow2 \
 qemu-img resize debian-13-genericcloud-amd64.qcow2 20G
 ```
 
+> **On a PVE host, every `virt-customize`/`virt-*` call in this guide may
+> fail with `guestfs_launch failed`.** libguestfs defaults to launching its
+> inspection appliance through `libvirt`, and PVE does not run standard
+> `libvirtd` — it has its own qemu management stack instead — so that
+> backend never starts anything. Force the direct-qemu backend instead:
+>
+> ```bash
+> export LIBGUESTFS_BACKEND=direct
+> ```
+>
+> Set it once per shell before the first `virt-customize` call. If it still
+> fails afterward, the error message's own suggestion is the next step:
+> `LIBGUESTFS_DEBUG=1 LIBGUESTFS_TRACE=1 virt-customize -v -x ...` to see
+> what the appliance is actually doing.
+
 > This installs the bare minimum. If the nodes will run Longhorn, or you need
 > your own packages, a CA or kernel modules in the image, extend this one
 > `virt-customize` call rather than adding a second — see
