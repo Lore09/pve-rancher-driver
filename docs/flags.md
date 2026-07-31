@@ -29,6 +29,9 @@ For which fields to set on a machine pool and why, see
 | `pve-linked-clone` | `false` | Clone as a linked clone instead of a full clone. See below |
 | `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned. Only meaningful for a single machine; mutually exclusive with `pve-vmid-range` |
 | `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
+| `pve-allowed-nodes` | *(empty)* | Comma-separated PVE node names the driver may place new VMs on, e.g. `pve1,pve2`. Empty considers every online node. Mutually exclusive with `pve-node`. See below |
+| `pve-pool` | *(empty)* | PVE resource pool new VMs are created into. See [rancher-setup.md](rancher-setup.md#restricting-the-token-to-a-resource-pool) |
+| `pve-tags` | *(empty)* | Comma-separated PVE tags applied to the VM, e.g. `rancher,prod`. Informational only — for finding/filtering VMs in the PVE UI |
 | `pve-vm-name-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
 | `pve-onboot` | `false` | Start the VM automatically when the PVE host boots |
 
@@ -72,6 +75,27 @@ regardless of template size.
   capability (LVM-thin, ZFS, Ceph RBD, qcow2 on a snapshot-capable
   filesystem). Plain LVM or raw NFS typically cannot do it, and the clone
   will fail outright.
+
+### `pve-allowed-nodes`
+
+With `pve-node` empty, the driver picks a destination node itself: the
+online node with the most free memory, restricted to `pve-allowed-nodes`
+when that is set (otherwise every online node is a candidate). On a
+single-node install there is only ever one candidate, so this has no
+observable effect — it only matters once there is more than one node to
+choose between.
+
+The node a VM actually lands on is written back into the machine's stored
+`pve-node` value once `Create` succeeds, so every later operation
+(`Start`/`Stop`/`GetState`/`Remove`, each a separate driver invocation) talks
+to the right node instead of re-running selection and potentially picking a
+different one.
+
+The template being cloned does not need to live on the chosen destination
+node — its actual node is discovered independently at clone time. Proxmox
+only allows a clone whose destination differs from the template's own node
+when the template's disk is on **shared storage** (e.g. Ceph, NFS); on local
+storage that clone fails with a Proxmox-side error naming the mismatch.
 
 ## Sizing
 
