@@ -203,7 +203,7 @@ driver flag shows up as a form field; the ones that matter first:
 | Linked clone | `pve-linked-clone` | Off by default (full clone). See the warning in the UI and [flags.md](flags.md#pve-linked-clone) before turning it on |
 | Node | `pve-node` | Leave empty to let the driver pick automatically. Mutually exclusive with Allowed nodes |
 | Allowed nodes | `pve-allowed-nodes` | Comma-separated node names the driver may place VMs on, e.g. `pve1,pve2`. Empty considers every online node. No effect on a single-node install |
-| Resource pool | `pve-pool` | PVE pool new VMs are created into. Pairs with a pool-scoped API token — see [Restricting the token to a resource pool](#restricting-the-token-to-a-resource-pool) |
+| Resource pool | `pve-pool` | PVE pool new VMs are created into. Set to `rancher-managed` to match the README's default ACL setup; leave empty only if you chose its unscoped alternative — see [Restricting the token to a resource pool](#restricting-the-token-to-a-resource-pool) |
 | Tags | `pve-tags` | Comma-separated PVE tags, e.g. `rancher,prod`. Informational only |
 | VMID | `pve-vmid` | `0` = PVE auto-assigns (recommended) |
 | Cores / Sockets / Memory | `pve-cores` / `pve-sockets` / `pve-memory` | Per-VM sizing |
@@ -337,52 +337,21 @@ Notes:
 
 ## Restricting the token to a resource pool
 
-The README's [Prepare Proxmox VE](../README.md#prepare-proxmox-ve) ACL grants
-the token every privilege it needs **on `/`** — the whole cluster. That is the
-simplest setup, but it also means the token can start, stop, reconfigure or
-delete *any* VM or container in the cluster, not just the ones Rancher
-created. If Proxmox hosts anything else — other VMs, someone else's test
-boxes — a bug in Rancher, a mistyped VMID, or a compromised Rancher server
-could act on them too.
+The README's [Prepare Proxmox VE](../README.md#prepare-proxmox-ve) section is
+the canonical setup and already uses this: the token's destructive
+privileges are granted on a PVE resource pool (`/pool/rancher-managed`)
+rather than on `/`, and every VM this driver creates is placed into that pool
+as part of the clone call itself — there is no window where a VM exists
+outside it. Proxmox then refuses any operation the token attempts against a
+VM outside the pool, regardless of what Rancher asks the driver to do. Use
+the README for the exact `pveum` commands; this section covers the
+trade-offs and how to verify it actually works.
 
-`pve-pool` plus a narrower ACL closes that: every VM this driver creates is
-placed into a PVE resource pool as part of the clone call itself (there is no
-window where a VM exists outside the pool), and the token's destructive
-privileges are granted on that pool's path instead of `/`. Proxmox then
-refuses any operation the token attempts against a VM outside the pool with a
-permission error, regardless of what Rancher asks the driver to do.
-
-```bash
-# The pool every VM this driver creates will land in.
-pveum pool add rancher-managed
-
-# Destructive/management privileges, scoped to that pool only. This is the
-# README's RancherPVENode role and privilege list, minus VM.Clone (see below)
-# and granted on /pool/rancher-managed instead of /.
-pveum role add RancherPVENode -privs "VM.Allocate,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
-pveum acl modify /pool/rancher-managed --tokens 'rancher@pve!machine' --roles RancherPVENode
-
-# VM.Clone specifically on the template, and nothing else: the token can read
-# and clone that one VM, but cannot start, stop, reconfigure or delete it.
-pveum role add RancherPVETemplateReader -privs "VM.Audit,VM.Clone"
-pveum acl modify /vms/9000 --tokens 'rancher@pve!machine' --roles RancherPVETemplateReader
-
-# Cluster-wide, but read-only or not VM-specific — granting these broadly
-# does not let the token touch another VM. Sys.Audit is required for the
-# node-status call the client makes before touching any VM; Datastore.Audit
-# lets it read storage stats; SDN.Use is needed to attach NICs to a bridge.
-# Datastore.AllocateSpace is what actually lets it consume space when
-# cloning/growing disks, still cluster-wide since a storage is not owned by
-# one VM.
-pveum role add RancherPVECluster -privs "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
-pveum acl modify / --tokens 'rancher@pve!machine' --roles RancherPVECluster --propagate 0
-```
-
-On PVE 8, replace `VM.GuestAgent.Audit` with `VM.Monitor` in the
-`RancherPVENode` role, same as the README's default recipe.
-
-Set the machine pool's **Resource pool** field to `rancher-managed`, matching
-the pool name above.
+If you deliberately chose the README's unscoped alternative instead (granting
+everything on `/`, no `pve-pool`), the token can start, stop, reconfigure or
+delete *any* VM or container in the cluster — not just the ones Rancher
+created. That is fine for a PVE host running nothing else, but worth knowing
+before assuming Rancher-created VMs are the only things it can touch.
 
 **Trade-off worth knowing about:** `VM.Audit` is deliberately *not* granted
 broadly here, only on the template. That means `/cluster/resources` — which
@@ -397,12 +366,10 @@ the cluster to avoid that retry entirely, add `VM.Audit` to the
 `RancherPVECluster` role above — it is read-only, so doing so does not let
 the token modify or delete anything outside the pool.
 
-**Migrating an existing machine pool:** VMs Rancher already created before
-you narrow the ACL are not pool members, so the token immediately loses the
-ability to stop or delete them once the ACL changes. Add their existing
-VMIDs to the pool first: `pveum pool add rancher-managed --vms
-100,101,102`, or the equivalent in **Datacenter → Permissions → Pools** in
-the PVE UI.
+This is the suggested setup whenever Proxmox hosts anything besides this
+driver's VMs: it is the only one of the two that gives you actual resource
+isolation, enforced by Proxmox itself rather than by trusting Rancher to
+behave.
 
 **Verify it before relying on it.** Grant the same role/token to a throwaway
 VM you create by hand *outside* the pool, then confirm `pveum` (or the API
@@ -488,7 +455,7 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Test Connection warns that Rancher could not reach or verify the host, once allow-listed | Rancher server does not trust the PVE TLS certificate; the proxy always verifies it and ignores the credential's `Insecure TLS` / `CA Cert`. Confirm with the in-pod `curl` | [Make Rancher trust the PVE CA](#make-rancher-trust-the-proxmox-ve-certificate), or accept the warning and type the machine-pool fields by hand — provisioning does not use this proxy |
 | Machine pool dropdowns are text inputs instead of dropdowns | Expected fallback when the PVE API is unreachable through the proxy — usually the certificate trust issue above | Fill the four fields by hand, or fix trust to get discovery back |
 | Test Connection says the credentials are not allowed / unauthorized | Wrong `API Token ID` or secret (`/version` needs no privileges, so this is not an ACL problem). Before the fix in the UI extension, the token was sent in `Authorization`, which Rancher itself rejected with 401 | Re-check the token id is `user@realm!tokenid` and the secret is the one printed by `pveum user token add`; update the UI extension |
-| "API token is missing privileges" at save | Token ACL not granted to the token itself | Run both `pveum acl modify` lines (user **and** `-token`) from the README |
+| "API token is missing privileges" at save | Token ACL not granted to the token itself | Run every `pveum acl modify` line (user **and** `-token`, for all three roles) from the README |
 | Node template dropdowns empty / clones fail silently | Same as above — token has zero effective ACLs (privsep) | Same fix; or `--pve-skip-permission-check` to bypass the probe |
 | Create times out "waiting for guest agent IP" | **qemu-guest-agent not installed or not running inside the image.** The driver now sets `agent=1` on every clone, so the PVE-side channel is no longer a cause | Re-bake the image with `qemu-guest-agent` installed and enabled; verify with `qm agent <id> ping` |
 | VM boots but node never `Ready` | cloud-init user lacks passwordless sudo, or `curl`/`bash` missing | Fix template; verify `sudo -n true` works for the SSH user |
@@ -496,9 +463,9 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Data disk missing in guest | wrong storage id on the row | Check the name with `pvesm status` |
 | `Create` fails with `data disk setup failed` | the guest rejected the setup script — usually `mkfs.xfs` missing, or `sudo` prompting for a password | Read the guest output in the error, then fix the template (see the [dependency matrix](template-preparation.md#guest-dependencies-for-longhorn)) |
 | `Create` fails with `no block device with serial pvedata1` | the guest cannot see disk serials, e.g. an unusual SCSI controller in the template | Use `virtio-scsi-single` as in the template guide; verify with `lsblk -ndo NAME,SERIAL` |
-| `not authorized to access endpoint` after pre-create checks pass | The token lacks `Sys.Audit`. The driver reads `/nodes/{node}/status` before touching any VM, and Proxmox gates that on `Sys.Audit` for the node | Add it to the role: `pveum role modify RancherPVENode -privs "<existing list>,Sys.Audit"` — note `-privs` **replaces** the list, so pass all of them. The privilege probe in `PreCreateCheck` checks for it from v0.3.2 on |
+| `not authorized to access endpoint` after pre-create checks pass | The token lacks `Sys.Audit`. The driver reads `/nodes/{node}/status` before touching any VM, and Proxmox gates that on `Sys.Audit` for the node | With the README's pool-scoped setup, `Sys.Audit` lives in the `RancherPVECluster` role granted on `/` — check that ACL line was applied to both the user and the token. With the unscoped alternative, add it to `RancherPVENode`: `pveum role modify RancherPVENode -privs "<existing list>,Sys.Audit"` — note `-privs` **replaces** the list, so pass all of them. The privilege probe in `PreCreateCheck` checks for it from v0.3.2 on |
 | `Error with pre-create check: ... x509: certificate signed by unknown authority` | The cloud credential has TLS verification on and no CA, and PVE's certificate is self-signed | Edit the cloud credential: either tick **Skip TLS certificate verification**, or paste `/etc/pve/pve-root-ca.pem` from the PVE host into **CA Certificate (PEM)**. These are driver-side and separate from Rancher's proxy trust — see [below](#make-rancher-trust-the-proxmox-ve-certificate) |
-| `Error with pre-create check: ... 401` / `authentication failure` | Token id or secret wrong, or the ACL was granted to the user but not the token | Re-check both `pveum acl modify` lines from the [README](../README.md#prepare-proxmox-ve): tokens do not inherit user privileges |
+| `Error with pre-create check: ... 401` / `authentication failure` | Token id or secret wrong, or the ACL was granted to the user but not the token | Re-check every `pveum acl modify` line from the [README](../README.md#prepare-proxmox-ve): tokens do not inherit user privileges |
 | `Create` fails with `--pve-cloudinit is required to format and mount` | a data disk asks for a filesystem but cloud-init is off, so no SSH key reaches the guest | Enable cloud-init on the pool, or set the row's filesystem to `none` |
 | `Create` fails with `data disk setup did not finish within` | mkfs on a very large disk, or a slow first boot | Raise `pve-disk-setup-timeout` |
 | IP picked from wrong interface (docker0/cni) | First-IPv4 fallback was used | Ensure MAC capture succeeded (driver logs); set `pve-net-device` to the right `netN` |

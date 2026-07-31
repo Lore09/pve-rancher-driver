@@ -82,22 +82,59 @@ air-gapped clusters — plus the full chart values reference are in
 
 Two things are needed before the first cluster.
 
-**An API token** with a least-privilege role. The required privilege set differs
-between PVE 8 and 9; the driver probes the live server version and tells you
-which one it wants:
+**An API token**, scoped to a PVE resource pool rather than to the whole
+cluster (`/`). Every VM this driver creates is placed into that pool as part
+of the clone call itself, so a token whose destructive privileges are only
+granted on the pool cannot touch anything else PVE hosts — Proxmox refuses
+the attempt regardless of what Rancher asks the driver to do. The privilege
+set differs between PVE 8 and 9; the driver probes the live server version
+and tells you which one it wants:
 
 ```bash
-pveum role add RancherPVENode -privs "VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Sys.Audit,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate"
+# The pool every VM this driver creates will land in.
+pveum pool add rancher-managed
+
+# Destructive/management privileges, scoped to that pool only.
+pveum role add RancherPVENode -privs "VM.Allocate,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
+
+# VM.Clone specifically on the template, and nothing else: the token can read
+# and clone it, but cannot start, stop, reconfigure or delete it. Replace
+# 9000 with your template's VMID.
+pveum role add RancherPVETemplateReader -privs "VM.Audit,VM.Clone"
+
+# Cluster-wide, but read-only or not VM-specific — granting these broadly
+# does not let the token touch another VM's lifecycle.
+pveum role add RancherPVECluster -privs "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
+
 pveum user add rancher@pve
 pveum user token add rancher@pve machine
-pveum acl modify / -user  rancher@pve         -role RancherPVENode
-pveum acl modify / -token 'rancher@pve!machine' -role RancherPVENode
+
+pveum acl modify /pool/rancher-managed -user  rancher@pve           -role RancherPVENode
+pveum acl modify /pool/rancher-managed -token 'rancher@pve!machine' -role RancherPVENode
+pveum acl modify /vms/9000             -user  rancher@pve           -role RancherPVETemplateReader
+pveum acl modify /vms/9000             -token 'rancher@pve!machine' -role RancherPVETemplateReader
+pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster --propagate 0
+pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster --propagate 0
 ```
 
 That is the **PVE 9** set. On PVE 8 replace `VM.GuestAgent.Audit` with
-`VM.Monitor`, or grant both to cover either. The token secret is printed once —
-save it. Both ACL lines are required: PVE tokens do not inherit the user's
-privileges.
+`VM.Monitor` in `RancherPVENode`, or grant both to cover either. The token
+secret is printed once — save it. Every ACL line above is required for both
+the user and the token: PVE tokens do not inherit the user's privileges.
+
+Every machine pool must then set **Resource Pool** to `rancher-managed` (the
+`pve-pool` field) to match — a pool created without it will fail to clone,
+since the token has no permission to create VMs outside `rancher-managed`.
+The trade-offs of this ACL, migrating an already-running cluster onto it, and
+how to verify it actually blocks access to other VMs are in
+[docs/rancher-setup.md](docs/rancher-setup.md#restricting-the-token-to-a-resource-pool).
+
+If nothing else runs on this PVE host and isolation does not matter to you,
+you can skip the pool and grant everything on `/` instead: `pveum role add
+RancherPVENode -privs
+"VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Sys.Audit,Datastore.AllocateSpace,Datastore.Audit,SDN.Use,Pool.Allocate"`,
+then `pveum acl modify / -user rancher@pve -role RancherPVENode` and the same
+for `-token`, and leave `pve-pool` empty.
 
 **A VM template** with `qemu-guest-agent` baked in, a cloud-init drive, and a
 login user with passwordless sudo. Recipes for Debian 13 and openSUSE Leap Micro
