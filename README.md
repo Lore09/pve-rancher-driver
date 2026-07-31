@@ -109,8 +109,8 @@ pveum user token add rancher@pve machine
 
 pveum acl modify /pool/rancher-managed -user  rancher@pve           -role RancherPVENode
 pveum acl modify /pool/rancher-managed -token 'rancher@pve!machine' -role RancherPVENode
-pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster --propagate 0
-pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster --propagate 0
+pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster
+pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster
 ```
 
 That is the **PVE 9** set. On PVE 8 replace `VM.GuestAgent.Audit` with

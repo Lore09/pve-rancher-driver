@@ -414,8 +414,8 @@ pveum acl modify /pool/rancher-managed -user  rancher@pve           -role Ranche
 pveum acl modify /pool/rancher-managed -token 'rancher@pve!machine' -role RancherPVENode
 pveum acl modify /vms/9000             -user  rancher@pve           -role RancherPVETemplateReader
 pveum acl modify /vms/9000             -token 'rancher@pve!machine' -role RancherPVETemplateReader
-pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster --propagate 0
-pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster --propagate 0
+pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster
+pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster
 ```
 
 Everything else — the `pve-pool` field, PVE 8's `VM.Monitor` swap, the
