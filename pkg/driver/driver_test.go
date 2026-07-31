@@ -448,7 +448,9 @@ func TestIPFlagsAreDeclared(t *testing.T) {
 
 	want := map[string]bool{
 		"pve-ip-mode":      false,
-		"pve-ip-base":      false,
+		"pve-ip-start":     false,
+		"pve-ip-end":       false,
+		"pve-ip-prefix":    false,
 		"pve-gateway":      false,
 		"pve-nameservers":  false,
 		"pve-searchdomain": false,
@@ -458,8 +460,8 @@ func TestIPFlagsAreDeclared(t *testing.T) {
 		if _, ok := want[name]; ok {
 			want[name] = true
 		}
-		if name == "pve-ipconfig" {
-			t.Error("pve-ipconfig must be removed: one flag cannot express a per-machine address, so every node in a pool would receive the same one")
+		if name == "pve-ipconfig" || name == "pve-ip-base" {
+			t.Errorf("%s must be removed: a single CIDR cannot express both the pool bounds and the node netmask, which is what made /28 mean two different things", name)
 		}
 	}
 	for name, found := range want {

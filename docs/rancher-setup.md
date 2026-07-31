@@ -210,8 +210,10 @@ driver flag shows up as a form field; the ones that matter first:
 | Boot disk device | `pve-boot-disk-device` | `scsi0` by default; match your template's boot disk |
 | Cloud-init | `pve-cloudinit` | Always on. The driver enables it regardless: it is the only channel for the SSH key, the static address and the DNS settings |
 | Addressing | `pve-ip-mode` | `DHCP` or `Static` |
-| Base address | `pve-ip-base` | Static only. First address of the pool, e.g. `10.10.20.10/24` |
-| Gateway | `pve-gateway` | Static only. Must be in the base subnet |
+| Start address | `pve-ip-start` | Static only. First address of the pool, e.g. `192.168.15.150` |
+| End address | `pve-ip-end` | Static only. Last address of the pool, e.g. `192.168.15.159`. Caps how many machines the pool holds |
+| Subnet prefix | `pve-ip-prefix` | Static only. The netmask the machines get, e.g. `24`. **Not** the pool size |
+| Gateway | `pve-gateway` | Static only. May sit outside the pool, but must be inside the subnet the prefix describes |
 | DNS servers | `pve-nameservers` | Both modes. Empty keeps the DHCP-supplied resolver |
 | DNS search domain | `pve-searchdomain` | Both modes |
 | Cloud-init user | `pve-ciuser` | e.g. `rancher` for Leap Micro; leave empty for Debian's built-in `debian` user |
@@ -426,8 +428,10 @@ sha256 of the `nodedriver-v*.yaml` file (it's a manifest, not the binary).
 | Pods crash-loop with `Fatal glibc error: CPU does not support x86-64-v2` (often first seen in a `helm-operation-*` pod) | The template was created with PVE's default `kvm64` CPU model, which lacks SSE4.2/POPCNT. Modern container images built against glibc 2.34+ target x86-64-v2 and abort immediately. The node itself provisions fine, so this reads as a Rancher fault rather than a VM one | Set `--cpu x86-64-v2-AES` on the template (see [template preparation](template-preparation.md#a2-create-the-template-vm)). Existing nodes need a full `qm stop` + `qm start` — the CPU model is fixed at VM start, so an in-guest reboot will not pick it up |
 | Node gets an unexpected IP after setting a bridge | Rewriting the net device assigns a new MAC, so DHCP reservations keyed to the old MAC no longer match | Re-key the reservation to the new MAC, or set `pve-ip-mode` to static, which does not depend on DHCP reservations at all |
 | `--pve-ip-mode static requires --pve-vmid-range` | The address is derived from the machine position in the VMID range, so without a range there is no offset to compute | Set a VMID range on the pool, e.g. `200-299` |
-| `static IP pool exhausted: ... leaves room for N machines` | The subnet is full. It caps the pool, not the VMID range, and machines fill it upward from the base | Widen the prefix, lower the base address, or scale the pool down. A VMID range wider than the subnet is fine on its own |
-| `--pve-ip-base ... is the network address` / `is the broadcast address` | The base cannot be assigned to a machine | Use the next address up, e.g. `10.10.20.1/24` rather than `10.10.20.0/24` |
+| `static IP pool exhausted: ... holds N machines` | The pool is full. It caps the machine count, not the VMID range, and machines fill it from the start upward | Raise the end address, or scale the pool down. A VMID range wider than the pool is fine on its own |
+| `the pool includes ... the network address` / `the broadcast address` | An end of the pool lands on an unassignable address | Move that end in by one, e.g. start at `.1` rather than `.0` |
+| `--pve-ip-start ... and --pve-ip-end ... are not in the same /N subnet` | The prefix is too narrow to hold both ends | Widen the subnet prefix to the real network, usually `24` |
+| `--pve-gateway ... is outside ...` | The prefix was set to bound the pool rather than to describe the network, so the gateway is no longer on-link | Set the prefix to the real network prefix and bound the pool with start and end instead |
 | Two pools get the same addresses | They share both a VMID range and an IP base | Give each pool its own VMID range |
 | `--pve-nameservers and --pve-searchdomain need --pve-cloudinit` | DNS reaches the guest as a cloud-init option | Enable cloud-init on the pool, or clear the DNS fields |
 
