@@ -42,9 +42,25 @@ type Config struct {
 	// PVE API endpoint. When non-empty it overrides the system roots. Only
 	// honored when Insecure is false.
 	CACertPEM string
-	// Timeout is applied as the upper bound when waiting for PVE tasks.
+	// Timeout bounds every individual HTTP request to the PVE API. Zero uses
+	// defaultRequestTimeout.
+	//
+	// Without this, a PVE host that stops responding mid-request (network
+	// partition, host down, reboot) hangs the call forever: net/http's
+	// default client has no timeout, and neither task.Wait's polling loop
+	// nor the driver's own operations set a context deadline, so nothing
+	// ever interrupts the stuck request. That single hung call is enough to
+	// stall a whole cluster teardown, since Rancher removes machines in a
+	// cluster one at a time and never reaches the ones after it.
 	Timeout time.Duration
 }
+
+// defaultRequestTimeout is used when Config.Timeout is zero. It bounds a
+// single PVE API request, not a whole operation — task.Wait already polls in
+// a loop capped by waitTimeout, and WaitForAgent similarly polls rather than
+// holding one request open, so 30s is generous for any one call without
+// cutting either of those loops short.
+const defaultRequestTimeout = 30 * time.Second
 
 // New returns a configured Proxmox client.
 func New(cfg Config) (*Client, error) {
@@ -70,7 +86,12 @@ func New(cfg Config) (*Client, error) {
 		tlsCfg.RootCAs = pool
 	}
 
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
 	httpClient := &http.Client{
+		Timeout: timeout,
 		Transport: &http.Transport{
 			TLSClientConfig: tlsCfg,
 		},
