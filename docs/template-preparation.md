@@ -360,6 +360,58 @@ time before `qm importdisk`.
   appliance to do its work. Combining the operations into a single call is
   noticeably faster and keeps the image build in one reviewable place.
 
+### Patching a template you already built
+
+`qm template` makes the disk read-only, so you cannot boot the template
+itself to fix something after the fact. You do not need to rebuild it from
+the downloaded image either — `virt-customize` can edit the template's disk
+directly while it is stopped, the same way it edited the `.qcow2` before
+`qm importdisk`, just pointed at the live volume instead:
+
+```bash
+# Find the real path of the template's boot disk. $TMPL is its VMID (500,
+# in this example); replace scsi0 if you used a different --boot-disk-device.
+TMPL=500
+VOLID=$(qm config $TMPL | sed -n 's/^scsi0: \([^,]*\),.*/\1/p')
+DISK=$(pvesm path "$VOLID")
+
+virt-customize -a "$DISK" \
+  --install some-package \
+  --run-command 'systemctl enable some.service'
+```
+
+`pvesm path` resolves the volume id to an actual device or file path
+regardless of storage backend — an LVM-thin/ZFS volume becomes a block
+device (`/dev/pve/vm-500-disk-0`), a directory storage a `.qcow2` file. Same
+rules as building from scratch apply: order operations correctly, `enable`
+works but `start` does not, and there is no need to re-truncate
+`/etc/machine-id` — that only matters once, at the original build.
+
+**Worked example:** cloud images often start `sshd` before the network is
+actually up (DHCP/routing not finished), so a provisioner that connects the
+instant SSH opens — which is exactly what Rancher's bootstrap does — can hit
+a real but transient failure (DNS/fetch errors, "exit status 100" from
+`apt-get`) in that window. Making `ssh.service` wait for
+`network-online.target` removes the race:
+
+```bash
+mkdir -p ssh.service.d
+cat > ssh.service.d/wait-for-network.conf <<'EOF'
+[Unit]
+After=network-online.target
+Wants=network-online.target
+EOF
+
+virt-customize -a "$DISK" \
+  --mkdir /etc/systemd/system/ssh.service.d \
+  --copy-in ssh.service.d/wait-for-network.conf:/etc/systemd/system/ssh.service.d/
+```
+
+(`ssh.service` is Debian's unit name for openssh-server; SUSE/RHEL-derived
+images use `sshd.service` instead.) Re-run the [smoke
+test](#verify-the-template-works-before-pointing-rancher-at-it) afterward —
+cloning is what actually proves the patched disk still boots.
+
 ### Kernel modules and sysctls
 
 Modules that must be present at boot go in `/etc/modules-load.d/`, and tunables
