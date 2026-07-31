@@ -60,20 +60,19 @@ virt-customize -a debian-13-genericcloud-amd64.qcow2 \
 qemu-img resize debian-13-genericcloud-amd64.qcow2 20G
 ```
 
-> **On a PVE host, every `virt-customize`/`virt-*` call in this guide may
-> fail with `guestfs_launch failed`.** libguestfs defaults to launching its
-> inspection appliance through `libvirt`, and PVE does not run standard
-> `libvirtd` — it has its own qemu management stack instead — so that
-> backend never starts anything. Force the direct-qemu backend instead:
+> **If a `virt-*` call fails with `guestfs_launch failed`**, first find out
+> whether libguestfs itself is broken or the arguments are:
 >
 > ```bash
-> export LIBGUESTFS_BACKEND=direct
+> libguestfs-test-tool 2>&1 | tail -5
 > ```
 >
-> Set it once per shell before the first `virt-customize` call. If it still
-> fails afterward, the error message's own suggestion is the next step:
-> `LIBGUESTFS_DEBUG=1 LIBGUESTFS_TRACE=1 virt-customize -v -x ...` to see
-> what the appliance is actually doing.
+> Ending in `===== TEST FINISHED OK =====` means the appliance launches
+> fine, so the problem is what was passed to `-a` — an empty variable, a
+> path that does not exist, or a disk belonging to a running VM. If the test
+> tool itself fails, try `export LIBGUESTFS_BACKEND=direct` (some hosts
+> cannot use the default libvirt backend), then
+> `LIBGUESTFS_DEBUG=1 LIBGUESTFS_TRACE=1 libguestfs-test-tool` for detail.
 
 > This installs the bare minimum. If the nodes will run Longhorn, or you need
 > your own packages, a CA or kernel modules in the image, extend this one
@@ -374,58 +373,6 @@ time before `qm importdisk`.
 - **One command, not five.** Each `virt-customize` invocation boots a small
   appliance to do its work. Combining the operations into a single call is
   noticeably faster and keeps the image build in one reviewable place.
-
-### Patching a template you already built
-
-`qm template` makes the disk read-only, so you cannot boot the template
-itself to fix something after the fact. You do not need to rebuild it from
-the downloaded image either — `virt-customize` can edit the template's disk
-directly while it is stopped, the same way it edited the `.qcow2` before
-`qm importdisk`, just pointed at the live volume instead:
-
-```bash
-# Find the real path of the template's boot disk. $TMPL is its VMID (500,
-# in this example); replace scsi0 if you used a different --boot-disk-device.
-TMPL=500
-VOLID=$(qm config $TMPL | sed -n 's/^scsi0: \([^,]*\),.*/\1/p')
-DISK=$(pvesm path "$VOLID")
-
-virt-customize -a "$DISK" \
-  --install some-package \
-  --run-command 'systemctl enable some.service'
-```
-
-`pvesm path` resolves the volume id to an actual device or file path
-regardless of storage backend — an LVM-thin/ZFS volume becomes a block
-device (`/dev/pve/vm-500-disk-0`), a directory storage a `.qcow2` file. Same
-rules as building from scratch apply: order operations correctly, `enable`
-works but `start` does not, and there is no need to re-truncate
-`/etc/machine-id` — that only matters once, at the original build.
-
-**Worked example:** cloud images often start `sshd` before the network is
-actually up (DHCP/routing not finished), so a provisioner that connects the
-instant SSH opens — which is exactly what Rancher's bootstrap does — can hit
-a real but transient failure (DNS/fetch errors, "exit status 100" from
-`apt-get`) in that window. Making `ssh.service` wait for
-`network-online.target` removes the race:
-
-```bash
-mkdir -p ssh.service.d
-cat > ssh.service.d/wait-for-network.conf <<'EOF'
-[Unit]
-After=network-online.target
-Wants=network-online.target
-EOF
-
-virt-customize -a "$DISK" \
-  --mkdir /etc/systemd/system/ssh.service.d \
-  --copy-in ssh.service.d/wait-for-network.conf:/etc/systemd/system/ssh.service.d/
-```
-
-(`ssh.service` is Debian's unit name for openssh-server; SUSE/RHEL-derived
-images use `sshd.service` instead.) Re-run the [smoke
-test](#verify-the-template-works-before-pointing-rancher-at-it) afterward —
-cloning is what actually proves the patched disk still boots.
 
 ### Kernel modules and sysctls
 

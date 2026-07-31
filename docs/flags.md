@@ -161,12 +161,33 @@ the exact system paths are refused.
 | `pve-net-firewall` | *(empty)* | `true`/`false` to toggle the PVE firewall on the NIC; empty keeps the PVE default. Requires `pve-net-bridge` |
 | `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface name. Rarely needed — MAC matching already pins it |
 | `pve-agent-timeout` | `300` | Seconds to wait for the QEMU guest agent to report an IP |
+| `pve-provision-delay` | `30` | Seconds to wait after the VM is up before handing it to Rancher for provisioning. See below |
 
 The four settings marked *Requires `pve-net-bridge`* are only written while
 rewriting the NIC, which only happens when a bridge is named. `PreCreateCheck`
 rejects them without one rather than silently ignoring a VLAN you asked for.
 
 See [networking.md](networking.md) for how to build the node network itself.
+
+### `pve-provision-delay`
+
+`Create` sleeps for this long, after the VM is running and reachable, before
+returning. Returning is what hands the machine to Rancher, and everything
+after that point — waiting for SSH, detecting the OS, running the bootstrap
+commands — is Rancher's own provisioning code that the driver cannot hook
+into. Delaying here is the only lever the driver has over when that starts.
+
+It defaults to 30 seconds rather than 0 because **"sshd accepts a
+connection" is not the same as "the guest is ready"**. Several cloud images
+open port 22 before cloud-init has finished writing the resolver and the
+default route. Rancher fires its first bootstrap command the moment SSH
+answers, so with no delay that command can run against a guest with no
+working DNS and fail on something that would have succeeded seconds later —
+and a failed bootstrap deletes and recreates the entire machine, often in a
+loop.
+
+Raise it if bootstrap still fails on a slow-booting image; set it to `0` to
+hand the machine back immediately.
 
 ## Cloud-init and access
 
