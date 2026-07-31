@@ -201,7 +201,10 @@ driver flag shows up as a form field; the ones that matter first:
 |---|---|---|
 | Template VMID | `pve-template-vmid` | From the [template guide](template-preparation.md), e.g. `9000` |
 | Linked clone | `pve-linked-clone` | Off by default (full clone). See the warning in the UI and [flags.md](flags.md#pve-linked-clone) before turning it on |
-| Node | `pve-node` | Leave empty to use the first online PVE node |
+| Node | `pve-node` | Leave empty to let the driver pick automatically. Mutually exclusive with Allowed nodes |
+| Allowed nodes | `pve-allowed-nodes` | Comma-separated node names the driver may place VMs on, e.g. `pve1,pve2`. Empty considers every online node. No effect on a single-node install |
+| Resource pool | `pve-pool` | PVE pool new VMs are created into. Pairs with a pool-scoped API token — see [Restricting the token to a resource pool](#restricting-the-token-to-a-resource-pool) |
+| Tags | `pve-tags` | Comma-separated PVE tags, e.g. `rancher,prod`. Informational only |
 | VMID | `pve-vmid` | `0` = PVE auto-assigns (recommended) |
 | Cores / Sockets / Memory | `pve-cores` / `pve-sockets` / `pve-memory` | Per-VM sizing |
 | Network device | `pve-net-device` | Which PVE NIC's MAC is used for IP discovery (`net0`), and the device the settings below rewrite |
@@ -331,6 +334,82 @@ Notes:
   the template's MAC will not match.
 - The driver writes only the device named by `pve-net-device`. Other NICs on
   the template are untouched.
+
+## Restricting the token to a resource pool
+
+The README's [Prepare Proxmox VE](../README.md#prepare-proxmox-ve) ACL grants
+the token every privilege it needs **on `/`** — the whole cluster. That is the
+simplest setup, but it also means the token can start, stop, reconfigure or
+delete *any* VM or container in the cluster, not just the ones Rancher
+created. If Proxmox hosts anything else — other VMs, someone else's test
+boxes — a bug in Rancher, a mistyped VMID, or a compromised Rancher server
+could act on them too.
+
+`pve-pool` plus a narrower ACL closes that: every VM this driver creates is
+placed into a PVE resource pool as part of the clone call itself (there is no
+window where a VM exists outside the pool), and the token's destructive
+privileges are granted on that pool's path instead of `/`. Proxmox then
+refuses any operation the token attempts against a VM outside the pool with a
+permission error, regardless of what Rancher asks the driver to do.
+
+```bash
+# The pool every VM this driver creates will land in.
+pveum pool add rancher-managed
+
+# Destructive/management privileges, scoped to that pool only. This is the
+# README's RancherPVENode role and privilege list, minus VM.Clone (see below)
+# and granted on /pool/rancher-managed instead of /.
+pveum role add RancherPVENode -privs "VM.Allocate,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
+pveum acl modify /pool/rancher-managed --tokens 'rancher@pve!machine' --roles RancherPVENode
+
+# VM.Clone specifically on the template, and nothing else: the token can read
+# and clone that one VM, but cannot start, stop, reconfigure or delete it.
+pveum role add RancherPVETemplateReader -privs "VM.Audit,VM.Clone"
+pveum acl modify /vms/9000 --tokens 'rancher@pve!machine' --roles RancherPVETemplateReader
+
+# Cluster-wide, but read-only or not VM-specific — granting these broadly
+# does not let the token touch another VM. Sys.Audit is required for the
+# node-status call the client makes before touching any VM; Datastore.Audit
+# lets it read storage stats; SDN.Use is needed to attach NICs to a bridge.
+# Datastore.AllocateSpace is what actually lets it consume space when
+# cloning/growing disks, still cluster-wide since a storage is not owned by
+# one VM.
+pveum role add RancherPVECluster -privs "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
+pveum acl modify / --tokens 'rancher@pve!machine' --roles RancherPVECluster --propagate 0
+```
+
+On PVE 8, replace `VM.GuestAgent.Audit` with `VM.Monitor` in the
+`RancherPVENode` role, same as the README's default recipe.
+
+Set the machine pool's **Resource pool** field to `rancher-managed`, matching
+the pool name above.
+
+**Trade-off worth knowing about:** `VM.Audit` is deliberately *not* granted
+broadly here, only on the template. That means `/cluster/resources` — which
+the driver calls both to avoid a VMID collision when `pve-vmid-range` is set
+and to locate the template when `pve-allowed-nodes` picks a node other than
+the template's own — only sees VMs inside the pool plus the template itself.
+In practice this is harmless: if the driver picks a VMID something outside
+its visibility is already using, Proxmox rejects the clone with "already
+exists" and the driver retries with another id (up to 5 times) exactly as it
+does for a same-pool race. If you would rather the driver see every VMID in
+the cluster to avoid that retry entirely, add `VM.Audit` to the
+`RancherPVECluster` role above — it is read-only, so doing so does not let
+the token modify or delete anything outside the pool.
+
+**Migrating an existing machine pool:** VMs Rancher already created before
+you narrow the ACL are not pool members, so the token immediately loses the
+ability to stop or delete them once the ACL changes. Add their existing
+VMIDs to the pool first: `pveum pool add rancher-managed --vms
+100,101,102`, or the equivalent in **Datacenter → Permissions → Pools** in
+the PVE UI.
+
+**Verify it before relying on it.** Grant the same role/token to a throwaway
+VM you create by hand *outside* the pool, then confirm `pveum` (or the API
+with the token's credentials) refuses to stop or delete it — a `403
+Permission check failed` is what "protected" looks like. Do this once after
+setup and again after any ACL change, rather than assuming the recipe above
+matches your exact PVE version's behavior.
 
 ## Boot disk sizing
 
