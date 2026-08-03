@@ -89,16 +89,34 @@ push if they drift.
 4. Commits the new binary's SHA-256 back into `deploy/chart/values.yaml`, since
    the digest cannot exist until the binary is built.
 
-Two details that are load-bearing, in case you edit these workflows:
+To re-release an existing tag, run **Actions → Release → Run workflow** and
+give it the tag. That is the only other way in: `release.yml` has no tag-push
+trigger, because a tag pushed with the default `GITHUB_TOKEN` does not start
+workflow runs, so that path could never fire on the normal route anyway.
 
-- `release.yml` is invoked with `workflow_call`, **not** by its tag trigger. A
-  tag pushed using the default `GITHUB_TOKEN` does not start new workflow runs,
-  so the tag-triggered path would silently never fire. It is kept as a manual
-  escape hatch for re-releasing an existing tag.
+Four details that are load-bearing, in case you edit these workflows:
+
 - `chart-release.yml` watches **`Chart.yaml` only**, and the checksum commit
   writes **`values.yaml` only**. That asymmetry is what stops the release from
   re-triggering itself. Widening the path filter to `deploy/chart/**` creates an
   infinite release loop.
+- **`ci.yml`'s concurrency group includes `github.workflow`.** A release reaches
+  CI twice — once from the push to `master`, once as the gate `release.yml`
+  calls — and both runs carry the same `github.ref`. Keying the group on the ref
+  alone put them in one bucket, so `cancel-in-progress` killed one of them: jobs
+  that start and immediately go grey, and occasionally a release whose own gate
+  was cancelled. For a reusable workflow `github.workflow` is the *caller's*
+  name, which separates the two.
+- **The release gate skips the cross-compile job** (`skip-cross-compile: true`).
+  goreleaser rebuilds every target moments later, so running `make dist` first
+  only lengthened the release. The `if:` on that job is written as
+  `${{ !inputs.skip-cross-compile }}` rather than `== false` on purpose:
+  GitHub coerces both `null` and `false` to `0`, so the equality form would
+  skip the job on every ordinary push.
+- **`release.yml` serialises on one concurrency group and never cancels.** It
+  ends by pushing the checksum commit to the default branch; two releases at
+  once would race there, and the loser would fail the push having already
+  published its binaries.
 
 Between the version bump and the checksum commit there is a short window where
 the chart on `master` claims a new version but still carries the previous
