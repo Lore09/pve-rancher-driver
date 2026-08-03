@@ -604,23 +604,6 @@ func TestNormalizeTags(t *testing.T) {
 	}
 }
 
-func TestResolveDescription(t *testing.T) {
-	d := &Driver{BaseDriver: &drivers.BaseDriver{MachineName: "pool-abc"}, TemplateVMID: 9000}
-	got := d.resolveDescription()
-	// The default exists to stop the clone from carrying the template's own
-	// notes, so it has to name this machine and where it came from.
-	for _, want := range []string{"pool-abc", "9000", "docker-machine-driver-pve"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("resolveDescription() = %q, want it to mention %q", got, want)
-		}
-	}
-
-	d.Description = "custom notes"
-	if got := d.resolveDescription(); got != "custom notes" {
-		t.Errorf("resolveDescription() = %q, want the explicit --pve-description value", got)
-	}
-}
-
 func TestValidateTemplateSelection(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -672,5 +655,75 @@ func TestValidateTemplateSelectionNormalizesTags(t *testing.T) {
 	}
 	if d.TemplateTag != "rancher,node" {
 		t.Errorf("TemplateTag = %q, want %q (lowercased, trimmed, deduped)", d.TemplateTag, "rancher,node")
+	}
+}
+
+func TestResolveDescription(t *testing.T) {
+	d := &Driver{BaseDriver: &drivers.BaseDriver{MachineName: "pool-abc"}, TemplateVMID: 9000}
+	got := d.resolveDescription()
+	// The default exists to stop the clone from carrying the template's own
+	// notes, so it has to name this machine and where it came from.
+	for _, want := range []string{"pool-abc", "9000", "docker-machine-driver-pve"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("resolveDescription() = %q, want it to mention %q", got, want)
+		}
+	}
+
+	d.Description = "custom notes"
+	if got := d.resolveDescription(); got != "custom notes" {
+		t.Errorf("resolveDescription() = %q, want the explicit --pve-description value", got)
+	}
+}
+
+func TestParseCloudInitResult(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"pve-cloudinit-result=0\nstatus: done", "0", true},
+		{"pve-cloudinit-result=2 status: degraded done", "2", true},
+		{"pve-cloudinit-result=absent", "absent", true},
+		{"pve-cloudinit-result=1", "1", true},
+		{"some unrelated banner text", "", false},
+		{"pve-cloudinit-result=nonsense", "", false},
+	}
+	for _, tt := range tests {
+		got, ok := parseCloudInitResult(tt.in)
+		if ok != tt.ok || got != tt.want {
+			t.Errorf("parseCloudInitResult(%q) = (%q, %v), want (%q, %v)", tt.in, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestInterpretCloudInitResult(t *testing.T) {
+	// Only a genuine cloud-init failure blocks the machine. Recoverable
+	// errors, a guest without cloud-init and unparseable output all continue:
+	// failing there would delete a node that is very likely fine.
+	tests := []struct {
+		name    string
+		out     string
+		wantErr bool
+	}{
+		{"success", "pve-cloudinit-result=0", false},
+		{"recoverable errors", "pve-cloudinit-result=2 status: degraded done", false},
+		{"no cloud-init in the guest", "pve-cloudinit-result=absent", false},
+		{"unreadable output", "banner nonsense", false},
+		{"failure", "pve-cloudinit-result=1 status: error", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := interpretCloudInitResult(tt.out)
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("interpretCloudInitResult(%q) = %v, wantErr %v", tt.out, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCloudInitTimeoutDefaultsToNonZero(t *testing.T) {
+	d := NewDriver("machine", "/tmp").(*Driver)
+	if d.CloudInitTimeout != defaultCloudInitTimeout {
+		t.Errorf("CloudInitTimeout = %s, want %s", d.CloudInitTimeout, defaultCloudInitTimeout)
 	}
 }

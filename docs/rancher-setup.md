@@ -234,7 +234,8 @@ driver flag shows up as a form field; the ones that matter first:
 | VM name prefix | `pve-vm-name-prefix` | Optional. Rendered as `<prefix>-<machine name>`, e.g. `k8s-mycluster-pool1-x7k2p`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only |
 | Data Disks | `pve-data-disk` | One row per disk; repeatable. See [Data disks](#data-disks) below |
 | Agent timeout | `pve-agent-timeout` | Seconds to wait for the guest-agent IP (default 300) |
-| Provision delay | `pve-provision-delay` | Seconds to wait after the VM is up before Rancher provisions it (default 30). Raise it if bootstrap fails against a guest whose network is not ready yet — see [flags.md](flags.md#pve-provision-delay) |
+| Cloud-init timeout | `pve-cloudinit-timeout` | Seconds to wait for `cloud-init status --wait` inside the guest before handing the machine to Rancher (default 300, `0` skips). This is the real readiness check that Provision delay only approximates — see [flags.md](flags.md#pve-cloudinit-timeout) |
+| Provision delay | `pve-provision-delay` | Seconds to wait after the VM is up before Rancher provisions it (default 30). Largely redundant once Cloud-init timeout is on, and can be lowered or set to 0; raise it if bootstrap still fails against a guest whose network is not ready yet — see [flags.md](flags.md#pve-provision-delay) |
 | On boot | `pve-onboot` | Autostart VM with the PVE host |
 
 One pool per role (control-plane, etcd, worker) is normal; workers are where

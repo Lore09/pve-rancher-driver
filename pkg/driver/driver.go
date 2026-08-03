@@ -61,6 +61,12 @@ const (
 	// working DNS and fail on what is really a transient condition — and a
 	// failed bootstrap gets the whole machine deleted and recreated.
 	defaultProvisionDelay = 30 * time.Second
+	// defaultCloudInitTimeout bounds the wait for cloud-init to finish inside
+	// the guest. It is the readiness signal --pve-provision-delay only
+	// approximates: cloud-init reports its own completion, so the driver can
+	// wait for the real thing instead of guessing at a duration. Generous
+	// because a first boot runs package installs and disk growth.
+	defaultCloudInitTimeout = 5 * time.Minute
 	// defaultTemplateMatch is the tag-matching policy for --pve-template-tag.
 	// Subset is the useful default: an image template usually carries build
 	// metadata tags (distro, date) alongside the one naming its role, and
@@ -116,6 +122,7 @@ type Driver struct {
 	SSHKeys          string
 	Onboot           bool
 	AgentTimeout     time.Duration
+	CloudInitTimeout time.Duration
 	ProvisionDelay   time.Duration
 	KeepOnFailure    bool
 	SkipPermCheck    bool
@@ -144,6 +151,7 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		IPMode:           string(ipModeDHCP),
 		Onboot:           false,
 		AgentTimeout:     defaultAgentTimeout,
+		CloudInitTimeout: defaultCloudInitTimeout,
 		DiskSetupTimeout: defaultDiskSetupTimeout,
 		ProvisionDelay:   defaultProvisionDelay,
 		TemplateMatch:    defaultTemplateMatch,
@@ -330,6 +338,12 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  int(defaultAgentTimeout / time.Second),
 		},
 		mcnflag.IntFlag{
+			Name:   "pve-cloudinit-timeout",
+			EnvVar: "PVE_CLOUDINIT_TIMEOUT",
+			Usage:  "Seconds to wait for cloud-init to finish inside the guest before handing the machine to Rancher. This is the real readiness signal that pve-provision-delay only approximates, so with it enabled the delay can usually be lowered or set to 0. Set to 0 to skip the wait entirely (guests without cloud-init are detected and skipped automatically)",
+			Value:  int(defaultCloudInitTimeout / time.Second),
+		},
+		mcnflag.IntFlag{
 			Name:   "pve-provision-delay",
 			EnvVar: "PVE_PROVISION_DELAY",
 			Usage:  "Seconds to wait after the VM is up before handing it back to Rancher for provisioning. Defaults to 30 because several cloud images accept SSH before cloud-init has finished configuring DNS and the default route, which makes Rancher's first bootstrap command fail against a half-ready guest. Set to 0 to hand it back immediately",
@@ -495,6 +509,13 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		d.AgentTimeout = time.Duration(timeoutSec) * time.Second
 	} else {
 		d.AgentTimeout = defaultAgentTimeout
+	}
+	// 0 is meaningful (skip the wait), so only a negative value falls back to
+	// the default.
+	if ciSec := flags.Int("pve-cloudinit-timeout"); ciSec >= 0 {
+		d.CloudInitTimeout = time.Duration(ciSec) * time.Second
+	} else {
+		d.CloudInitTimeout = defaultCloudInitTimeout
 	}
 	if setupSec := flags.Int("pve-disk-setup-timeout"); setupSec > 0 {
 		d.DiskSetupTimeout = time.Duration(setupSec) * time.Second
@@ -784,14 +805,25 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		log.Infof("pve: VM %d uses MAC %s on %s", d.VMID, mac, d.NetDevice)
 	}
 
-	// Data disks are set up over SSH, so the address has to be resolved here
-	// rather than left to the GetIP call libmachine makes after Create.
-	if len(d.DataDisks) > 0 {
+	// Both the cloud-init wait and data disk setup happen over SSH, so the
+	// address has to be resolved here rather than left to the GetIP call
+	// libmachine makes after Create.
+	if len(d.DataDisks) > 0 || d.CloudInitTimeout > 0 {
 		ip, err := d.waitUntilGuestIP(ctx)
 		if err != nil {
 			return err
 		}
 		d.IPAddress = ip
+	}
+
+	// Before the disks, not after: cloud-init can still be growing the root
+	// filesystem, rewriting fstab or restarting the network while the driver
+	// would otherwise be partitioning and mounting alongside it.
+	if err := d.waitForCloudInit(); err != nil {
+		return err
+	}
+
+	if len(d.DataDisks) > 0 {
 		if err := d.setupGuestDisks(attached); err != nil {
 			return err
 		}
@@ -923,6 +955,21 @@ func (d *Driver) resolveTemplateVMID(ctx context.Context) error {
 	return nil
 }
 
+// resolveDescription returns the text written to the VM's Notes field.
+//
+// A clone inherits the template's own notes, which describe the template and
+// are actively misleading on a machine — so the default is not "leave it
+// alone" but a short provenance line. Somebody looking at an unfamiliar VM in
+// the PVE UI can then tell what created it and what it belongs to without
+// cross-referencing Rancher.
+func (d *Driver) resolveDescription() string {
+	if d.Description != "" {
+		return d.Description
+	}
+	return fmt.Sprintf("Rancher machine %q, cloned from template %d by docker-machine-driver-pve. Managed by Rancher — changes made here may be overwritten or lost when the machine is replaced.",
+		d.MachineName, d.TemplateVMID)
+}
+
 // validateTemplateSelection checks that exactly one way of naming the template
 // is configured, and that the tag list and match policy are usable. It does not
 // hit the API — resolving the tag to a VMID happens in Create, against the live
@@ -951,21 +998,6 @@ func (d *Driver) validateTemplateSelection() error {
 		return fmt.Errorf("pve: --pve-template-tag-match %q is not valid; use %q or %q", d.TemplateMatch, proxmox.MatchSubset, proxmox.MatchExact)
 	}
 	return nil
-}
-
-// resolveDescription returns the text written to the VM's Notes field.
-//
-// A clone inherits the template's own notes, which describe the template and
-// are actively misleading on a machine — so the default is not "leave it
-// alone" but a short provenance line. Somebody looking at an unfamiliar VM in
-// the PVE UI can then tell what created it and what it belongs to without
-// cross-referencing Rancher.
-func (d *Driver) resolveDescription() string {
-	if d.Description != "" {
-		return d.Description
-	}
-	return fmt.Sprintf("Rancher machine %q, cloned from template %d by docker-machine-driver-pve. Managed by Rancher — changes made here may be overwritten or lost when the machine is replaced.",
-		d.MachineName, d.TemplateVMID)
 }
 
 // validateVMNamePrefix rejects a prefix that would produce a VM name PVE

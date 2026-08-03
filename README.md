@@ -225,7 +225,8 @@ PVE REST API ◄──┘       ├─ Resolve target node (or first online node
                         ├─ Start the VM
                         ├─ Capture the NIC MAC, then poll the QEMU guest
                         │   agent for the IPv4 on that exact interface
-                        └─ SSH in and format/mount the data disks
+                        ├─ SSH in and wait for cloud-init to report done
+                        └─ Format/mount the data disks
                             → returns "created" once the disks are mounted
 ```
 

@@ -212,6 +212,7 @@ the exact system paths are refused.
 | `pve-net-firewall` | *(empty)* | `true`/`false` to toggle the PVE firewall on the NIC; empty keeps the PVE default. Requires `pve-net-bridge` |
 | `pve-net-iface` | *(empty)* | Restrict IP discovery to this guest interface name. Rarely needed — MAC matching already pins it |
 | `pve-agent-timeout` | `300` | Seconds to wait for the QEMU guest agent to report an IP |
+| `pve-cloudinit-timeout` | `300` | Seconds to wait for cloud-init to finish inside the guest before handing the machine to Rancher. `0` skips the wait. See below |
 | `pve-provision-delay` | `30` | Seconds to wait after the VM is up before handing it to Rancher for provisioning. See below |
 
 The four settings marked *Requires `pve-net-bridge`* are only written while
@@ -219,6 +220,36 @@ rewriting the NIC, which only happens when a bridge is named. `PreCreateCheck`
 rejects them without one rather than silently ignoring a VLAN you asked for.
 
 See [networking.md](networking.md) for how to build the node network itself.
+
+### `pve-cloudinit-timeout`
+
+After the VM is up and its address is known, the driver SSHes in and runs
+`cloud-init status --wait`, blocking until the guest itself reports that
+cloud-init has finished. This is the readiness signal `pve-provision-delay`
+only approximates: instead of guessing at a duration, the driver waits for the
+thing it actually cares about — the resolver written, the default route
+installed, the login user created.
+
+It runs **before** data-disk setup, so the driver never partitions and mounts
+while cloud-init is still growing the root filesystem or rewriting fstab.
+
+Outcomes:
+
+| In the guest | Driver behaviour |
+|---|---|
+| cloud-init finished cleanly | Continues |
+| Finished with recoverable errors (a failed optional module) | Continues, logging a warning — worth checking first if the node later misbehaves |
+| cloud-init is not installed | Skips the wait, logging that it did |
+| cloud-init failed | Create fails, rather than handing Rancher a broken guest |
+| Did not finish within the timeout | Create fails, naming this flag |
+
+Set it to `0` to skip the wait entirely. With the wait on, `pve-provision-delay`
+is usually redundant and can be lowered or set to `0` — the delay exists
+precisely because the driver had no way to know when cloud-init was done.
+
+The wait needs SSH, which means the cloud-init key injection has to have worked;
+a template whose `pve-ssh-user` is wrong fails here instead of failing later
+during Rancher's bootstrap, which is a considerably clearer error.
 
 ### `pve-provision-delay`
 
