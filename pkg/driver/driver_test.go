@@ -364,6 +364,8 @@ func TestCreateFlagsDeriveExpectedFieldNames(t *testing.T) {
 	for _, want := range []string{
 		"templateVmid", "dataDisk", "netBridge", "cloudinit",
 		"sshUser", "sshPort", "vmNamePrefix", "bootDiskSize",
+		"templateTag", "templateTagMatch", "cloneStorage", "cloneFormat",
+		"description", "cloudinitTimeout",
 	} {
 		if !got[want] {
 			t.Errorf("no flag derives the machine-config field %q that the UI extension binds to", want)
@@ -599,6 +601,173 @@ func TestNormalizeTags(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("normalizeTags(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateTemplateSelection(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Driver)
+		wantErr string
+	}{
+		{"neither vmid nor tag", func(d *Driver) {}, "--pve-template-tag"},
+		{"both are mutually exclusive", func(d *Driver) {
+			d.TemplateVMID = 9000
+			d.TemplateTag = "rancher"
+		}, "mutually exclusive"},
+		{"vmid alone is fine", func(d *Driver) { d.TemplateVMID = 9000 }, ""},
+		{"tag alone is fine", func(d *Driver) { d.TemplateTag = "rancher" }, ""},
+		{"invalid tag", func(d *Driver) { d.TemplateTag = "Not A Tag!" }, "not a valid PVE tag"},
+		{"invalid match policy", func(d *Driver) {
+			d.TemplateTag = "rancher"
+			d.TemplateMatch = "fuzzy"
+		}, "--pve-template-tag-match"},
+		{"exact match policy is accepted", func(d *Driver) {
+			d.TemplateTag = "rancher"
+			d.TemplateMatch = "exact"
+		}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{TemplateMatch: defaultTemplateMatch}
+			tt.mutate(d)
+			err := d.validateTemplateSelection()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateTemplateSelection() returned error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateTemplateSelection() = nil, want an error mentioning %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateTemplateSelection() error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateTemplateSelectionNormalizesTags(t *testing.T) {
+	d := &Driver{TemplateTag: " Rancher , NODE ,rancher", TemplateMatch: defaultTemplateMatch}
+	if err := d.validateTemplateSelection(); err != nil {
+		t.Fatalf("validateTemplateSelection() returned error: %v", err)
+	}
+	if d.TemplateTag != "rancher,node" {
+		t.Errorf("TemplateTag = %q, want %q (lowercased, trimmed, deduped)", d.TemplateTag, "rancher,node")
+	}
+}
+
+func TestResolveDescription(t *testing.T) {
+	d := &Driver{BaseDriver: &drivers.BaseDriver{MachineName: "pool-abc"}, TemplateVMID: 9000}
+	got := d.resolveDescription()
+	// The default exists to stop the clone from carrying the template's own
+	// notes, so it has to name this machine and where it came from.
+	for _, want := range []string{"pool-abc", "9000", "docker-machine-driver-pve"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("resolveDescription() = %q, want it to mention %q", got, want)
+		}
+	}
+
+	d.Description = "custom notes"
+	if got := d.resolveDescription(); got != "custom notes" {
+		t.Errorf("resolveDescription() = %q, want the explicit --pve-description value", got)
+	}
+}
+
+func TestParseCloudInitResult(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"pve-cloudinit-result=0\nstatus: done", "0", true},
+		{"pve-cloudinit-result=2 status: degraded done", "2", true},
+		{"pve-cloudinit-result=absent", "absent", true},
+		{"pve-cloudinit-result=1", "1", true},
+		{"some unrelated banner text", "", false},
+		{"pve-cloudinit-result=nonsense", "", false},
+	}
+	for _, tt := range tests {
+		got, ok := parseCloudInitResult(tt.in)
+		if ok != tt.ok || got != tt.want {
+			t.Errorf("parseCloudInitResult(%q) = (%q, %v), want (%q, %v)", tt.in, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestInterpretCloudInitResult(t *testing.T) {
+	// Only a genuine cloud-init failure blocks the machine. Recoverable
+	// errors, a guest without cloud-init and unparseable output all continue:
+	// failing there would delete a node that is very likely fine.
+	tests := []struct {
+		name    string
+		out     string
+		wantErr bool
+	}{
+		{"success", "pve-cloudinit-result=0", false},
+		{"recoverable errors", "pve-cloudinit-result=2 status: degraded done", false},
+		{"no cloud-init in the guest", "pve-cloudinit-result=absent", false},
+		{"unreadable output", "banner nonsense", false},
+		{"failure", "pve-cloudinit-result=1 status: error", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := interpretCloudInitResult(tt.out)
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("interpretCloudInitResult(%q) = %v, wantErr %v", tt.out, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCloudInitTimeoutDefaultsToNonZero(t *testing.T) {
+	d := NewDriver("machine", "/tmp").(*Driver)
+	if d.CloudInitTimeout != defaultCloudInitTimeout {
+		t.Errorf("CloudInitTimeout = %s, want %s", d.CloudInitTimeout, defaultCloudInitTimeout)
+	}
+}
+
+func TestValidateCloneTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Driver)
+		wantErr string
+	}{
+		{"nothing set is fine", func(d *Driver) {}, ""},
+		{"storage on a full clone", func(d *Driver) { d.CloneStorage = "ceph-rbd" }, ""},
+		{"valid format", func(d *Driver) { d.CloneFormat = "qcow2" }, ""},
+		{"invalid format", func(d *Driver) { d.CloneFormat = "vhdx" }, "--pve-clone-format"},
+		// Both are full-clone-only in PVE: a linked clone is an overlay on the
+		// template's own disk, so there is no second storage or format to pick.
+		{"storage with linked clone", func(d *Driver) {
+			d.LinkedClone = true
+			d.CloneStorage = "ceph-rbd"
+		}, "--pve-clone-storage"},
+		{"format with linked clone", func(d *Driver) {
+			d.LinkedClone = true
+			d.CloneFormat = "qcow2"
+		}, "--pve-clone-format"},
+		{"linked clone alone is fine", func(d *Driver) { d.LinkedClone = true }, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{}
+			tt.mutate(d)
+			err := d.validateCloneTarget()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateCloneTarget() returned error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateCloneTarget() = nil, want an error mentioning %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateCloneTarget() error = %q, want it to mention %q", err, tt.wantErr)
 			}
 		})
 	}

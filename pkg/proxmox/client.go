@@ -240,6 +240,112 @@ func (c *Client) nodeOf(ctx context.Context, vmid int) (string, error) {
 	return "", fmt.Errorf("proxmox: VMID %d not found anywhere in the cluster", vmid)
 }
 
+// TemplateMatch selects how FindTemplateByTags compares a template's tags
+// against the requested ones.
+type TemplateMatch string
+
+const (
+	// MatchSubset accepts a template that carries every requested tag,
+	// whatever else it also carries.
+	MatchSubset TemplateMatch = "subset"
+	// MatchExact accepts only a template whose tag set is exactly the
+	// requested one.
+	MatchExact TemplateMatch = "exact"
+)
+
+// FoundTemplate is a template resolved by tag, carrying enough context for
+// the caller to log which one it picked.
+type FoundTemplate struct {
+	VMID int
+	Name string
+	Node string
+	Tags []string
+}
+
+// FindTemplateByTags returns the VM template matching the given tags.
+//
+// It exists so a machine pool can name an *image* rather than a VMID:
+// rebuilding the template and moving the tag to the new one is then enough to
+// roll new machines onto a new image, with no machine-pool edit and no chance
+// of a stale VMID pointing at a template that was deleted.
+//
+// Ambiguity is an error rather than a silent choice. Two templates carrying
+// the same tag is exactly what a half-finished image rollout looks like, and
+// picking one (the lowest VMID, say) would provision half a machine pool from
+// each. The error names both so the operator can retag the loser.
+func (c *Client) FindTemplateByTags(ctx context.Context, tags []string, match TemplateMatch) (FoundTemplate, error) {
+	if len(tags) == 0 {
+		return FoundTemplate{}, errors.New("proxmox: no template tags given")
+	}
+	resources, err := c.clusterResources(ctx)
+	if err != nil {
+		return FoundTemplate{}, err
+	}
+	var found []FoundTemplate
+	for _, r := range resources {
+		// Template != 0 is what distinguishes a template from a plain VM; the
+		// type check keeps LXC templates carrying the same tag out of it.
+		if r.Type != "qemu" || r.Template == 0 {
+			continue
+		}
+		have := splitTags(r.Tags)
+		if !tagsMatch(have, tags, match) {
+			continue
+		}
+		found = append(found, FoundTemplate{
+			VMID: int(r.VMID),
+			Name: r.Name,
+			Node: r.Node,
+			Tags: have,
+		})
+	}
+	switch len(found) {
+	case 1:
+		return found[0], nil
+	case 0:
+		return FoundTemplate{}, fmt.Errorf("proxmox: no VM template matches tags %q (%s match); tag the template in the PVE UI, or check the API token can see it — a token with no privileges on the template's node simply gets an empty list rather than an error",
+			strings.Join(tags, ","), match)
+	default:
+		sort.Slice(found, func(i, j int) bool { return found[i].VMID < found[j].VMID })
+		var names []string
+		for _, f := range found {
+			names = append(names, fmt.Sprintf("%d (%s)", f.VMID, f.Name))
+		}
+		return FoundTemplate{}, fmt.Errorf("proxmox: tags %q (%s match) match %d templates: %s; a tag used for template selection must identify exactly one template, so remove it from all but the one you want",
+			strings.Join(tags, ","), match, len(found), strings.Join(names, ", "))
+	}
+}
+
+// splitTags parses a PVE `tags` value. PVE stores them semicolon-separated
+// but accepts commas on input and normalises them, so both are split here.
+func splitTags(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool { return r == ';' || r == ',' })
+	tags := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f = strings.ToLower(strings.TrimSpace(f)); f != "" {
+			tags = append(tags, f)
+		}
+	}
+	return tags
+}
+
+// tagsMatch reports whether have satisfies want under the given policy.
+func tagsMatch(have, want []string, match TemplateMatch) bool {
+	set := make(map[string]bool, len(have))
+	for _, t := range have {
+		set[t] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	if match == MatchExact {
+		return len(set) == len(want)
+	}
+	return true
+}
+
 // CloneOptions configures a single template clone.
 type CloneOptions struct {
 	// NewID is the VMID to assign the clone. 0 lets Proxmox assign the next
@@ -263,6 +369,48 @@ type CloneOptions struct {
 	// only ever act on VMs inside the pool, and every VM this driver
 	// creates lands there from the moment it exists.
 	Pool string
+	// Storage is the PVE storage id the clone's disks are created on. Empty
+	// inherits the template's own storage, which is PVE's behaviour and was
+	// this driver's only option before — it pins every machine pool cloning a
+	// given template to wherever that template happens to live.
+	//
+	// Full clones only: PVE rejects it outright for a linked clone, whose
+	// whole point is to reference the template's disk in place.
+	Storage string
+	// Format is the disk format for the clone (raw, qcow2, vmdk). Empty uses
+	// the storage's default, which is what almost every setup wants: the
+	// format is only selectable on file-based storages (dir, NFS, CIFS), and
+	// block backends (LVM, ZFS, Ceph RBD) reject anything but their own.
+	//
+	// Full clones only, same as Storage.
+	Format string
+}
+
+// CloneFormats are the disk formats PVE accepts for a full clone.
+var CloneFormats = []string{"raw", "qcow2", "vmdk"}
+
+// cloneParams renders the PVE clone request for opts.
+//
+// Storage and Format are full-clone-only in PVE and are dropped for a linked
+// clone rather than passed through. Callers validate the combination earlier
+// so the operator sees a message naming the flag they set, but the request
+// itself must be correct however the client is called.
+func cloneParams(opts CloneOptions) *proxmox.VirtualMachineCloneOptions {
+	full := uint8(1)
+	if opts.Linked {
+		full = 0
+	}
+	params := &proxmox.VirtualMachineCloneOptions{
+		NewID: opts.NewID,
+		Name:  opts.Name,
+		Full:  full,
+		Pool:  opts.Pool,
+	}
+	if !opts.Linked {
+		params.Storage = opts.Storage
+		params.Format = opts.Format
+	}
+	return params
 }
 
 // CloneFromTemplate clones the given template VMID into a new VM according
@@ -294,16 +442,7 @@ func (c *Client) CloneFromTemplate(ctx context.Context, templateVMID int, opts C
 		return 0, err
 	}
 
-	full := uint8(1)
-	if opts.Linked {
-		full = 0
-	}
-	params := &proxmox.VirtualMachineCloneOptions{
-		NewID: opts.NewID,
-		Name:  opts.Name,
-		Full:  full,
-		Pool:  opts.Pool,
-	}
+	params := cloneParams(opts)
 	if target != templateNode {
 		params.Target = target
 	}
@@ -351,6 +490,9 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 	}
 	if opts.Tags != "" {
 		options = append(options, proxmox.VirtualMachineOption{Name: "tags", Value: opts.Tags})
+	}
+	if opts.Description != "" {
+		options = append(options, proxmox.VirtualMachineOption{Name: "description", Value: opts.Description})
 	}
 	if opts.CloudInit {
 		if opts.IPConfig != "" {
@@ -764,7 +906,13 @@ type VMOptions struct {
 	// Tags is PVE's semicolon-separated `tags` config value. Purely
 	// informational to PVE itself, but it is how a VM created by this driver
 	// is identified/filtered in the PVE UI without opening it.
-	Tags         string
+	Tags string
+	// Description is PVE's free-text `description` config value, rendered as
+	// the Notes panel in the PVE UI. A clone inherits the template's notes,
+	// which describe the template rather than the machine, so the driver
+	// always overwrites it with something that identifies who created this VM
+	// and what it belongs to.
+	Description  string
 	CloudInit    bool
 	IPConfig     string
 	Nameserver   string

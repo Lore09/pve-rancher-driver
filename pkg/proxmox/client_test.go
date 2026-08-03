@@ -327,3 +327,89 @@ func TestIsNotFound(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestSplitTags(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"rancher", []string{"rancher"}},
+		// PVE stores tags semicolon-separated but accepts commas on input.
+		{"rancher;node", []string{"rancher", "node"}},
+		{"rancher,node", []string{"rancher", "node"}},
+		{" Rancher ; NODE ", []string{"rancher", "node"}},
+		{";;rancher;;", []string{"rancher"}},
+	}
+	for _, tt := range tests {
+		got := splitTags(tt.in)
+		if len(got) != len(tt.want) {
+			t.Fatalf("splitTags(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("splitTags(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+func TestTagsMatch(t *testing.T) {
+	tests := []struct {
+		name  string
+		have  []string
+		want  []string
+		match TemplateMatch
+		ok    bool
+	}{
+		{"subset: extra build tags are fine", []string{"rancher", "debian13", "2026-08"}, []string{"rancher"}, MatchSubset, true},
+		{"subset: all requested must be present", []string{"rancher"}, []string{"rancher", "gpu"}, MatchSubset, false},
+		{"subset: identical sets match", []string{"rancher"}, []string{"rancher"}, MatchSubset, true},
+		{"exact: extra tags disqualify", []string{"rancher", "debian13"}, []string{"rancher"}, MatchExact, false},
+		{"exact: identical sets match", []string{"rancher", "gpu"}, []string{"gpu", "rancher"}, MatchExact, true},
+		{"untagged template never matches", nil, []string{"rancher"}, MatchSubset, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tagsMatch(tt.have, tt.want, tt.match); got != tt.ok {
+				t.Errorf("tagsMatch(%v, %v, %q) = %v, want %v", tt.have, tt.want, tt.match, got, tt.ok)
+			}
+		})
+	}
+}
+
+func TestCloneOptionsDropStorageAndFormatForLinkedClones(t *testing.T) {
+	// PVE rejects storage/format on a linked clone. The driver validates this
+	// first, but the client must not pass them on regardless of how it was
+	// called — a linked clone has no storage of its own to land on.
+	for _, tt := range []struct {
+		name   string
+		linked bool
+		want   string
+	}{
+		{"full clone keeps the storage", false, "ceph-rbd"},
+		{"linked clone drops it", true, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := CloneOptions{Linked: tt.linked, Storage: "ceph-rbd", Format: "qcow2"}
+			got := cloneParams(opts)
+			if got.Storage != tt.want {
+				t.Errorf("Storage = %q, want %q", got.Storage, tt.want)
+			}
+			wantFormat := "qcow2"
+			if tt.linked {
+				wantFormat = ""
+			}
+			if got.Format != wantFormat {
+				t.Errorf("Format = %q, want %q", got.Format, wantFormat)
+			}
+			wantFull := uint8(1)
+			if tt.linked {
+				wantFull = 0
+			}
+			if got.Full != wantFull {
+				t.Errorf("Full = %d, want %d", got.Full, wantFull)
+			}
+		})
+	}
+}

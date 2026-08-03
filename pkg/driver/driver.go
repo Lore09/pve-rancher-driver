@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -61,6 +62,17 @@ const (
 	// working DNS and fail on what is really a transient condition — and a
 	// failed bootstrap gets the whole machine deleted and recreated.
 	defaultProvisionDelay = 30 * time.Second
+	// defaultCloudInitTimeout bounds the wait for cloud-init to finish inside
+	// the guest. It is the readiness signal --pve-provision-delay only
+	// approximates: cloud-init reports its own completion, so the driver can
+	// wait for the real thing instead of guessing at a duration. Generous
+	// because a first boot runs package installs and disk growth.
+	defaultCloudInitTimeout = 5 * time.Minute
+	// defaultTemplateMatch is the tag-matching policy for --pve-template-tag.
+	// Subset is the useful default: an image template usually carries build
+	// metadata tags (distro, date) alongside the one naming its role, and
+	// requiring the operator to list all of them would defeat the point.
+	defaultTemplateMatch = string(proxmox.MatchSubset)
 )
 
 // Driver is the libmachine Driver implementation backed by Proxmox VE.
@@ -77,8 +89,13 @@ type Driver struct {
 	VMID             int
 	VMIDRange        string
 	TemplateVMID     int
+	TemplateTag      string
+	TemplateMatch    string
 	LinkedClone      bool
+	CloneStorage     string
+	CloneFormat      string
 	Tags             string
+	Description      string
 	Pool             string
 	VMNamePrefix     string
 	Cores            int
@@ -108,6 +125,7 @@ type Driver struct {
 	SSHKeys          string
 	Onboot           bool
 	AgentTimeout     time.Duration
+	CloudInitTimeout time.Duration
 	ProvisionDelay   time.Duration
 	KeepOnFailure    bool
 	SkipPermCheck    bool
@@ -136,8 +154,10 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		IPMode:           string(ipModeDHCP),
 		Onboot:           false,
 		AgentTimeout:     defaultAgentTimeout,
+		CloudInitTimeout: defaultCloudInitTimeout,
 		DiskSetupTimeout: defaultDiskSetupTimeout,
 		ProvisionDelay:   defaultProvisionDelay,
+		TemplateMatch:    defaultTemplateMatch,
 	}
 }
 
@@ -195,13 +215,34 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.IntFlag{
 			Name:   "pve-template-vmid",
 			EnvVar: "PVE_TEMPLATE_VMID",
-			Usage:  "Existing PVE VM template VMID used to clone new VMs from",
+			Usage:  "Existing PVE VM template VMID used to clone new VMs from. Mutually exclusive with pve-template-tag",
 			Value:  0,
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-template-tag",
+			EnvVar: "PVE_TEMPLATE_TAG",
+			Usage:  "Select the template to clone by PVE tag instead of by VMID, e.g. rancher-node. Comma-separated tags must all be present. Exactly one template must match, so a rebuilt image is rolled out by moving the tag rather than by editing every machine pool. Mutually exclusive with pve-template-vmid",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-template-tag-match",
+			EnvVar: "PVE_TEMPLATE_TAG_MATCH",
+			Usage:  "How pve-template-tag matches: subset (default, the template carries at least the given tags) or exact (the template's tags are exactly the given ones)",
+			Value:  defaultTemplateMatch,
 		},
 		mcnflag.BoolFlag{
 			Name:   "pve-linked-clone",
 			EnvVar: "PVE_LINKED_CLONE",
 			Usage:  "Clone the template as a linked clone instead of a full clone. Much faster and lighter on storage I/O when several machines clone at once, but every linked clone stays dependent on the template's disk for as long as it exists (the template can never be deleted or modified while one remains), and not every storage backend supports it",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-clone-storage",
+			EnvVar: "PVE_CLONE_STORAGE",
+			Usage:  "PVE storage id the clone's disks are created on, e.g. local-lvm or ceph-rbd. Empty puts them on the template's own storage, which pins every pool cloning that template to wherever the template happens to live. Full clones only — rejected together with pve-linked-clone",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-clone-format",
+			EnvVar: "PVE_CLONE_FORMAT",
+			Usage:  "Disk format for the clone: raw, qcow2 or vmdk. Empty uses the storage's default, which is almost always right — the format is only selectable on file-based storages (dir, NFS, CIFS), and block backends (LVM, ZFS, Ceph RBD) reject anything but their own. Full clones only",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-vm-name-prefix",
@@ -212,6 +253,11 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "pve-tags",
 			EnvVar: "PVE_TAGS",
 			Usage:  "Comma-separated PVE tags applied to the created VM, e.g. rancher,prod. Purely informational to PVE — lets a VM this driver created be identified and filtered in the PVE UI. Lowercase letters, digits, and _ + . - only",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-description",
+			EnvVar: "PVE_DESCRIPTION",
+			Usage:  "Text written to the VM's Notes field in PVE. Empty writes a default noting the driver, the machine name and the template it was cloned from — a clone would otherwise inherit the template's own notes, which describe the template rather than the machine",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-pool",
@@ -303,6 +349,12 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "PVE_AGENT_TIMEOUT",
 			Usage:  "Seconds to wait for the QEMU guest agent to report the VM's IP",
 			Value:  int(defaultAgentTimeout / time.Second),
+		},
+		mcnflag.IntFlag{
+			Name:   "pve-cloudinit-timeout",
+			EnvVar: "PVE_CLOUDINIT_TIMEOUT",
+			Usage:  "Seconds to wait for cloud-init to finish inside the guest before handing the machine to Rancher. This is the real readiness signal that pve-provision-delay only approximates, so with it enabled the delay can usually be lowered or set to 0. Set to 0 to skip the wait entirely (guests without cloud-init are detected and skipped automatically)",
+			Value:  int(defaultCloudInitTimeout / time.Second),
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-provision-delay",
@@ -410,8 +462,16 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.VMID = flags.Int("pve-vmid")
 	d.VMIDRange = strings.TrimSpace(flags.String("pve-vmid-range"))
 	d.TemplateVMID = flags.Int("pve-template-vmid")
+	d.TemplateTag = strings.TrimSpace(flags.String("pve-template-tag"))
+	d.TemplateMatch = strings.ToLower(strings.TrimSpace(flags.String("pve-template-tag-match")))
+	if d.TemplateMatch == "" {
+		d.TemplateMatch = defaultTemplateMatch
+	}
 	d.LinkedClone = flags.Bool("pve-linked-clone")
+	d.CloneStorage = strings.TrimSpace(flags.String("pve-clone-storage"))
+	d.CloneFormat = strings.ToLower(strings.TrimSpace(flags.String("pve-clone-format")))
 	d.Tags = strings.TrimSpace(flags.String("pve-tags"))
+	d.Description = strings.TrimSpace(flags.String("pve-description"))
 	d.Pool = strings.TrimSpace(flags.String("pve-pool"))
 	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vm-name-prefix"))
 	d.Cores = flags.Int("pve-cores")
@@ -465,6 +525,13 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	} else {
 		d.AgentTimeout = defaultAgentTimeout
 	}
+	// 0 is meaningful (skip the wait), so only a negative value falls back to
+	// the default.
+	if ciSec := flags.Int("pve-cloudinit-timeout"); ciSec >= 0 {
+		d.CloudInitTimeout = time.Duration(ciSec) * time.Second
+	} else {
+		d.CloudInitTimeout = defaultCloudInitTimeout
+	}
 	if setupSec := flags.Int("pve-disk-setup-timeout"); setupSec > 0 {
 		d.DiskSetupTimeout = time.Duration(setupSec) * time.Second
 	} else {
@@ -501,8 +568,11 @@ func (d *Driver) PreCreateCheck() error {
 	if d.APITokenSecret == "" {
 		return errors.New("pve: --pve-api-token-secret is required")
 	}
-	if d.TemplateVMID == 0 {
-		return errors.New("pve: --pve-template-vmid is required to clone a VM")
+	if err := d.validateTemplateSelection(); err != nil {
+		return err
+	}
+	if err := d.validateCloneTarget(); err != nil {
+		return err
 	}
 	if err := d.validateVMNamePrefix(); err != nil {
 		return err
@@ -617,10 +687,18 @@ func (d *Driver) Create() error {
 	if err := d.init(); err != nil {
 		return err
 	}
-	if d.TemplateVMID == 0 {
-		return errors.New("pve: --pve-template-vmid is required to clone a VM")
+	if err := d.validateTemplateSelection(); err != nil {
+		return err
 	}
 	ctx := context.Background()
+
+	// Tag resolution happens here rather than in PreCreateCheck so every
+	// machine in a pool resolves against the cluster as it is at its own
+	// create time: retagging a rebuilt image then rolls new machines onto it
+	// without touching the machine pool.
+	if err := d.resolveTemplateVMID(ctx); err != nil {
+		return err
+	}
 
 	vmName := d.resolveVMName()
 
@@ -678,6 +756,7 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		Memory:       uint32(d.MemoryMB),
 		Onboot:       &onboot,
 		Tags:         d.Tags,
+		Description:  d.resolveDescription(),
 		CloudInit:    d.CloudInit,
 		IPConfig:     ipConfig,
 		Nameserver:   d.Nameservers,
@@ -744,14 +823,25 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		log.Infof("pve: VM %d uses MAC %s on %s", d.VMID, mac, d.NetDevice)
 	}
 
-	// Data disks are set up over SSH, so the address has to be resolved here
-	// rather than left to the GetIP call libmachine makes after Create.
-	if len(d.DataDisks) > 0 {
+	// Both the cloud-init wait and data disk setup happen over SSH, so the
+	// address has to be resolved here rather than left to the GetIP call
+	// libmachine makes after Create.
+	if len(d.DataDisks) > 0 || d.CloudInitTimeout > 0 {
 		ip, err := d.waitUntilGuestIP(ctx)
 		if err != nil {
 			return err
 		}
 		d.IPAddress = ip
+	}
+
+	// Before the disks, not after: cloud-init can still be growing the root
+	// filesystem, rewriting fstab or restarting the network while the driver
+	// would otherwise be partitioning and mounting alongside it.
+	if err := d.waitForCloudInit(); err != nil {
+		return err
+	}
+
+	if len(d.DataDisks) > 0 {
 		if err := d.setupGuestDisks(attached); err != nil {
 			return err
 		}
@@ -795,9 +885,11 @@ func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, err
 		return 0, err
 	}
 	opts := proxmox.CloneOptions{
-		Name:   vmName,
-		Linked: d.LinkedClone,
-		Pool:   d.Pool,
+		Name:    vmName,
+		Linked:  d.LinkedClone,
+		Pool:    d.Pool,
+		Storage: d.CloneStorage,
+		Format:  d.CloneFormat,
 	}
 	if d.VMID != 0 || d.VMIDRange == "" {
 		opts.NewID = d.VMID
@@ -859,6 +951,98 @@ func (d *Driver) resolveVMName() string {
 		return d.MachineName
 	}
 	return prefix + "-" + d.MachineName
+}
+
+// resolveTemplateVMID fills in d.TemplateVMID from --pve-template-tag when a
+// VMID was not given directly. It is a no-op when the VMID is already known.
+//
+// The resolved id is only used for this Create call and deliberately not
+// treated as a permanent binding: a later machine in the same pool resolves
+// the tag again, so a template rebuilt and retagged mid-scale-up is picked up
+// by the machines created after it.
+func (d *Driver) resolveTemplateVMID(ctx context.Context) error {
+	if d.TemplateVMID != 0 || d.TemplateTag == "" {
+		return nil
+	}
+	tags := strings.Split(d.TemplateTag, ",")
+	found, err := d.client.FindTemplateByTags(ctx, tags, proxmox.TemplateMatch(d.TemplateMatch))
+	if err != nil {
+		return err
+	}
+	d.TemplateVMID = found.VMID
+	log.Infof("pve: template tag %q (%s match) resolved to VMID %d (%q) on node %s",
+		d.TemplateTag, d.TemplateMatch, found.VMID, found.Name, found.Node)
+	return nil
+}
+
+// resolveDescription returns the text written to the VM's Notes field.
+//
+// A clone inherits the template's own notes, which describe the template and
+// are actively misleading on a machine — so the default is not "leave it
+// alone" but a short provenance line. Somebody looking at an unfamiliar VM in
+// the PVE UI can then tell what created it and what it belongs to without
+// cross-referencing Rancher.
+func (d *Driver) resolveDescription() string {
+	if d.Description != "" {
+		return d.Description
+	}
+	return fmt.Sprintf("Rancher machine %q, cloned from template %d by docker-machine-driver-pve. Managed by Rancher — changes made here may be overwritten or lost when the machine is replaced.",
+		d.MachineName, d.TemplateVMID)
+}
+
+// validateTemplateSelection checks that exactly one way of naming the template
+// is configured, and that the tag list and match policy are usable. It does not
+// hit the API — resolving the tag to a VMID happens in Create, against the live
+// cluster.
+func (d *Driver) validateTemplateSelection() error {
+	switch {
+	case d.TemplateVMID == 0 && d.TemplateTag == "":
+		return errors.New("pve: one of --pve-template-vmid or --pve-template-tag is required to clone a VM")
+	case d.TemplateVMID != 0 && d.TemplateTag != "":
+		return fmt.Errorf("pve: --pve-template-vmid %d and --pve-template-tag %q are mutually exclusive; an explicit VMID already names the template, and honouring both would silently ignore one of them", d.TemplateVMID, d.TemplateTag)
+	}
+	if d.TemplateTag == "" {
+		return nil
+	}
+	tags, err := normalizeTagList("--pve-template-tag", d.TemplateTag)
+	if err != nil {
+		return err
+	}
+	if len(tags) == 0 {
+		return fmt.Errorf("pve: --pve-template-tag %q contains no usable tag", d.TemplateTag)
+	}
+	d.TemplateTag = strings.Join(tags, ",")
+	switch proxmox.TemplateMatch(d.TemplateMatch) {
+	case proxmox.MatchSubset, proxmox.MatchExact:
+	default:
+		return fmt.Errorf("pve: --pve-template-tag-match %q is not valid; use %q or %q", d.TemplateMatch, proxmox.MatchSubset, proxmox.MatchExact)
+	}
+	return nil
+}
+
+// validateCloneTarget checks the clone's destination storage and disk format.
+//
+// Both are full-clone-only in PVE: a linked clone is by definition an overlay
+// on the template's own disk, so there is no second storage for it to land on
+// and no format to choose. PVE rejects the combination itself, but with an
+// error that names the API parameter rather than the flag the operator set,
+// so it is caught here instead.
+func (d *Driver) validateCloneTarget() error {
+	if !d.LinkedClone {
+		if d.CloneFormat != "" && !slices.Contains(proxmox.CloneFormats, d.CloneFormat) {
+			return fmt.Errorf("pve: --pve-clone-format %q is not valid; use one of %s (or leave it empty to take the storage's default, which is what block storages like LVM, ZFS and Ceph RBD require)",
+				d.CloneFormat, strings.Join(proxmox.CloneFormats, ", "))
+		}
+		return nil
+	}
+	if d.CloneStorage != "" {
+		return fmt.Errorf("pve: --pve-clone-storage %q cannot be combined with --pve-linked-clone: a linked clone is an overlay on the template's own disk and always lives on the template's storage. Drop one of the two — a full clone onto a different storage is exactly how you move machines off the template's storage",
+			d.CloneStorage)
+	}
+	if d.CloneFormat != "" {
+		return fmt.Errorf("pve: --pve-clone-format %q cannot be combined with --pve-linked-clone: a linked clone inherits the template disk's format", d.CloneFormat)
+	}
+	return nil
 }
 
 // validateVMNamePrefix rejects a prefix that would produce a VM name PVE
