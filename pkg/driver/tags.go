@@ -21,6 +21,17 @@ const tagSeparator = ";"
 // (possibly differing only in case) is a harmless typo, not a config error
 // worth failing PreCreateCheck over.
 func normalizeTags(s string) (string, error) {
+	tags, err := normalizeTagList("--pve-tags", s)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(tags, tagSeparator), nil
+}
+
+// normalizeTagList parses a comma-separated tag list into lowercase, deduped
+// tags, validating each one. flag names the flag the list came from so the
+// error points at the field the operator actually typed into.
+func normalizeTagList(flag, s string) ([]string, error) {
 	fields := strings.Split(s, ",")
 	tags := make([]string, 0, len(fields))
 	seen := make(map[string]bool, len(fields))
@@ -30,7 +41,7 @@ func normalizeTags(s string) (string, error) {
 			continue
 		}
 		if !pveTagPattern.MatchString(tag) {
-			return "", fmt.Errorf("pve: --pve-tags %q is not a valid PVE tag; use lowercase letters, digits, and _ + . -, starting with a letter, digit or underscore", tag)
+			return nil, fmt.Errorf("pve: %s %q is not a valid PVE tag; use lowercase letters, digits, and _ + . -, starting with a letter, digit or underscore", flag, tag)
 		}
 		if seen[tag] {
 			continue
@@ -38,5 +49,5 @@ func normalizeTags(s string) (string, error) {
 		seen[tag] = true
 		tags = append(tags, tag)
 	}
-	return strings.Join(tags, tagSeparator), nil
+	return tags, nil
 }

@@ -61,6 +61,11 @@ const (
 	// working DNS and fail on what is really a transient condition — and a
 	// failed bootstrap gets the whole machine deleted and recreated.
 	defaultProvisionDelay = 30 * time.Second
+	// defaultTemplateMatch is the tag-matching policy for --pve-template-tag.
+	// Subset is the useful default: an image template usually carries build
+	// metadata tags (distro, date) alongside the one naming its role, and
+	// requiring the operator to list all of them would defeat the point.
+	defaultTemplateMatch = string(proxmox.MatchSubset)
 )
 
 // Driver is the libmachine Driver implementation backed by Proxmox VE.
@@ -77,6 +82,8 @@ type Driver struct {
 	VMID             int
 	VMIDRange        string
 	TemplateVMID     int
+	TemplateTag      string
+	TemplateMatch    string
 	LinkedClone      bool
 	Tags             string
 	Description      string
@@ -139,6 +146,7 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		AgentTimeout:     defaultAgentTimeout,
 		DiskSetupTimeout: defaultDiskSetupTimeout,
 		ProvisionDelay:   defaultProvisionDelay,
+		TemplateMatch:    defaultTemplateMatch,
 	}
 }
 
@@ -196,8 +204,19 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		mcnflag.IntFlag{
 			Name:   "pve-template-vmid",
 			EnvVar: "PVE_TEMPLATE_VMID",
-			Usage:  "Existing PVE VM template VMID used to clone new VMs from",
+			Usage:  "Existing PVE VM template VMID used to clone new VMs from. Mutually exclusive with pve-template-tag",
 			Value:  0,
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-template-tag",
+			EnvVar: "PVE_TEMPLATE_TAG",
+			Usage:  "Select the template to clone by PVE tag instead of by VMID, e.g. rancher-node. Comma-separated tags must all be present. Exactly one template must match, so a rebuilt image is rolled out by moving the tag rather than by editing every machine pool. Mutually exclusive with pve-template-vmid",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-template-tag-match",
+			EnvVar: "PVE_TEMPLATE_TAG_MATCH",
+			Usage:  "How pve-template-tag matches: subset (default, the template carries at least the given tags) or exact (the template's tags are exactly the given ones)",
+			Value:  defaultTemplateMatch,
 		},
 		mcnflag.BoolFlag{
 			Name:   "pve-linked-clone",
@@ -416,6 +435,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.VMID = flags.Int("pve-vmid")
 	d.VMIDRange = strings.TrimSpace(flags.String("pve-vmid-range"))
 	d.TemplateVMID = flags.Int("pve-template-vmid")
+	d.TemplateTag = strings.TrimSpace(flags.String("pve-template-tag"))
+	d.TemplateMatch = strings.ToLower(strings.TrimSpace(flags.String("pve-template-tag-match")))
+	if d.TemplateMatch == "" {
+		d.TemplateMatch = defaultTemplateMatch
+	}
 	d.LinkedClone = flags.Bool("pve-linked-clone")
 	d.Tags = strings.TrimSpace(flags.String("pve-tags"))
 	d.Description = strings.TrimSpace(flags.String("pve-description"))
@@ -508,8 +532,8 @@ func (d *Driver) PreCreateCheck() error {
 	if d.APITokenSecret == "" {
 		return errors.New("pve: --pve-api-token-secret is required")
 	}
-	if d.TemplateVMID == 0 {
-		return errors.New("pve: --pve-template-vmid is required to clone a VM")
+	if err := d.validateTemplateSelection(); err != nil {
+		return err
 	}
 	if err := d.validateVMNamePrefix(); err != nil {
 		return err
@@ -624,10 +648,18 @@ func (d *Driver) Create() error {
 	if err := d.init(); err != nil {
 		return err
 	}
-	if d.TemplateVMID == 0 {
-		return errors.New("pve: --pve-template-vmid is required to clone a VM")
+	if err := d.validateTemplateSelection(); err != nil {
+		return err
 	}
 	ctx := context.Background()
+
+	// Tag resolution happens here rather than in PreCreateCheck so every
+	// machine in a pool resolves against the cluster as it is at its own
+	// create time: retagging a rebuilt image then rolls new machines onto it
+	// without touching the machine pool.
+	if err := d.resolveTemplateVMID(ctx); err != nil {
+		return err
+	}
 
 	vmName := d.resolveVMName()
 
@@ -867,6 +899,58 @@ func (d *Driver) resolveVMName() string {
 		return d.MachineName
 	}
 	return prefix + "-" + d.MachineName
+}
+
+// resolveTemplateVMID fills in d.TemplateVMID from --pve-template-tag when a
+// VMID was not given directly. It is a no-op when the VMID is already known.
+//
+// The resolved id is only used for this Create call and deliberately not
+// treated as a permanent binding: a later machine in the same pool resolves
+// the tag again, so a template rebuilt and retagged mid-scale-up is picked up
+// by the machines created after it.
+func (d *Driver) resolveTemplateVMID(ctx context.Context) error {
+	if d.TemplateVMID != 0 || d.TemplateTag == "" {
+		return nil
+	}
+	tags := strings.Split(d.TemplateTag, ",")
+	found, err := d.client.FindTemplateByTags(ctx, tags, proxmox.TemplateMatch(d.TemplateMatch))
+	if err != nil {
+		return err
+	}
+	d.TemplateVMID = found.VMID
+	log.Infof("pve: template tag %q (%s match) resolved to VMID %d (%q) on node %s",
+		d.TemplateTag, d.TemplateMatch, found.VMID, found.Name, found.Node)
+	return nil
+}
+
+// validateTemplateSelection checks that exactly one way of naming the template
+// is configured, and that the tag list and match policy are usable. It does not
+// hit the API — resolving the tag to a VMID happens in Create, against the live
+// cluster.
+func (d *Driver) validateTemplateSelection() error {
+	switch {
+	case d.TemplateVMID == 0 && d.TemplateTag == "":
+		return errors.New("pve: one of --pve-template-vmid or --pve-template-tag is required to clone a VM")
+	case d.TemplateVMID != 0 && d.TemplateTag != "":
+		return fmt.Errorf("pve: --pve-template-vmid %d and --pve-template-tag %q are mutually exclusive; an explicit VMID already names the template, and honouring both would silently ignore one of them", d.TemplateVMID, d.TemplateTag)
+	}
+	if d.TemplateTag == "" {
+		return nil
+	}
+	tags, err := normalizeTagList("--pve-template-tag", d.TemplateTag)
+	if err != nil {
+		return err
+	}
+	if len(tags) == 0 {
+		return fmt.Errorf("pve: --pve-template-tag %q contains no usable tag", d.TemplateTag)
+	}
+	d.TemplateTag = strings.Join(tags, ",")
+	switch proxmox.TemplateMatch(d.TemplateMatch) {
+	case proxmox.MatchSubset, proxmox.MatchExact:
+	default:
+		return fmt.Errorf("pve: --pve-template-tag-match %q is not valid; use %q or %q", d.TemplateMatch, proxmox.MatchSubset, proxmox.MatchExact)
+	}
+	return nil
 }
 
 // resolveDescription returns the text written to the VM's Notes field.

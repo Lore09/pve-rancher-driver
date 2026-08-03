@@ -32,7 +32,9 @@ be created in is a property of the token's ACL — a token scoped to
 | Flag | Default | Description |
 |------|---------|-------------|
 | `pve-node` | *(first online)* | Target PVE node name |
-| `pve-template-vmid` | *(required)* | Template VMID to clone from |
+| `pve-template-vmid` | *(required)* | Template VMID to clone from. Mutually exclusive with `pve-template-tag` |
+| `pve-template-tag` | *(empty)* | Select the template by PVE tag instead of VMID, e.g. `rancher-node`. Comma-separated tags must all match, and exactly one template must match. See below |
+| `pve-template-tag-match` | `subset` | `subset` (template carries at least the given tags) or `exact` (its tags are exactly the given ones) |
 | `pve-linked-clone` | `false` | Clone as a linked clone instead of a full clone. See below |
 | `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned. Only meaningful for a single machine; mutually exclusive with `pve-vmid-range` |
 | `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
@@ -58,6 +60,39 @@ the race is invisible in normal use. If the range fills up, provisioning fails
 with a clear error rather than silently spilling outside it.
 
 Valid ids are `100`-`999999999`; Proxmox reserves `1`-`99`.
+
+### Selecting the template by tag
+
+`pve-template-vmid` pins a machine pool to one specific template VM. That is
+fine until you rebuild the image: the new template gets a new VMID, and every
+machine pool that should use it has to be edited — and a pool still pointing at
+a deleted VMID fails to provision with a Proxmox-side error.
+
+`pve-template-tag` names the *image* instead. Tag the template `rancher-node`
+in the PVE UI, set `pve-template-tag=rancher-node`, and rolling out a rebuilt
+image is one operation on the PVE side: remove the tag from the old template,
+put it on the new one. Machines created after that clone the new one; nothing
+in Rancher changes.
+
+Resolution happens per machine, at create time — not once when the pool is
+saved. Retagging halfway through a scale-up means the machines already created
+keep the old image and the ones after it get the new one, which is what you
+want for a rolling image update and worth knowing before scaling a pool during
+a rebuild.
+
+**Exactly one template must match**, or provisioning fails naming every
+candidate. This is deliberate: two templates carrying the same tag is what a
+half-finished rollout looks like, and quietly picking one would build half a
+machine pool from each image. Matching is:
+
+| Policy | Matches when |
+|---|---|
+| `subset` (default) | The template carries **at least** the tags you listed. Extra tags — `debian13`, a build date — are ignored |
+| `exact` | The template's tag set is **exactly** the one you listed |
+
+Use `subset` unless you deliberately tag templates as complete sets. Note that a
+token which cannot see a template's node gets an empty list rather than an
+error, so "no template matches" can also mean a missing ACL.
 
 ### `pve-description`
 

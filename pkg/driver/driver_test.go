@@ -620,3 +620,57 @@ func TestResolveDescription(t *testing.T) {
 		t.Errorf("resolveDescription() = %q, want the explicit --pve-description value", got)
 	}
 }
+
+func TestValidateTemplateSelection(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Driver)
+		wantErr string
+	}{
+		{"neither vmid nor tag", func(d *Driver) {}, "--pve-template-tag"},
+		{"both are mutually exclusive", func(d *Driver) {
+			d.TemplateVMID = 9000
+			d.TemplateTag = "rancher"
+		}, "mutually exclusive"},
+		{"vmid alone is fine", func(d *Driver) { d.TemplateVMID = 9000 }, ""},
+		{"tag alone is fine", func(d *Driver) { d.TemplateTag = "rancher" }, ""},
+		{"invalid tag", func(d *Driver) { d.TemplateTag = "Not A Tag!" }, "not a valid PVE tag"},
+		{"invalid match policy", func(d *Driver) {
+			d.TemplateTag = "rancher"
+			d.TemplateMatch = "fuzzy"
+		}, "--pve-template-tag-match"},
+		{"exact match policy is accepted", func(d *Driver) {
+			d.TemplateTag = "rancher"
+			d.TemplateMatch = "exact"
+		}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{TemplateMatch: defaultTemplateMatch}
+			tt.mutate(d)
+			err := d.validateTemplateSelection()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateTemplateSelection() returned error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateTemplateSelection() = nil, want an error mentioning %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateTemplateSelection() error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateTemplateSelectionNormalizesTags(t *testing.T) {
+	d := &Driver{TemplateTag: " Rancher , NODE ,rancher", TemplateMatch: defaultTemplateMatch}
+	if err := d.validateTemplateSelection(); err != nil {
+		t.Fatalf("validateTemplateSelection() returned error: %v", err)
+	}
+	if d.TemplateTag != "rancher,node" {
+		t.Errorf("TemplateTag = %q, want %q (lowercased, trimmed, deduped)", d.TemplateTag, "rancher,node")
+	}
+}

@@ -204,7 +204,9 @@ driver flag shows up as a form field; the ones that matter first:
 
 | Field (UI) | Flag | Notes |
 |---|---|---|
-| Template VMID | `pve-template-vmid` | From the [template guide](template-preparation.md), e.g. `9000` |
+| Template VMID | `pve-template-vmid` | From the [template guide](template-preparation.md), e.g. `9000`. Mutually exclusive with Template tag |
+| Template tag | `pve-template-tag` | Alternative to the VMID: pick the template by PVE tag, e.g. `rancher-node`. Exactly one template must carry it. Lets a rebuilt image be rolled out by moving the tag instead of editing every machine pool — see [flags.md](flags.md#selecting-the-template-by-tag) |
+| Template tag match | `pve-template-tag-match` | `subset` (default) or `exact`. Only read when Template tag is set |
 | Linked clone | `pve-linked-clone` | Off by default (full clone). See the warning in the UI and [flags.md](flags.md#pve-linked-clone) before turning it on |
 | Node | `pve-node` | Leave empty to let the driver pick automatically. Mutually exclusive with Allowed nodes |
 | Allowed nodes | `pve-allowed-nodes` | Comma-separated node names the driver may place VMs on, e.g. `pve1,pve2`. Empty considers every online node. No effect on a single-node install |
