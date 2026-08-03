@@ -603,3 +603,20 @@ func TestNormalizeTags(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveDescription(t *testing.T) {
+	d := &Driver{BaseDriver: &drivers.BaseDriver{MachineName: "pool-abc"}, TemplateVMID: 9000}
+	got := d.resolveDescription()
+	// The default exists to stop the clone from carrying the template's own
+	// notes, so it has to name this machine and where it came from.
+	for _, want := range []string{"pool-abc", "9000", "docker-machine-driver-pve"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("resolveDescription() = %q, want it to mention %q", got, want)
+		}
+	}
+
+	d.Description = "custom notes"
+	if got := d.resolveDescription(); got != "custom notes" {
+		t.Errorf("resolveDescription() = %q, want the explicit --pve-description value", got)
+	}
+}

@@ -352,6 +352,9 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 	if opts.Tags != "" {
 		options = append(options, proxmox.VirtualMachineOption{Name: "tags", Value: opts.Tags})
 	}
+	if opts.Description != "" {
+		options = append(options, proxmox.VirtualMachineOption{Name: "description", Value: opts.Description})
+	}
 	if opts.CloudInit {
 		if opts.IPConfig != "" {
 			options = append(options, proxmox.VirtualMachineOption{Name: "ipconfig0", Value: opts.IPConfig})
@@ -764,7 +767,13 @@ type VMOptions struct {
 	// Tags is PVE's semicolon-separated `tags` config value. Purely
 	// informational to PVE itself, but it is how a VM created by this driver
 	// is identified/filtered in the PVE UI without opening it.
-	Tags         string
+	Tags string
+	// Description is PVE's free-text `description` config value, rendered as
+	// the Notes panel in the PVE UI. A clone inherits the template's notes,
+	// which describe the template rather than the machine, so the driver
+	// always overwrites it with something that identifies who created this VM
+	// and what it belongs to.
+	Description  string
 	CloudInit    bool
 	IPConfig     string
 	Nameserver   string

@@ -38,6 +38,7 @@ be created in is a property of the token's ACL — a token scoped to
 | `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
 | `pve-allowed-nodes` | *(empty)* | Comma-separated PVE node names the driver may place new VMs on, e.g. `pve1,pve2`. Empty considers every online node. Mutually exclusive with `pve-node`. See below |
 | `pve-tags` | *(empty)* | Comma-separated PVE tags applied to the VM, e.g. `rancher,prod`. Informational only — for finding/filtering VMs in the PVE UI |
+| `pve-description` | *(default text)* | VM Notes field. Empty writes a line naming the machine, the template it came from and the driver. See below |
 | `pve-vm-name-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
 | `pve-onboot` | `false` | Start the VM automatically when the PVE host boots |
 
@@ -57,6 +58,15 @@ the race is invisible in normal use. If the range fills up, provisioning fails
 with a clear error rather than silently spilling outside it.
 
 Valid ids are `100`-`999999999`; Proxmox reserves `1`-`99`.
+
+### `pve-description`
+
+Cloning copies the template's Notes field, so without this every machine in PVE
+carries text describing the *template* — build date, image recipe, "do not
+start this VM". The driver overwrites it with a line naming the machine, the
+template VMID it was cloned from, and the fact that Rancher manages it, so an
+unfamiliar VM in the PVE UI can be identified without cross-referencing
+Rancher. Set `pve-description` to replace that text with your own.
 
 ### `pve-linked-clone`
 

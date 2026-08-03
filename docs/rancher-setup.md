@@ -209,6 +209,7 @@ driver flag shows up as a form field; the ones that matter first:
 | Node | `pve-node` | Leave empty to let the driver pick automatically. Mutually exclusive with Allowed nodes |
 | Allowed nodes | `pve-allowed-nodes` | Comma-separated node names the driver may place VMs on, e.g. `pve1,pve2`. Empty considers every online node. No effect on a single-node install |
 | Tags | `pve-tags` | Comma-separated PVE tags, e.g. `rancher,prod`. Informational only |
+| Description | `pve-description` | VM Notes text. Empty writes a default naming the machine and its template, replacing the template's own notes that the clone would otherwise inherit |
 | VMID | `pve-vmid` | `0` = PVE auto-assigns (recommended) |
 | Cores / Sockets / Memory | `pve-cores` / `pve-sockets` / `pve-memory` | Per-VM sizing |
 | Network device | `pve-net-device` | Which PVE NIC's MAC is used for IP discovery (`net0`), and the device the settings below rewrite |

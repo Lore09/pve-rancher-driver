@@ -79,6 +79,7 @@ type Driver struct {
 	TemplateVMID     int
 	LinkedClone      bool
 	Tags             string
+	Description      string
 	Pool             string
 	VMNamePrefix     string
 	Cores            int
@@ -212,6 +213,11 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "pve-tags",
 			EnvVar: "PVE_TAGS",
 			Usage:  "Comma-separated PVE tags applied to the created VM, e.g. rancher,prod. Purely informational to PVE — lets a VM this driver created be identified and filtered in the PVE UI. Lowercase letters, digits, and _ + . - only",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-description",
+			EnvVar: "PVE_DESCRIPTION",
+			Usage:  "Text written to the VM's Notes field in PVE. Empty writes a default noting the driver, the machine name and the template it was cloned from — a clone would otherwise inherit the template's own notes, which describe the template rather than the machine",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-pool",
@@ -412,6 +418,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.TemplateVMID = flags.Int("pve-template-vmid")
 	d.LinkedClone = flags.Bool("pve-linked-clone")
 	d.Tags = strings.TrimSpace(flags.String("pve-tags"))
+	d.Description = strings.TrimSpace(flags.String("pve-description"))
 	d.Pool = strings.TrimSpace(flags.String("pve-pool"))
 	d.VMNamePrefix = strings.TrimSpace(flags.String("pve-vm-name-prefix"))
 	d.Cores = flags.Int("pve-cores")
@@ -678,6 +685,7 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		Memory:       uint32(d.MemoryMB),
 		Onboot:       &onboot,
 		Tags:         d.Tags,
+		Description:  d.resolveDescription(),
 		CloudInit:    d.CloudInit,
 		IPConfig:     ipConfig,
 		Nameserver:   d.Nameservers,
@@ -859,6 +867,21 @@ func (d *Driver) resolveVMName() string {
 		return d.MachineName
 	}
 	return prefix + "-" + d.MachineName
+}
+
+// resolveDescription returns the text written to the VM's Notes field.
+//
+// A clone inherits the template's own notes, which describe the template and
+// are actively misleading on a machine — so the default is not "leave it
+// alone" but a short provenance line. Somebody looking at an unfamiliar VM in
+// the PVE UI can then tell what created it and what it belongs to without
+// cross-referencing Rancher.
+func (d *Driver) resolveDescription() string {
+	if d.Description != "" {
+		return d.Description
+	}
+	return fmt.Sprintf("Rancher machine %q, cloned from template %d by docker-machine-driver-pve. Managed by Rancher — changes made here may be overwritten or lost when the machine is replaced.",
+		d.MachineName, d.TemplateVMID)
 }
 
 // validateVMNamePrefix rejects a prefix that would produce a VM name PVE
