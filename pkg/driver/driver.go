@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -91,6 +92,8 @@ type Driver struct {
 	TemplateTag      string
 	TemplateMatch    string
 	LinkedClone      bool
+	CloneStorage     string
+	CloneFormat      string
 	Tags             string
 	Description      string
 	Pool             string
@@ -230,6 +233,16 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "pve-linked-clone",
 			EnvVar: "PVE_LINKED_CLONE",
 			Usage:  "Clone the template as a linked clone instead of a full clone. Much faster and lighter on storage I/O when several machines clone at once, but every linked clone stays dependent on the template's disk for as long as it exists (the template can never be deleted or modified while one remains), and not every storage backend supports it",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-clone-storage",
+			EnvVar: "PVE_CLONE_STORAGE",
+			Usage:  "PVE storage id the clone's disks are created on, e.g. local-lvm or ceph-rbd. Empty puts them on the template's own storage, which pins every pool cloning that template to wherever the template happens to live. Full clones only — rejected together with pve-linked-clone",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-clone-format",
+			EnvVar: "PVE_CLONE_FORMAT",
+			Usage:  "Disk format for the clone: raw, qcow2 or vmdk. Empty uses the storage's default, which is almost always right — the format is only selectable on file-based storages (dir, NFS, CIFS), and block backends (LVM, ZFS, Ceph RBD) reject anything but their own. Full clones only",
 		},
 		mcnflag.StringFlag{
 			Name:   "pve-vm-name-prefix",
@@ -455,6 +468,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		d.TemplateMatch = defaultTemplateMatch
 	}
 	d.LinkedClone = flags.Bool("pve-linked-clone")
+	d.CloneStorage = strings.TrimSpace(flags.String("pve-clone-storage"))
+	d.CloneFormat = strings.ToLower(strings.TrimSpace(flags.String("pve-clone-format")))
 	d.Tags = strings.TrimSpace(flags.String("pve-tags"))
 	d.Description = strings.TrimSpace(flags.String("pve-description"))
 	d.Pool = strings.TrimSpace(flags.String("pve-pool"))
@@ -554,6 +569,9 @@ func (d *Driver) PreCreateCheck() error {
 		return errors.New("pve: --pve-api-token-secret is required")
 	}
 	if err := d.validateTemplateSelection(); err != nil {
+		return err
+	}
+	if err := d.validateCloneTarget(); err != nil {
 		return err
 	}
 	if err := d.validateVMNamePrefix(); err != nil {
@@ -867,9 +885,11 @@ func (d *Driver) cloneFromTemplate(ctx context.Context, vmName string) (int, err
 		return 0, err
 	}
 	opts := proxmox.CloneOptions{
-		Name:   vmName,
-		Linked: d.LinkedClone,
-		Pool:   d.Pool,
+		Name:    vmName,
+		Linked:  d.LinkedClone,
+		Pool:    d.Pool,
+		Storage: d.CloneStorage,
+		Format:  d.CloneFormat,
 	}
 	if d.VMID != 0 || d.VMIDRange == "" {
 		opts.NewID = d.VMID
@@ -996,6 +1016,31 @@ func (d *Driver) validateTemplateSelection() error {
 	case proxmox.MatchSubset, proxmox.MatchExact:
 	default:
 		return fmt.Errorf("pve: --pve-template-tag-match %q is not valid; use %q or %q", d.TemplateMatch, proxmox.MatchSubset, proxmox.MatchExact)
+	}
+	return nil
+}
+
+// validateCloneTarget checks the clone's destination storage and disk format.
+//
+// Both are full-clone-only in PVE: a linked clone is by definition an overlay
+// on the template's own disk, so there is no second storage for it to land on
+// and no format to choose. PVE rejects the combination itself, but with an
+// error that names the API parameter rather than the flag the operator set,
+// so it is caught here instead.
+func (d *Driver) validateCloneTarget() error {
+	if !d.LinkedClone {
+		if d.CloneFormat != "" && !slices.Contains(proxmox.CloneFormats, d.CloneFormat) {
+			return fmt.Errorf("pve: --pve-clone-format %q is not valid; use one of %s (or leave it empty to take the storage's default, which is what block storages like LVM, ZFS and Ceph RBD require)",
+				d.CloneFormat, strings.Join(proxmox.CloneFormats, ", "))
+		}
+		return nil
+	}
+	if d.CloneStorage != "" {
+		return fmt.Errorf("pve: --pve-clone-storage %q cannot be combined with --pve-linked-clone: a linked clone is an overlay on the template's own disk and always lives on the template's storage. Drop one of the two — a full clone onto a different storage is exactly how you move machines off the template's storage",
+			d.CloneStorage)
+	}
+	if d.CloneFormat != "" {
+		return fmt.Errorf("pve: --pve-clone-format %q cannot be combined with --pve-linked-clone: a linked clone inherits the template disk's format", d.CloneFormat)
 	}
 	return nil
 }

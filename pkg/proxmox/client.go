@@ -369,6 +369,48 @@ type CloneOptions struct {
 	// only ever act on VMs inside the pool, and every VM this driver
 	// creates lands there from the moment it exists.
 	Pool string
+	// Storage is the PVE storage id the clone's disks are created on. Empty
+	// inherits the template's own storage, which is PVE's behaviour and was
+	// this driver's only option before — it pins every machine pool cloning a
+	// given template to wherever that template happens to live.
+	//
+	// Full clones only: PVE rejects it outright for a linked clone, whose
+	// whole point is to reference the template's disk in place.
+	Storage string
+	// Format is the disk format for the clone (raw, qcow2, vmdk). Empty uses
+	// the storage's default, which is what almost every setup wants: the
+	// format is only selectable on file-based storages (dir, NFS, CIFS), and
+	// block backends (LVM, ZFS, Ceph RBD) reject anything but their own.
+	//
+	// Full clones only, same as Storage.
+	Format string
+}
+
+// CloneFormats are the disk formats PVE accepts for a full clone.
+var CloneFormats = []string{"raw", "qcow2", "vmdk"}
+
+// cloneParams renders the PVE clone request for opts.
+//
+// Storage and Format are full-clone-only in PVE and are dropped for a linked
+// clone rather than passed through. Callers validate the combination earlier
+// so the operator sees a message naming the flag they set, but the request
+// itself must be correct however the client is called.
+func cloneParams(opts CloneOptions) *proxmox.VirtualMachineCloneOptions {
+	full := uint8(1)
+	if opts.Linked {
+		full = 0
+	}
+	params := &proxmox.VirtualMachineCloneOptions{
+		NewID: opts.NewID,
+		Name:  opts.Name,
+		Full:  full,
+		Pool:  opts.Pool,
+	}
+	if !opts.Linked {
+		params.Storage = opts.Storage
+		params.Format = opts.Format
+	}
+	return params
 }
 
 // CloneFromTemplate clones the given template VMID into a new VM according
@@ -400,16 +442,7 @@ func (c *Client) CloneFromTemplate(ctx context.Context, templateVMID int, opts C
 		return 0, err
 	}
 
-	full := uint8(1)
-	if opts.Linked {
-		full = 0
-	}
-	params := &proxmox.VirtualMachineCloneOptions{
-		NewID: opts.NewID,
-		Name:  opts.Name,
-		Full:  full,
-		Pool:  opts.Pool,
-	}
+	params := cloneParams(opts)
 	if target != templateNode {
 		params.Target = target
 	}

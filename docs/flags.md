@@ -36,6 +36,8 @@ be created in is a property of the token's ACL — a token scoped to
 | `pve-template-tag` | *(empty)* | Select the template by PVE tag instead of VMID, e.g. `rancher-node`. Comma-separated tags must all match, and exactly one template must match. See below |
 | `pve-template-tag-match` | `subset` | `subset` (template carries at least the given tags) or `exact` (its tags are exactly the given ones) |
 | `pve-linked-clone` | `false` | Clone as a linked clone instead of a full clone. See below |
+| `pve-clone-storage` | *(template's own)* | PVE storage id the clone's disks are created on, e.g. `ceph-rbd`. Full clones only. See below |
+| `pve-clone-format` | *(storage default)* | Disk format for the clone: `raw`, `qcow2` or `vmdk`. Full clones only. See below |
 | `pve-vmid` | `0` | Explicit VMID for the created VM, `0` = auto-assigned. Only meaningful for a single machine; mutually exclusive with `pve-vmid-range` |
 | `pve-vmid-range` | *(empty)* | Allocate the VMID from this inclusive range, e.g. `200-299`. Empty lets Proxmox pick the next free id cluster-wide. See below |
 | `pve-allowed-nodes` | *(empty)* | Comma-separated PVE node names the driver may place new VMs on, e.g. `pve1,pve2`. Empty considers every online node. Mutually exclusive with `pve-node`. See below |
@@ -60,6 +62,42 @@ the race is invisible in normal use. If the range fills up, provisioning fails
 with a clear error rather than silently spilling outside it.
 
 Valid ids are `100`-`999999999`; Proxmox reserves `1`-`99`.
+
+### Where the clone's disks land
+
+By default PVE creates a clone's disks on **the storage the template's disks
+are on**. That is an inherited default, not a chosen one, and it pins every
+machine pool cloning a given template to wherever that template happens to
+live: putting nodes on Ceph when the template sits on `local-lvm` would
+otherwise mean building a second template.
+
+`pve-clone-storage` names the destination storage instead — the same thing as
+the *Target Storage* dropdown in PVE's own clone dialog. Three cases where it
+matters:
+
+- **Different backends per pool.** One template, worker nodes on fast local
+  NVMe, control-plane nodes on shared storage.
+- **Linked clones on a template that cannot support them.** `pve-linked-clone`
+  needs snapshot-capable storage; if the template lives on plain LVM, full-clone
+  it once onto LVM-thin/ZFS with this flag and everything downstream works.
+- **Capacity.** Ten full clones of a 20 GB template is 200 GB, and without this
+  it all lands wherever the template is.
+
+`pve-clone-format` (`raw`, `qcow2`, `vmdk`) picks the disk format. Leave it
+empty unless you have a specific reason: the format is only selectable on
+file-based storages (dir, NFS, CIFS), and block backends (LVM, ZFS, Ceph RBD)
+reject anything but their own. The one common use is forcing `qcow2` on NFS so
+the VMs support snapshots.
+
+Two constraints:
+
+- **Both are full-clone-only.** A linked clone is an overlay on the template's
+  own disk, so it has no separate storage to land on and no format to choose.
+  Combining either with `pve-linked-clone` is rejected in `PreCreateCheck`.
+- **Neither lifts the cross-node rule.** Setting a destination storage does not
+  let a template on local storage be cloned to a different node — PVE still
+  requires the source template on shared storage for that, exactly as described
+  under [`pve-allowed-nodes`](#pve-allowed-nodes).
 
 ### Selecting the template by tag
 

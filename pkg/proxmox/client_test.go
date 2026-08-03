@@ -377,3 +377,39 @@ func TestTagsMatch(t *testing.T) {
 		})
 	}
 }
+
+func TestCloneOptionsDropStorageAndFormatForLinkedClones(t *testing.T) {
+	// PVE rejects storage/format on a linked clone. The driver validates this
+	// first, but the client must not pass them on regardless of how it was
+	// called — a linked clone has no storage of its own to land on.
+	for _, tt := range []struct {
+		name   string
+		linked bool
+		want   string
+	}{
+		{"full clone keeps the storage", false, "ceph-rbd"},
+		{"linked clone drops it", true, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := CloneOptions{Linked: tt.linked, Storage: "ceph-rbd", Format: "qcow2"}
+			got := cloneParams(opts)
+			if got.Storage != tt.want {
+				t.Errorf("Storage = %q, want %q", got.Storage, tt.want)
+			}
+			wantFormat := "qcow2"
+			if tt.linked {
+				wantFormat = ""
+			}
+			if got.Format != wantFormat {
+				t.Errorf("Format = %q, want %q", got.Format, wantFormat)
+			}
+			wantFull := uint8(1)
+			if tt.linked {
+				wantFull = 0
+			}
+			if got.Full != wantFull {
+				t.Errorf("Full = %d, want %d", got.Full, wantFull)
+			}
+		})
+	}
+}

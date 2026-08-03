@@ -727,3 +727,46 @@ func TestCloudInitTimeoutDefaultsToNonZero(t *testing.T) {
 		t.Errorf("CloudInitTimeout = %s, want %s", d.CloudInitTimeout, defaultCloudInitTimeout)
 	}
 }
+
+func TestValidateCloneTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Driver)
+		wantErr string
+	}{
+		{"nothing set is fine", func(d *Driver) {}, ""},
+		{"storage on a full clone", func(d *Driver) { d.CloneStorage = "ceph-rbd" }, ""},
+		{"valid format", func(d *Driver) { d.CloneFormat = "qcow2" }, ""},
+		{"invalid format", func(d *Driver) { d.CloneFormat = "vhdx" }, "--pve-clone-format"},
+		// Both are full-clone-only in PVE: a linked clone is an overlay on the
+		// template's own disk, so there is no second storage or format to pick.
+		{"storage with linked clone", func(d *Driver) {
+			d.LinkedClone = true
+			d.CloneStorage = "ceph-rbd"
+		}, "--pve-clone-storage"},
+		{"format with linked clone", func(d *Driver) {
+			d.LinkedClone = true
+			d.CloneFormat = "qcow2"
+		}, "--pve-clone-format"},
+		{"linked clone alone is fine", func(d *Driver) { d.LinkedClone = true }, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{}
+			tt.mutate(d)
+			err := d.validateCloneTarget()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateCloneTarget() returned error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateCloneTarget() = nil, want an error mentioning %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateCloneTarget() error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
