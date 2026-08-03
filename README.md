@@ -65,7 +65,51 @@ Without this you still get a working driver, but the machine-pool form is
 Rancher's generic one — no template/storage/bridge dropdowns, no Test
 Connection, and no validation of data-disk mount paths.
 
-### 4. Verify
+### 4. Make Rancher trust the Proxmox VE certificate
+
+The UI extension reads PVE through Rancher's own proxy, which validates the
+certificate against the **Rancher server's** trust store — there is no way to
+turn that off, and the credential's `Insecure TLS` / `CA Cert` fields do not
+apply to it (they are read by the driver only). A stock PVE serves port 8006
+with a certificate signed by its own cluster CA, which nothing trusts by
+default, so this applies to most self-hosted setups.
+
+Copy the PVE cluster CA off a node and hand it to Rancher:
+
+```bash
+scp root@<pve-host>:/etc/pve/pve-root-ca.pem .
+
+kubectl -n cattle-system create secret generic tls-ca-additional \
+  --from-file=ca-additional.pem=pve-root-ca.pem
+
+helm upgrade rancher rancher-stable/rancher -n cattle-system --reuse-values \
+  --set additionalTrustedCAs=true
+
+kubectl -n cattle-system rollout restart deploy/rancher
+```
+
+The key name must be exactly `ca-additional.pem`, and
+`additionalTrustedCAs=true` is what actually mounts it — the secret alone does
+nothing. If `tls-ca-additional` already exists, concatenate rather than replace
+it. Verify with:
+
+```bash
+kubectl -n cattle-system exec deploy/rancher -- \
+  curl -sS -o /dev/null -w '%{http_code}\n' https://<pve-host>:8006/api2/json/version
+```
+
+`401` means TLS is trusted and reachable. `curl: (60)` means the CA has not
+landed yet.
+
+Skipping this step does **not** break cluster creation: the driver connects to
+PVE directly and honours `Insecure TLS` / `CA Cert`. What you lose is
+discovery — **Test Connection** warns, and the node / template VMID / storage /
+bridge dropdowns in the machine-pool form degrade to plain text inputs you have
+to fill in by hand. Docker installs, replaced certificates and the full
+troubleshooting table are in
+[docs/rancher-setup.md](docs/rancher-setup.md#make-rancher-trust-the-proxmox-ve-certificate).
+
+### 5. Verify
 
 ```bash
 kubectl get nodedriver pve -o jsonpath='{.status.conditions[?(@.type=="Downloaded")].status}{"\n"}'
@@ -90,33 +134,44 @@ the attempt regardless of what Rancher asks the driver to do. The privilege
 set differs between PVE 8 and 9; the driver probes the live server version
 and tells you which one it wants:
 
+Create the pool, the two roles, the user and its token. The pool is where every
+VM this driver creates lands; add the template to it as well (replace `9000`
+with your template's VMID) so one role covers both cloning it and managing what
+gets cloned from it. `RancherPVENode` holds every privilege that will be scoped
+to the pool only; `RancherPVECluster` holds the ones that are cluster-wide but
+read-only or not VM-specific, so granting them broadly does not let the token
+touch another VM's lifecycle.
+
 ```bash
-# The pool every VM this driver creates will land in. Add the template to it
-# too (replace 9000 with your template's VMID) — that is what lets one role
-# cover both cloning it and managing what gets cloned from it.
 pveum pool add rancher-managed
 pveum pool modify rancher-managed --vms 9000
 
-# Every privilege the token needs, scoped to that pool only.
 pveum role add RancherPVENode -privs "VM.Clone,VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Config.Disk,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Cloudinit,VM.Config.Options,VM.GuestAgent.Audit,Pool.Allocate"
-
-# Cluster-wide, but read-only or not VM-specific — granting these broadly
-# does not let the token touch another VM's lifecycle.
 pveum role add RancherPVECluster -privs "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
 
 pveum user add rancher@pve
 pveum user token add rancher@pve machine
+```
 
+That is the **PVE 9** privilege set. On PVE 8 replace `VM.GuestAgent.Audit` with
+`VM.Monitor` in `RancherPVENode`, or grant both to cover either. The token
+secret is printed once — save it.
+
+### Bind the roles
+
+Nothing above grants anything yet — the roles only become effective once bound.
+**Use these ACLs**: they are what confines the token to `rancher-managed`, and
+they are the entire reason a token stolen from a Rancher cluster cannot delete
+the rest of your PVE. All four lines are required: PVE tokens do **not** inherit
+their user's privileges, so each grant is made twice, once for the user and once
+for the token.
+
+```bash
 pveum acl modify /pool/rancher-managed -user  rancher@pve           -role RancherPVENode
 pveum acl modify /pool/rancher-managed -token 'rancher@pve!machine' -role RancherPVENode
 pveum acl modify /                     -user  rancher@pve           -role RancherPVECluster
 pveum acl modify /                     -token 'rancher@pve!machine' -role RancherPVECluster
 ```
-
-That is the **PVE 9** set. On PVE 8 replace `VM.GuestAgent.Audit` with
-`VM.Monitor` in `RancherPVENode`, or grant both to cover either. The token
-secret is printed once — save it. Every ACL line above is required for both
-the user and the token: PVE tokens do not inherit the user's privileges.
 
 Set **Resource Pool** to `rancher-managed` on the **cloud credential** to
 match. It lives on the credential, not on each machine pool, because it is a
