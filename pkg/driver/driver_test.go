@@ -364,6 +364,8 @@ func TestCreateFlagsDeriveExpectedFieldNames(t *testing.T) {
 	for _, want := range []string{
 		"templateVmid", "dataDisk", "netBridge", "cloudinit",
 		"sshUser", "sshPort", "vmNamePrefix", "bootDiskSize",
+		"templateTag", "templateTagMatch", "cloneStorage", "cloneFormat",
+		"description", "cloudinitTimeout",
 	} {
 		if !got[want] {
 			t.Errorf("no flag derives the machine-config field %q that the UI extension binds to", want)
