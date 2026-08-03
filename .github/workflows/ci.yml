@@ -21,9 +21,30 @@ on:
     paths-ignore:
       - deploy/chart/**
   workflow_call:
+    inputs:
+      skip-cross-compile:
+        description: >-
+          Skip the cross-compile job. Set by release.yml: goreleaser rebuilds
+          every target minutes later, so `make dist` there is pure duplicate
+          work on the critical path of a release.
+        type: boolean
+        default: false
 
+# The workflow name is part of the group on purpose.
+#
+# A release reaches this workflow twice over: once from the push to master, and
+# once as the gate release.yml calls. Both runs carry the *same* github.ref
+# (refs/heads/master), so a group keyed on the ref alone put them in one bucket
+# and cancel-in-progress killed one of them — usually visible as jobs that start
+# and immediately go grey, and at worst as a release whose gate was cancelled
+# out from under it.
+#
+# For a reusable workflow, github.workflow is the *calling* workflow's name, so
+# the gate run lands in `ci-Chart Release-...` while the push run stays in
+# `ci-CI-...`. Superseding still works where it should: a second push to the
+# same branch cancels the first.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -62,6 +83,11 @@ jobs:
   build:
     name: Cross-compile
     needs: [lint, check]
+    # `inputs` is empty on the push/PR path, and !null is true there — so this
+    # runs by default and is skipped only when a caller explicitly opts out.
+    # Do not rewrite as `inputs.skip-cross-compile == false`: GitHub coerces
+    # both null and false to 0, so that form would skip the job on every push.
+    if: ${{ !inputs.skip-cross-compile }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
