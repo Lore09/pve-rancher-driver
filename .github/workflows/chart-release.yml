@@ -2,11 +2,17 @@ name: Chart Release
 
 # Chart version bumps drive releases.
 #
-# Bumping `version` in deploy/chart/Chart.yaml on the default branch is the
-# single action that cuts a release: this workflow notices the change, creates
-# the matching `v<version>` tag, and invokes the release workflow to build and
-# publish the binaries. There is no separate `git tag` step to remember, and no
-# way to tag a version the chart does not claim to be.
+# Bumping `version` in deploy/chart/Chart.yaml is the single action that cuts a
+# release: this workflow notices the change, creates the matching tag, and
+# invokes the release workflow to build and publish the binaries. There is no
+# separate `git tag` step to remember, and no way to tag a version the chart
+# does not claim to be.
+#
+# The branch decides what kind of release it is:
+#   dev    -> v<version>-dev, published as a GitHub prerelease
+#   master -> v<version>,      published as the stable release
+# The -dev suffix lives only in the tag. deploy/chart/Chart.yaml always carries
+# a plain x.y.z version, so dev and master never differ on that file.
 #
 # WHY THE PATH FILTER IS EXACTLY ONE FILE
 # ---------------------------------------
@@ -17,12 +23,14 @@ name: Chart Release
 # infinite release loop.
 on:
   push:
-    branches: [master, main]
+    branches: [master, dev]
     paths:
       - deploy/chart/Chart.yaml
 
-# Serialise releases so two quick bumps cannot race to create tags. Never
-# cancel in progress: a half-finished release leaves a tag with no binaries.
+# Serialise releases so two quick bumps cannot race to create tags. The group is
+# deliberately branch-independent: a dev and a master release both create tags
+# and both end up publishing, so they must not overlap either. Never cancel in
+# progress: a half-finished release leaves a tag with no binaries.
 concurrency:
   group: chart-release
   cancel-in-progress: false
@@ -37,82 +45,51 @@ jobs:
     outputs:
       bumped: ${{ steps.check.outputs.bumped }}
       tag: ${{ steps.check.outputs.tag }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # needs history to diff against the pre-push commit
+          fetch-tags: true # detect-release.sh needs the full tag list
 
-      - name: Compare chart version against the previous commit
-        id: check
+      # Read the two versions and the previous tip's version out of git, then
+      # hand the decision to the script. The split exists so the decision logic
+      # is unit-testable without a repository; see
+      # .github/scripts/detect-release.test.sh.
+      - name: Gather versions
+        id: gather
         shell: bash
         run: |
           set -euo pipefail
           CHART=deploy/chart/Chart.yaml
 
-          NEW_VERSION="$(yq -r '.version' "$CHART")"
-          APP_VERSION="$(yq -r '.appVersion' "$CHART")"
-
-          if [ -z "$NEW_VERSION" ] || [ "$NEW_VERSION" = "null" ]; then
-            echo "::error file=$CHART::version is missing"; exit 1
-          fi
-
-          # appVersion is what the NodeDriver download URL is built from. If it
-          # drifts from version, the chart and the binary it points at are no
-          # longer the same release, which is the whole thing this design is
-          # meant to make impossible.
-          if [ "$NEW_VERSION" != "$APP_VERSION" ]; then
-            echo "::error file=$CHART::version ($NEW_VERSION) and appVersion ($APP_VERSION) must match"; exit 1
-          fi
-
-          if ! printf '%s' "$NEW_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error file=$CHART::version '$NEW_VERSION' is not semver (x.y.z or x.y.z-pre)"; exit 1
-          fi
+          {
+            echo "new=$(yq -r '.version' "$CHART")"
+            echo "app=$(yq -r '.appVersion' "$CHART")"
+          } >> "$GITHUB_OUTPUT"
 
           # github.event.before is the tip before this push, which handles a
           # push containing several commits. It is all-zeros when the branch was
           # just created, in which case treat the chart as new.
           BEFORE="${{ github.event.before }}"
-          OLD_VERSION=""
+          OLD=""
           if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-            OLD_VERSION="$(git show "$BEFORE:$CHART" 2>/dev/null | yq -r '.version' 2>/dev/null || true)"
+            OLD="$(git show "$BEFORE:$CHART" 2>/dev/null | yq -r '.version' 2>/dev/null || true)"
           fi
-          [ "$OLD_VERSION" = "null" ] && OLD_VERSION=""
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
 
-          echo "previous version: ${OLD_VERSION:-(none)}"
-          echo "new version:      $NEW_VERSION"
-
-          if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
-            echo "Chart.yaml changed but version did not; nothing to release."
-            echo "bumped=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Reject a decrease, which would point the `latest` release at an older
-          # binary. Only the numeric x.y.z core is compared: `sort -V` does not
-          # implement semver precedence for pre-release suffixes (it treats the
-          # shorter string as a prefix, so 0.2.0 sorts *before* 0.2.0-rc.1), and
-          # naively using it would reject the legitimate promotion of a release
-          # candidate to its final version. Movement within the same core - rc.1
-          # to rc.2, or rc.1 to final - is therefore allowed without ordering
-          # checks; the exact-match case above already caught "no change".
-          if [ -n "$OLD_VERSION" ]; then
-            OLD_CORE="${OLD_VERSION%%-*}"
-            NEW_CORE="${NEW_VERSION%%-*}"
-            if [ "$OLD_CORE" != "$NEW_CORE" ]; then
-              LOWEST="$(printf '%s\n%s\n' "$OLD_CORE" "$NEW_CORE" | sort -V | head -1)"
-              if [ "$LOWEST" != "$OLD_CORE" ]; then
-                echo "::error file=$CHART::version went backwards: $OLD_VERSION -> $NEW_VERSION"; exit 1
-              fi
-            fi
-          fi
-
-          TAG="v$NEW_VERSION"
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::error file=$CHART::tag $TAG already exists; bump to a new version instead of reusing one"; exit 1
-          fi
-
-          echo "bumped=true" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Decide release
+        id: check
+        shell: bash
+        env:
+          BRANCH: ${{ github.ref_name }}
+          NEW_VERSION: ${{ steps.gather.outputs.new }}
+          APP_VERSION: ${{ steps.gather.outputs.app }}
+          OLD_VERSION: ${{ steps.gather.outputs.old }}
+        run: |
+          set -euo pipefail
+          EXISTING_TAGS="$(git tag --list)" \
+            bash .github/scripts/detect-release.sh
 
       - name: Create and push tag
         if: steps.check.outputs.bumped == 'true'
@@ -137,6 +114,7 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.detect.outputs.tag }}
+      prerelease: ${{ needs.detect.outputs.prerelease == 'true' }}
     permissions:
       contents: write
     secrets: inherit
