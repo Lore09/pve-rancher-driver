@@ -86,10 +86,8 @@ jobs:
           # need the deploy-key bypass on the protected branches.
           ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
 
-      # Fail now rather than after the binaries are published. Prereleases skip
-      # the writeback, so they do not need the key.
+      # Fail now rather than after the binaries are published.
       - name: Check release credentials
-        if: ${{ !inputs.prerelease }}
         env:
           RELEASE_SSH_KEY: ${{ secrets.RELEASE_SSH_KEY }}
         run: |
@@ -203,12 +201,14 @@ jobs:
       # This writes values.yaml only. chart-release.yml watches Chart.yaml only.
       # That asymmetry is what makes the loop impossible — keep it.
       - name: Record checksum in chart values
-        if: ${{ !inputs.prerelease }}
         shell: bash
         env:
           VERSION: ${{ steps.crd.outputs.version }}
           SHA256: ${{ steps.crd.outputs.sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Prereleases record onto dev so the chart there can be installed with
+          # --set nodeDriver.version=<tag>; stable releases record onto the
+          # branch that serves the Rancher git-backed repository.
+          TARGET: ${{ inputs.prerelease && 'dev' || github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           VALUES=deploy/chart/values.yaml
@@ -216,13 +216,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # The build ran against a detached tag; move to the branch that serves
-          # the Rancher git-backed repository.
-          git fetch --depth=1 origin "$DEFAULT_BRANCH"
-          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+          # The build ran against a detached tag; move to the target branch.
+          git fetch --depth=1 origin "$TARGET"
+          git checkout -B "$TARGET" "origin/$TARGET"
 
           if [ ! -f "$VALUES" ]; then
-            echo "::warning::$VALUES not present on $DEFAULT_BRANCH; skipping"; exit 0
+            echo "::warning::$VALUES not present on $TARGET; skipping"; exit 0
           fi
 
           # Edited with sed rather than `yq -i` on purpose: yq round-trips the
@@ -247,7 +246,7 @@ jobs:
           # [skip ci] keeps this from re-running the CI workflow; the path filter
           # in chart-release.yml already prevents a release loop.
           git commit -m "chore(chart): record ${VERSION} binary checksum [skip ci]"
-          git push origin "HEAD:$DEFAULT_BRANCH"
+          git push origin "HEAD:$TARGET"
 
       # Bring the checksum commit into dev: fast-forward if dev has nothing of
       # its own, otherwise merge. Warns instead of failing.
