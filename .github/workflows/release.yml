@@ -82,6 +82,24 @@ jobs:
           # new tag. Check the tag out explicitly so goreleaser derives the
           # right version.
           ref: ${{ inputs.version }}
+          # The pushes at the end of this job land on ruleset-protected
+          # branches. github-actions[bot] cannot be granted bypass on a
+          # user-owned repo, so they authenticate with a deploy key, which the
+          # rulesets do allow through. checkout sets the SSH remote and
+          # persists the key for the later `git push` steps.
+          ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
+
+      # Fail now rather than after the binaries are published. Prereleases skip
+      # the writeback, so they do not need the key.
+      - name: Check release credentials
+        if: ${{ !inputs.prerelease }}
+        env:
+          RELEASE_SSH_KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          if [ -z "${RELEASE_SSH_KEY:-}" ]; then
+            echo "::error::RELEASE_SSH_KEY is not set; the checksum commit would be rejected by the branch ruleset."
+            exit 1
+          fi
 
       - uses: actions/setup-go@v5
         with:
