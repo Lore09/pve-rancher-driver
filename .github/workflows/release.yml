@@ -25,12 +25,24 @@ on:
         description: Tag to release, e.g. v0.1.3. Must already exist.
         required: true
         type: string
+      prerelease:
+        description: >-
+          Publish as a GitHub prerelease and skip the chart-values writeback.
+          Set by chart-release.yml for tags cut from the dev branch.
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
         description: Tag to re-release, e.g. v0.1.3. Must already exist.
         required: true
         type: string
+      prerelease:
+        description: Publish as a prerelease and skip the chart-values writeback.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -45,11 +57,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Reuse the CI pipeline as a gate; releases cannot ship if lint or tests
-  # are red.
+  # Reuse the CI pipeline as a gate; releases cannot ship if lint, tests, or the
+  # vulnerability scan are red.
+  #
+  # `full: true` on every path, prereleases included. The reduced tier on dev
+  # pull requests buys faster review feedback; it must not weaken what is
+  # required to publish an artifact.
   ci:
     uses: ./.github/workflows/ci.yml
     with:
+      full: true
       # goreleaser cross-compiles every target in the next job, so having CI
       # do it first only adds minutes to the release.
       skip-cross-compile: true
@@ -68,7 +85,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.25"
           cache: true
 
       - name: Install goreleaser
@@ -143,6 +160,10 @@ jobs:
           # Required on the workflow_call path: the run is triggered by a branch
           # push, so the action cannot infer the tag from the ref.
           tag_name: ${{ steps.crd.outputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          # A dev build must never become the release users land on from the
+          # repository page or fetch via the /latest redirect.
+          make_latest: ${{ !inputs.prerelease }}
           files: |
             dist/docker-machine-driver-pve-*
             dist/checksums.txt
@@ -150,6 +171,13 @@ jobs:
 
       # The chart pins the binary's SHA-256, which cannot exist until the binary
       # is built — so it is recorded here, after the fact, on the default branch.
+      #
+      # SKIPPED FOR PRERELEASES. This runs against the default branch, and a dev
+      # build's tag (v0.8.0-dev) does not match the plain version the chart
+      # declares (0.8.0). Writing checksumFor: v0.8.0-dev would trip the chart
+      # template's own mismatch guard and leave the chart unrenderable. Dev
+      # builds are consumed through the prerelease's rendered
+      # nodedriver-<tag>.yaml, not through Helm.
       #
       # Until this lands, the chart on the default branch has a checksum
       # belonging to the *previous* version. The chart template detects that
@@ -160,6 +188,7 @@ jobs:
       # This writes values.yaml only. chart-release.yml watches Chart.yaml only.
       # That asymmetry is what makes the loop impossible — keep it.
       - name: Record checksum in chart values
+        if: ${{ !inputs.prerelease }}
         shell: bash
         env:
           VERSION: ${{ steps.crd.outputs.version }}
@@ -204,3 +233,41 @@ jobs:
           # in chart-release.yml already prevents a release loop.
           git commit -m "chore(chart): record ${VERSION} binary checksum [skip ci]"
           git push origin "HEAD:$DEFAULT_BRANCH"
+
+      # The checksum commit lands on the default branch only, so dev falls one
+      # commit behind on every release and the next promotion pull request
+      # carries a spurious values.yaml conflict. Fast-forward dev to match.
+      #
+      # This never fails the job. By the time it runs the binaries are published
+      # and the chart on master is correct; a dev branch that needs a manual
+      # merge is an inconvenience, not a broken release.
+      - name: Sync checksum commit to dev
+        if: ${{ !inputs.prerelease }}
+        continue-on-error: true
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+
+          if ! git ls-remote --exit-code --heads origin dev >/dev/null 2>&1; then
+            echo "::notice::no dev branch yet; nothing to sync"
+            exit 0
+          fi
+
+          # Steps share the workspace, and the previous step left HEAD on the
+          # default branch at the commit it just pushed — so HEAD is exactly
+          # what dev needs to reach. Pushing HEAD rather than a remote-tracking
+          # ref also sidesteps the previous step's `--depth=1` fetch, which can
+          # make a push of origin/<branch> fail with "shallow update not
+          # allowed".
+          #
+          # A plain (non-force) push is precisely the semantics wanted: git
+          # accepts it if and only if it is a fast-forward, and rejects it if
+          # dev has commits of its own. No --force-with-lease needed; using one
+          # here would only add a way to discard dev-only work.
+          if git push origin "HEAD:refs/heads/dev"; then
+            echo "::notice::fast-forwarded dev to $DEFAULT_BRANCH"
+          else
+            echo "::warning::could not fast-forward dev to $DEFAULT_BRANCH (dev has diverged). Merge $DEFAULT_BRANCH into dev manually to pick up the checksum commit."
+          fi

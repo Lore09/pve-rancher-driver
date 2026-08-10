@@ -1,27 +1,34 @@
 name: CI
 
-# The Go pipeline is skipped for changes that cannot affect the Go build —
-# currently the Helm chart. GitHub runs the workflow when *any* changed file
-# falls outside paths-ignore, so a push touching both the chart and Go code
-# still gets linted; only chart-only changes are skipped.
+# Pull requests only. Once branch protection requires a green PR, re-running the
+# same commits on merge proves nothing, and release.yml still calls this
+# workflow as its gate — so nothing is ever published unlinted.
 #
-# NOTE: paths-ignore does not apply to workflow_call. release.yml invokes this
-# workflow as its release gate, so a chart version bump — which reaches this
-# workflow through chart-release.yml -> release.yml -> ci.yml — is still fully
-# linted and tested before anything is published. Skipping here only affects the
-# direct push/PR runs.
+# CHECK TIERS
+# -----------
+# PR -> dev    lint, vet, tests            (fast feedback on feature work)
+# PR -> master the above + govulncheck + cross-compile
+# release gate everything, via `full: true` from release.yml
+#
+# The dev tier keeps `go test` deliberately. dev is where all feature work
+# lands; lint-only there means a broken test merges cleanly and surfaces at
+# release time, when the fix has to travel through another pull request.
+#
+# NOTE: there is no `paths-ignore` here. GitHub reports a skipped workflow's
+# checks as *missing* rather than passing, so filtering out chart-only pull
+# requests would leave them permanently unmergeable against the required checks
+# configured on master. Do not add one back.
 on:
-  push:
-    branches: [master, main]
-    tags-ignore: ["v*"]
-    paths-ignore:
-      - deploy/chart/**
   pull_request:
-    branches: [master, main]
-    paths-ignore:
-      - deploy/chart/**
+    branches: [master, dev]
   workflow_call:
     inputs:
+      full:
+        description: >-
+          Run the full tier regardless of the target branch. Set by release.yml
+          so every published artifact is gated on the complete suite.
+        type: boolean
+        default: false
       skip-cross-compile:
         description: >-
           Skip the cross-compile job. Set by release.yml: goreleaser rebuilds
@@ -32,17 +39,13 @@ on:
 
 # The workflow name is part of the group on purpose.
 #
-# A release reaches this workflow twice over: once from the push to master, and
-# once as the gate release.yml calls. Both runs carry the *same* github.ref
-# (refs/heads/master), so a group keyed on the ref alone put them in one bucket
-# and cancel-in-progress killed one of them — usually visible as jobs that start
-# and immediately go grey, and at worst as a release whose gate was cancelled
-# out from under it.
-#
 # For a reusable workflow, github.workflow is the *calling* workflow's name, so
-# the gate run lands in `ci-Chart Release-...` while the push run stays in
-# `ci-CI-...`. Superseding still works where it should: a second push to the
-# same branch cancels the first.
+# a release's gate run lands in `ci-Chart Release-...` while a pull request run
+# stays in `ci-CI-...`. Without that, the two runs share a github.ref and
+# cancel-in-progress kills one of them — visible as jobs that start and
+# immediately go grey, and at worst as a release whose gate was cancelled out
+# from under it. Superseding still works where it should: a new push to the same
+# pull request cancels the previous run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -55,14 +58,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.25"
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # golangci-lint v2 + action v8. v1 cannot parse a `go 1.25.0` directive
+      # and is no longer released, so the Go toolchain bump forced this. The
+      # config in .golangci.yml at the repo root was migrated to the v2 schema
+      # at the same time; the linter set is unchanged.
+      #
+      # No `args:` — v2 reads the timeout from `run.timeout` in the config.
+      - uses: golangci/golangci-lint-action@v8
         with:
-          version: v1.59
-          # only fail the build if the linter reports issues; left the
-          # configuration in .golangci.yml at the repo root.
-          args: --timeout=5m
+          version: v2.6.2
 
   check:
     name: go vet + tests
@@ -71,7 +77,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.25"
           cache: true
       - name: go vet
         run: go vet ./...
@@ -80,20 +86,56 @@ jobs:
       - name: build (linux/amd64 verification)
         run: go build -o /tmp/docker-machine-driver-pve ./cmd/docker-machine-driver-pve
 
-  build:
-    name: Cross-compile
-    needs: [lint, check]
-    # `inputs` is empty on the push/PR path, and !null is true there — so this
-    # runs by default and is skipped only when a caller explicitly opts out.
-    # Do not rewrite as `inputs.skip-cross-compile == false`: GitHub coerces
-    # both null and false to 0, so that form would skip the job on every push.
-    if: ${{ !inputs.skip-cross-compile }}
+  vuln:
+    name: govulncheck
+    # Full tier only. github.base_ref is the pull request's target branch and is
+    # empty on the workflow_call path; inputs.full is null on the pull request
+    # path. Do not rewrite as `github.event_name == 'workflow_call'` — on the
+    # reusable-workflow path event_name reports the *caller's* event (push).
+    if: ${{ github.base_ref == 'master' || inputs.full }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.25"
+          cache: true
+      # Pinned, not @latest: a release must not start failing because an
+      # upstream tool changed under it. v1.1.4 rather than v1.1.3 — the latter's
+      # x/tools dependency does not compile on Go 1.24+, so it would break for
+      # anyone running this locally against a modern toolchain.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      # Reports only vulnerabilities in code paths this module actually reaches,
+      # so a finding here is real rather than a transitive-dependency rumour.
+      #
+      # The gate script decides pass/fail rather than govulncheck's own exit
+      # code, because this module has 11 unfixable findings in a deliberately
+      # pinned docker/docker. See .github/scripts/govulncheck-gate.sh for the
+      # allowlist and the reasoning. `|| true` keeps a non-zero govulncheck
+      # exit (which it returns whenever it finds anything at all) from ending
+      # the step before the gate has looked at the results.
+      - name: Run govulncheck
+        run: govulncheck -format json ./... > govulncheck.json || true
+
+      - name: Gate on non-allowlisted findings
+        run: bash .github/scripts/govulncheck-gate.sh govulncheck.json
+
+  build:
+    name: Cross-compile
+    needs: [lint, check]
+    # Full tier only, and skippable on top of that by release.yml. `inputs` is
+    # empty on the pull request path, so !skip-cross-compile is true there and
+    # the tier check is what gates it. Do not rewrite either half as
+    # `== false`: GitHub coerces both null and false to 0, so that form would
+    # skip the job unconditionally.
+    if: ${{ (github.base_ref == 'master' || inputs.full) && !inputs.skip-cross-compile }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
           cache: true
       - name: Build all targets + checksums
         run: make dist

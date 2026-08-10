@@ -1,0 +1,110 @@
+name: Chart lint
+
+# Validates deploy/chart on pull requests that touch it.
+#
+# ci.yml cannot host these checks: it has no Helm toolchain, and the assertions
+# below are only meaningful for chart changes. The version assertions duplicate
+# .github/scripts/detect-release.sh on purpose — that script only runs after
+# merge, so without this a bad version in the one file that triggers releases
+# fails a release run rather than a pull request check.
+#
+# NOT A REQUIRED STATUS CHECK. This workflow is path-filtered, and GitHub
+# reports a skipped workflow's checks as missing rather than passing, so
+# requiring it would make every pull request that does not touch the chart
+# unmergeable.
+on:
+  pull_request:
+    branches: [master, dev]
+    paths:
+      - deploy/chart/**
+
+concurrency:
+  group: chart-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Chart lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      # Mirrors the checks in .github/scripts/detect-release.sh so they fail on
+      # the pull request instead of during the release run they would trigger.
+      - name: Assert chart version fields
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHART=deploy/chart/Chart.yaml
+
+          V="$(yq -r '.version' "$CHART")"
+          A="$(yq -r '.appVersion' "$CHART")"
+
+          if [ -z "$V" ] || [ "$V" = "null" ]; then
+            echo "::error file=$CHART::version is missing"; exit 1
+          fi
+          if [ "$V" != "$A" ]; then
+            echo "::error file=$CHART::version ($V) and appVersion ($A) must match"; exit 1
+          fi
+          # Plain x.y.z only; the -dev suffix belongs to the tag, never the
+          # chart. See .github/workflows/chart-release.yml.
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error file=$CHART::version '$V' is not plain semver (x.y.z)"; exit 1
+          fi
+
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      # The same two overrides the template step explains below. Without them
+      # `helm lint` still reports "0 chart(s) failed" while the template fails
+      # to render underneath — it logs the failure and passes anyway, which
+      # makes a bare `helm lint` here worth almost nothing.
+      - name: helm lint
+        run: |
+          helm lint deploy/chart \
+            --set verifyManagementCluster=false \
+            --set nodeDriver.checksum=""
+
+      # Two overrides, both required and neither hiding a real failure:
+      #
+      #   verifyManagementCluster=false — there is no cluster here, so the
+      #     template's Rancher-management-cluster check has nothing to discover.
+      #     This is the escape hatch the chart documents for offline rendering.
+      #
+      #   nodeDriver.checksum="" — on a version-bump pull request, values.yaml
+      #     still holds the *previous* release's digest, because the new one
+      #     cannot exist until the binary is built after merge. The template
+      #     correctly refuses to render that combination. Clearing the checksum
+      #     is the chart's own documented way to skip verification, and it is
+      #     what lets this job test rendering on exactly the pull requests that
+      #     matter most.
+      - name: helm template
+        run: |
+          helm template pve-rancher-driver deploy/chart \
+            --set verifyManagementCluster=false \
+            --set nodeDriver.checksum=""
+
+      # The guard that turns a checksum/version mismatch into a loud error is
+      # the chart's main safety property. Assert it still fires, so a refactor
+      # cannot silently remove it and leave drivers stuck in `Downloading`.
+      - name: Assert the checksum mismatch guard fires
+        shell: bash
+        run: |
+          set -uo pipefail
+          OUT="$(helm template pve-rancher-driver deploy/chart \
+            --set verifyManagementCluster=false \
+            --set nodeDriver.checksum=deadbeef \
+            --set nodeDriver.checksumFor=v0.0.0-not-a-real-version 2>&1)"
+          STATUS=$?
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::chart rendered with a mismatched checksum; the checksumFor guard is not firing"
+            exit 1
+          fi
+          case "$OUT" in
+            *"was recorded for"*) echo "guard fired as expected" ;;
+            *) echo "::error::render failed, but not with the checksum guard message: $OUT"; exit 1 ;;
+          esac

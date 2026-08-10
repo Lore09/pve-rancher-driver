@@ -1,12 +1,22 @@
 # golangci-lint config for pve-rancher-driver. Kept narrow on purpose:
 # revive + govet + staticcheck + ineffassign + unused + errorlint + gocritic
 # catch most real defects without forcing style churn on a small driver.
+#
+# v2 schema. The migration from v1 came with the Go 1.25 toolchain bump:
+# golangci-lint v1 cannot parse a `go 1.25.0` directive, and v1 is no longer
+# released. Mapping from the old file, in case you are diffing against history:
+#   linters.disable-all: true  -> linters.default: none
+#   linters-settings           -> linters.settings
+#   issues.exclude-rules       -> linters.exclusions.rules
+#   issues.exclude-dirs        -> linters.exclusions.paths
+#   run.go                     -> dropped; the toolchain is read from go.mod
+version: "2"
+
 run:
   timeout: 5m
-  go: "1.22"
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - govet
     - ineffassign
@@ -18,23 +28,23 @@ linters:
     - misspell
     - goprintffuncname
 
-linters-settings:
-  revive:
-    severity: warning
-    rules:
-      - name: exported
-        disabled: true # the driver wraps an upstream-style API, ignore case churn
-  errorlint:
-    errorf: true
-    asserts: true
-    comparison: true
+  settings:
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+          disabled: true # the driver wraps an upstream-style API, ignore case churn
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
 
-issues:
-  exclude-rules:
-    # driver flags intentionally read from env vars; shadowing is harmless.
-    - path: pkg/driver/driver\.go
-      linters: [gocritic]
-      text: "flagDeref"
-  exclude-dirs:
-    - vendor
-    - dist
+  exclusions:
+    rules:
+      # driver flags intentionally read from env vars; shadowing is harmless.
+      - path: pkg/driver/driver\.go
+        linters: [gocritic]
+        text: "flagDeref"
+    paths:
+      - vendor
+      - dist
