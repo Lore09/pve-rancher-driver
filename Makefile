@@ -5,7 +5,7 @@ TARGETS := darwin/amd64 darwin/arm64 linux/amd64 linux/arm64
 
 GOFLAGS ?= -mod=mod
 
-.PHONY: all build vet test fmt clean crossclean dist install-deps
+.PHONY: all build vet test fmt clean crossclean dist install-deps test-workflows
 
 all: build
 
@@ -40,3 +40,9 @@ clean:
 
 crossclean:
 	rm -rf dist
+
+# Unit tests for the release-decision logic used by .github/workflows.
+# Pure bash; no Go toolchain and no repository state required.
+test-workflows:
+	bash .github/scripts/detect-release.test.sh
+	bash .github/scripts/govulncheck-gate.test.sh
