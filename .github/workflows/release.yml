@@ -82,11 +82,8 @@ jobs:
           # new tag. Check the tag out explicitly so goreleaser derives the
           # right version.
           ref: ${{ inputs.version }}
-          # The pushes at the end of this job land on ruleset-protected
-          # branches. github-actions[bot] cannot be granted bypass on a
-          # user-owned repo, so they authenticate with a deploy key, which the
-          # rulesets do allow through. checkout sets the SSH remote and
-          # persists the key for the later `git push` steps.
+          # Sets an SSH remote and persists the key for the pushes below, which
+          # need the deploy-key bypass on the protected branches.
           ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
 
       # Fail now rather than after the binaries are published. Prereleases skip
@@ -252,14 +249,9 @@ jobs:
           git commit -m "chore(chart): record ${VERSION} binary checksum [skip ci]"
           git push origin "HEAD:$DEFAULT_BRANCH"
 
-      # The checksum commit lands on the default branch only, so dev falls one
-      # commit behind on every release and the next promotion pull request
-      # carries a spurious values.yaml conflict. Fast-forward dev to match.
-      #
-      # This never fails the job. By the time it runs the binaries are published
-      # and the chart on master is correct; a dev branch that needs a manual
-      # merge is an inconvenience, not a broken release.
-      - name: Sync checksum commit to dev
+      # Bring the checksum commit into dev: fast-forward if dev has nothing of
+      # its own, otherwise merge. Warns instead of failing.
+      - name: Sync the default branch into dev
         if: ${{ !inputs.prerelease }}
         continue-on-error: true
         shell: bash
@@ -273,19 +265,43 @@ jobs:
             exit 0
           fi
 
-          # Steps share the workspace, and the previous step left HEAD on the
-          # default branch at the commit it just pushed — so HEAD is exactly
-          # what dev needs to reach. Pushing HEAD rather than a remote-tracking
-          # ref also sidesteps the previous step's `--depth=1` fetch, which can
-          # make a push of origin/<branch> fail with "shallow update not
-          # allowed".
-          #
-          # A plain (non-force) push is precisely the semantics wanted: git
-          # accepts it if and only if it is a fast-forward, and rejects it if
-          # dev has commits of its own. No --force-with-lease needed; using one
-          # here would only add a way to discard dev-only work.
+          # The previous step's --depth=1 fetch can leave the repo shallow.
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow origin || git fetch --depth=2147483647 origin
+          fi
+          git fetch origin "$DEFAULT_BRANCH" dev
+
+          BASE="$(git rev-parse "origin/$DEFAULT_BRANCH")"
+          DEV="$(git rev-parse origin/dev)"
+
+          if [ "$BASE" = "$DEV" ]; then
+            echo "::notice::dev already matches $DEFAULT_BRANCH"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "$DEV" "$BASE"; then
+            if git push origin "$BASE:refs/heads/dev"; then
+              echo "::notice::fast-forwarded dev to $DEFAULT_BRANCH"
+            else
+              echo "::warning::could not fast-forward dev to $DEFAULT_BRANCH"
+            fi
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B dev-sync "$DEV"
+          if ! git merge --no-edit -m "chore: merge $DEFAULT_BRANCH into dev (release checksum)" "$BASE"; then
+            git merge --abort >/dev/null 2>&1 || true
+            echo "::warning::merging $DEFAULT_BRANCH into dev hit conflicts; resolve it manually to pick up the checksum commit."
+            exit 0
+          fi
+
+          # Fast-forward for dev, so a plain push works and a dev that moved
+          # meanwhile is rejected rather than clobbered.
           if git push origin "HEAD:refs/heads/dev"; then
-            echo "::notice::fast-forwarded dev to $DEFAULT_BRANCH"
+            echo "::notice::merged $DEFAULT_BRANCH into dev"
           else
-            echo "::warning::could not fast-forward dev to $DEFAULT_BRANCH (dev has diverged). Merge $DEFAULT_BRANCH into dev manually to pick up the checksum commit."
+            echo "::warning::could not push the merge (dev moved while this ran); merge $DEFAULT_BRANCH into dev manually."
           fi

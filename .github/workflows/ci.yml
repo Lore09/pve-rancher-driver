@@ -51,12 +51,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Decides whether the Go pipeline has anything to do. The jobs below always
+  # run so their required status checks always report; they just skip their
+  # steps when nothing relevant changed.
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Anything that is not a pull request (the release gate) runs in full.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          git fetch -q origin "${{ github.base_ref }}"
+          BASE="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+          CHANGED="$(git diff --name-only "$BASE" HEAD)"
+          echo "$CHANGED"
+
+          if printf '%s\n' "$CHANGED" | grep -Eq '\.go$|^go\.(mod|sum)$|^\.golangci\.yml$|^Makefile$|^\.goreleaser\.yaml$|^\.github/(workflows/(ci|release)\.yml|scripts/)'; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: Lint (golangci-lint)
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.go == 'true' }}
       - uses: actions/setup-go@v5
+        if: ${{ needs.changes.outputs.go == 'true' }}
         with:
           go-version: "1.25"
           cache: true
@@ -67,27 +103,35 @@ jobs:
       #
       # No `args:` — v2 reads the timeout from `run.timeout` in the config.
       - uses: golangci/golangci-lint-action@v8
+        if: ${{ needs.changes.outputs.go == 'true' }}
         with:
           version: v2.6.2
 
   check:
     name: go vet + tests
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.go == 'true' }}
       - uses: actions/setup-go@v5
+        if: ${{ needs.changes.outputs.go == 'true' }}
         with:
           go-version: "1.25"
           cache: true
       - name: go vet
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: go vet ./...
       - name: go test
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: go test -race -count=1 ./...
       - name: build (linux/amd64 verification)
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: go build -o /tmp/docker-machine-driver-pve ./cmd/docker-machine-driver-pve
 
   vuln:
     name: govulncheck
+    needs: changes
     # Full tier only. github.base_ref is the pull request's target branch and is
     # empty on the workflow_call path; inputs.full is null on the pull request
     # path. Do not rewrite as `github.event_name == 'workflow_call'` — on the
@@ -96,7 +140,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.go == 'true' }}
       - uses: actions/setup-go@v5
+        if: ${{ needs.changes.outputs.go == 'true' }}
         with:
           go-version: "1.25"
           cache: true
@@ -105,6 +151,7 @@ jobs:
       # x/tools dependency does not compile on Go 1.24+, so it would break for
       # anyone running this locally against a modern toolchain.
       - name: Install govulncheck
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
       # Reports only vulnerabilities in code paths this module actually reaches,
       # so a finding here is real rather than a transitive-dependency rumour.
@@ -116,14 +163,16 @@ jobs:
       # exit (which it returns whenever it finds anything at all) from ending
       # the step before the gate has looked at the results.
       - name: Run govulncheck
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: govulncheck -format json ./... > govulncheck.json || true
 
       - name: Gate on non-allowlisted findings
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: bash .github/scripts/govulncheck-gate.sh govulncheck.json
 
   build:
     name: Cross-compile
-    needs: [lint, check]
+    needs: [changes, lint, check]
     # Full tier only, and skippable on top of that by release.yml. `inputs` is
     # empty on the pull request path, so !skip-cross-compile is true there and
     # the tier check is what gates it. Do not rewrite either half as
@@ -133,13 +182,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.go == 'true' }}
       - uses: actions/setup-go@v5
+        if: ${{ needs.changes.outputs.go == 'true' }}
         with:
           go-version: "1.25"
           cache: true
       - name: Build all targets + checksums
+        if: ${{ needs.changes.outputs.go == 'true' }}
         run: make dist
       - uses: actions/upload-artifact@v4
+        if: ${{ needs.changes.outputs.go == 'true' }}
         with:
           name: dist
           path: dist/

@@ -95,12 +95,12 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          OUT="$(helm template pve-rancher-driver deploy/chart \
+          # `if`, not a bare assignment: the shell runs with -e and helm is
+          # expected to fail here.
+          if OUT="$(helm template pve-rancher-driver deploy/chart \
             --set verifyManagementCluster=false \
             --set nodeDriver.checksum=deadbeef \
-            --set nodeDriver.checksumFor=v0.0.0-not-a-real-version 2>&1)"
-          STATUS=$?
-          if [ "$STATUS" -eq 0 ]; then
+            --set nodeDriver.checksumFor=v0.0.0-not-a-real-version 2>&1)"; then
             echo "::error::chart rendered with a mismatched checksum; the checksumFor guard is not firing"
             exit 1
           fi
