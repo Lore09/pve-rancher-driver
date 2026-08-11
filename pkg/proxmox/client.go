@@ -612,6 +612,76 @@ func (c *Client) ResizeBootDisk(ctx context.Context, vmid int, disk string, size
 	return nil
 }
 
+// setDiskProperty sets key=val on a PVE disk property string, replacing the
+// existing setting or appending one.
+//
+// The first element is the volume id ("local-lvm:vm-101-disk-0") and carries no
+// "=", so it is always kept as-is; only the key=value pairs after it are
+// candidates for replacement.
+func setDiskProperty(value, key, val string) string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts)+1)
+	replaced := false
+	for i, part := range parts {
+		if i > 0 && strings.HasPrefix(part, key+"=") {
+			out = append(out, key+"="+val)
+			replaced = true
+			continue
+		}
+		out = append(out, part)
+	}
+	if !replaced {
+		out = append(out, key+"="+val)
+	}
+	return strings.Join(out, ",")
+}
+
+// SetBootDiskBackup includes the given disk in PVE's backups, or excludes it.
+//
+// PVE has no way to set one property of a disk on its own: the whole property
+// string has to be rewritten, so it is read back first. Call this *after*
+// ResizeBootDisk — the resize rewrites size= in that same string, and writing a
+// value read before it would put the old size back.
+func (c *Client) SetBootDiskBackup(ctx context.Context, vmid int, disk string, backup bool) error {
+	if disk == "" {
+		return errors.New("proxmox: disk device is required to set its backup flag")
+	}
+	node, err := c.ResolveNode(ctx)
+	if err != nil {
+		return err
+	}
+	raw := map[string]interface{}{}
+	if err := c.api.Get(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), &raw); err != nil {
+		return fmt.Errorf("proxmox: cannot read vm %d config: %w", vmid, err)
+	}
+	current, ok := raw[disk].(string)
+	if !ok || current == "" {
+		return fmt.Errorf("proxmox: vm %d has no disk %s to set the backup flag on; check --pve-boot-disk-device matches the template's boot disk", vmid, disk)
+	}
+	flag := "0"
+	if backup {
+		flag = "1"
+	}
+	updated := setDiskProperty(current, "backup", flag)
+	if updated == current {
+		return nil
+	}
+	vm, err := c.vm(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	task, err := vm.Config(ctx, proxmox.VirtualMachineOption{Name: disk, Value: updated})
+	if err != nil {
+		return fmt.Errorf("proxmox: setting backup=%s on %s of vm %d failed: %w", flag, disk, vmid, err)
+	}
+	if task != nil {
+		if err := task.Wait(ctx, time.Second, c.waitTimeout()); err != nil {
+			return fmt.Errorf("proxmox: backup-flag task for vm %d did not complete: %w", vmid, err)
+		}
+	}
+	return nil
+}
+
 // buildDiskValue renders the PVE config value for one data disk. The key order
 // is fixed so the value is stable and diffable in tests and in PVE's UI.
 //
