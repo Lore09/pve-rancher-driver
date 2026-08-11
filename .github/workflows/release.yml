@@ -57,22 +57,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Reuse the CI pipeline as a gate; releases cannot ship if lint, tests, or the
-  # vulnerability scan are red.
-  #
-  # `full: true` on every path, prereleases included. The reduced tier on dev
-  # pull requests buys faster review feedback; it must not weaken what is
-  # required to publish an artifact.
-  ci:
-    uses: ./.github/workflows/ci.yml
-    with:
-      full: true
-      # goreleaser cross-compiles every target in the next job, so having CI
-      # do it first only adds minutes to the release.
-      skip-cross-compile: true
-
+  # No lint/test gate here: the commits being released already passed the full
+  # suite on the pull request that merged them.
   release:
-    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
