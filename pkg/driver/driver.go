@@ -123,6 +123,9 @@ type Driver struct {
 	SearchDomain     string
 	CIUser           string
 	SSHKeys          string
+	CICustom         string
+	ExtraConfigEntry []string
+	ExtraConfig      []proxmox.ConfigOption
 	Onboot           bool
 	AgentTimeout     time.Duration
 	CloudInitTimeout time.Duration
@@ -413,6 +416,16 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "PVE_SSHKEYS",
 			Usage:  "Extra OpenSSH public keys injected via cloud-init (one per line, plain text). The driver's own generated key is always added",
 		},
+		mcnflag.StringFlag{
+			Name:   "pve-cicustom",
+			EnvVar: "PVE_CICUSTOM",
+			Usage:  "PVE cicustom value naming cloud-init snippets, e.g. vendor=local:snippets/rancher.yaml. Use vendor= to add packages, certificates or sysctls without rebuilding the template; user= is rejected because it would replace the generated user-data carrying the driver's per-machine SSH key",
+		},
+		mcnflag.StringSliceFlag{
+			Name:   "pve-extra-config",
+			EnvVar: "PVE_EXTRA_CONFIG",
+			Usage:  "Raw PVE VM config key=value applied after every other setting, repeatable, e.g. cpu=host or hostpci0=0000:01:00,pcie=1. Escape hatch for PVE options this driver has no flag for; keys the driver writes itself are rejected",
+		},
 		mcnflag.BoolFlag{
 			Name:   "pve-onboot",
 			EnvVar: "PVE_ONBOOT",
@@ -516,6 +529,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.SearchDomain = strings.TrimSpace(flags.String("pve-searchdomain"))
 	d.CIUser = flags.String("pve-ciuser")
 	d.SSHKeys = flags.String("pve-sshkeys")
+	d.CICustom = strings.TrimSpace(flags.String("pve-cicustom"))
+	d.ExtraConfigEntry = flags.StringSlice("pve-extra-config")
 	d.Onboot = flags.Bool("pve-onboot")
 	d.SkipPermCheck = flags.Bool("pve-skip-permission-check")
 	d.KeepOnFailure = flags.Bool("pve-keep-on-failure")
@@ -633,6 +648,18 @@ func (d *Driver) PreCreateCheck() error {
 			return fmt.Errorf("pve: %s require --pve-net-bridge to be set", strings.Join(orphans, ", "))
 		}
 	}
+	mode, err := parseIPMode(d.IPMode)
+	if err != nil {
+		return err
+	}
+	if err := validateCICustom(d.CICustom, mode == ipModeStatic); err != nil {
+		return err
+	}
+	extra, err := ParseExtraConfig(d.ExtraConfigEntry, d.reservedConfigKeys())
+	if err != nil {
+		return err
+	}
+	d.ExtraConfig = extra
 	if err := d.init(); err != nil {
 		return err
 	}
@@ -642,6 +669,59 @@ func (d *Driver) PreCreateCheck() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return d.client.VerifyPermissions(ctx)
+}
+
+// reservedConfigKeys are the PVE config keys this driver writes itself, mapped
+// to the flag that owns each one so a rejected --pve-extra-config entry names
+// the field to edit instead.
+//
+// Only keys actually written for *this* configuration are listed: with no
+// bridge named the NIC is left alone and net0 is fair game, and without a boot
+// disk resize nothing touches the boot device. Reserving them unconditionally
+// would refuse entries that are perfectly safe.
+func (d *Driver) reservedConfigKeys() map[string]string {
+	reserved := map[string]string{
+		// Not tied to a flag: IP discovery goes through the guest agent on
+		// every path, so the driver forces the channel on regardless.
+		"agent":       "the driver itself (guest agent is required for IP discovery)",
+		"name":        "--pve-vm-name-prefix",
+		"cores":       "--pve-cores",
+		"sockets":     "--pve-sockets",
+		"memory":      "--pve-memory",
+		"onboot":      "--pve-onboot",
+		"tags":        "--pve-tags",
+		"description": "--pve-description",
+	}
+	if d.CloudInit {
+		reserved["ipconfig0"] = "--pve-ip-mode"
+		reserved["nameserver"] = "--pve-nameservers"
+		reserved["searchdomain"] = "--pve-searchdomain"
+		reserved["ciuser"] = "--pve-ciuser"
+		reserved["sshkeys"] = "--pve-sshkeys"
+		reserved["cicustom"] = "--pve-cicustom"
+	}
+	// The MAC that pins IP discovery is read back off this device after
+	// Configure, so an override here would send the driver looking for an
+	// address on a NIC that no longer exists.
+	if d.NetBridge != "" {
+		device := strings.ToLower(strings.TrimSpace(d.NetDevice))
+		if device == "" {
+			device = "net0"
+		}
+		reserved[device] = "--pve-net-bridge"
+	}
+	if d.BootDiskGB > 0 {
+		reserved[strings.ToLower(d.BootDiskDevice)] = "--pve-boot-disk-size"
+	}
+	// Data disks with no explicit device= are assigned a free slot by scanning
+	// the live config, which already sees anything set here — only the pinned
+	// ones can collide.
+	for _, disk := range d.DataDisks {
+		if disk.Device != "" {
+			reserved[strings.ToLower(disk.Device)] = "--pve-data-disk device=" + disk.Device
+		}
+	}
+	return reserved
 }
 
 func (d *Driver) init() error {
@@ -768,6 +848,8 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 		NetVlanTag:   d.NetVlanTag,
 		NetMTU:       d.NetMTU,
 		NetFirewall:  firewall,
+		CICustom:     d.CICustom,
+		Extra:        d.ExtraConfig,
 	}
 	opts.CIUser = d.resolveCIUser()
 	if d.CloudInit {
@@ -786,6 +868,12 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	}
 	if ipConfig != "ip=dhcp" {
 		log.Infof("pve: VM %d configured with static %s", d.VMID, ipConfig)
+	}
+	if d.CICustom != "" {
+		log.Infof("pve: VM %d takes cloud-init from %s (--pve-cicustom)", d.VMID, d.CICustom)
+	}
+	for _, extra := range d.ExtraConfig {
+		log.Infof("pve: VM %d set %s=%s (--pve-extra-config)", d.VMID, extra.Key, extra.Value)
 	}
 
 	// Grow the boot disk before AddDisks: slot allocation scans the live config
