@@ -102,6 +102,7 @@ type Driver struct {
 	Sockets          int
 	MemoryMB         int
 	BootDiskGB       int
+	Backup           string
 	DataDiskEntries  []string
 	DataDisks        []proxmox.DiskSpec
 	DiskSetupTimeout time.Duration
@@ -296,6 +297,15 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "PVE_BOOT_DISK_DEVICE",
 			Usage:  "PVE config key of the boot disk grown by pve-boot-disk-size, e.g. scsi0, virtio0, sata0",
 			Value:  defaultBootDiskDevice,
+		},
+		// Tri-state rather than a BoolFlag: an unset BoolFlag is
+		// indistinguishable from an explicit false, so a machine pool created
+		// before this flag existed would read as "exclude from backups" and
+		// silently drop every node out of the backup job.
+		mcnflag.StringFlag{
+			Name:   "pve-backup",
+			EnvVar: "PVE_BACKUP",
+			Usage:  "true/false to include the boot disk in PVE backups; empty keeps whatever the template set (PVE includes disks by default). Data disks have their own backup= key on pve-data-disk",
 		},
 		mcnflag.StringSliceFlag{
 			Name:   "pve-data-disk",
@@ -495,6 +505,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	if d.BootDiskDevice == "" {
 		d.BootDiskDevice = defaultBootDiskDevice
 	}
+	d.Backup = strings.TrimSpace(flags.String("pve-backup"))
 	d.DataDiskEntries = flags.StringSlice("pve-data-disk")
 	d.NetIface = flags.String("pve-net-iface")
 	d.NetDevice = flags.String("pve-net-device")
@@ -630,6 +641,9 @@ func (d *Driver) PreCreateCheck() error {
 	if _, ferr := parseNetFirewall(d.NetFirewall); ferr != nil {
 		return ferr
 	}
+	if _, berr := parseTriState("--pve-backup", d.Backup); berr != nil {
+		return berr
+	}
 	// The pve-net-* knobs are only ever applied as part of rewriting the net
 	// device, which is gated on a bridge being named. Silently ignoring them
 	// would look like the driver honoured a VLAN it never set, so fail loudly.
@@ -712,6 +726,9 @@ func (d *Driver) reservedConfigKeys() map[string]string {
 	}
 	if d.BootDiskGB > 0 {
 		reserved[strings.ToLower(d.BootDiskDevice)] = "--pve-boot-disk-size"
+	}
+	if d.Backup != "" {
+		reserved[strings.ToLower(d.BootDiskDevice)] = "--pve-backup"
 	}
 	// Data disks with no explicit device= are assigned a free slot by scanning
 	// the live config, which already sees anything set here — only the pinned
@@ -884,6 +901,22 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 			return err
 		}
 		log.Infof("pve: grew boot disk %s of VM %d to %dGB", d.BootDiskDevice, d.VMID, d.BootDiskGB)
+	}
+
+	// After the resize, never before: the resize rewrites size= in the same
+	// property string this reads back and re-sends, so doing it first would put
+	// the pre-resize size back.
+	if backup, err := parseTriState("--pve-backup", d.Backup); err != nil {
+		return err
+	} else if backup != nil {
+		if err := d.client.SetBootDiskBackup(ctx, d.VMID, d.BootDiskDevice, *backup); err != nil {
+			return err
+		}
+		if *backup {
+			log.Infof("pve: boot disk %s of VM %d is included in PVE backups", d.BootDiskDevice, d.VMID)
+		} else {
+			log.Infof("pve: boot disk %s of VM %d is excluded from PVE backups (--pve-backup=false)", d.BootDiskDevice, d.VMID)
+		}
 	}
 
 	attached, err := d.client.AddDisks(ctx, d.VMID, d.DataDisks)
@@ -1156,6 +1189,13 @@ func (d *Driver) validateVMNamePrefix() error {
 // that third state, and defaulting to false would silently disable a firewall
 // the template had enabled.
 func parseNetFirewall(s string) (*bool, error) {
+	return parseTriState("--pve-net-firewall", s)
+}
+
+// parseTriState parses a flag whose three states are "leave PVE's own default
+// alone" (empty), true and false — which a plain BoolFlag cannot express, since
+// an unset one is indistinguishable from an explicit false.
+func parseTriState(flag, s string) (*bool, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "":
 		return nil, nil
@@ -1166,7 +1206,7 @@ func parseNetFirewall(s string) (*bool, error) {
 		v := false
 		return &v, nil
 	}
-	return nil, fmt.Errorf("pve: --pve-net-firewall must be true or false, got %q", s)
+	return nil, fmt.Errorf("pve: %s must be true or false, got %q", flag, s)
 }
 
 // ensureSSHKeyPair creates the docker-machine SSH keypair at GetSSHKeyPath()

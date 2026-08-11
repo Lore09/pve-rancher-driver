@@ -413,3 +413,38 @@ func TestCloneOptionsDropStorageAndFormatForLinkedClones(t *testing.T) {
 		})
 	}
 }
+
+func TestSetDiskProperty(t *testing.T) {
+	for name, tc := range map[string]struct {
+		value, key, val, want string
+	}{
+		"appends when absent": {
+			"local-lvm:vm-101-disk-0,iothread=1,size=20G", "backup", "0",
+			"local-lvm:vm-101-disk-0,iothread=1,size=20G,backup=0",
+		},
+		"replaces in place, preserving order": {
+			"local-lvm:vm-101-disk-0,backup=1,size=20G", "backup", "0",
+			"local-lvm:vm-101-disk-0,backup=0,size=20G",
+		},
+		"volume id is never treated as a pair": {
+			"local-lvm:vm-101-disk-0", "backup", "1",
+			"local-lvm:vm-101-disk-0,backup=1",
+		},
+		// A volume id can itself contain the key as a substring; only a real
+		// key=value pair after the first element may be replaced.
+		"substring in the volume id is left alone": {
+			"backups:vm-101-disk-0,size=20G", "backup", "0",
+			"backups:vm-101-disk-0,size=20G,backup=0",
+		},
+		"no change when already correct": {
+			"local-lvm:vm-101-disk-0,backup=1", "backup", "1",
+			"local-lvm:vm-101-disk-0,backup=1",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := setDiskProperty(tc.value, tc.key, tc.val); got != tc.want {
+				t.Errorf("setDiskProperty(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
