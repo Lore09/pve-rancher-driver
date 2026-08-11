@@ -29,7 +29,8 @@ metadata:
     privateCredentialFields: "apiTokenSecret"
     passwordFields: "apiTokenSecret"
 spec:
-  displayName: "Proxmox VE (pve)"
+  # Must equal metadata.name: Rancher derives the provider id from this.
+  displayName: "pve"
   description: "Provision RKE2/K3s nodes as Proxmox VE virtual machines cloned from a template"
   active: true
   addCloudCredential: true

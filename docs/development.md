@@ -128,9 +128,9 @@ The branch decides what kind of release you get:
 3. Calls [`release.yml`](../.github/workflows/release.yml), which runs CI as a
    gate, builds the binaries with goreleaser, renders
    `nodedriver-<version>.yaml`, and publishes the GitHub release.
-4. **On `master` only**, commits the new binary's SHA-256 back into
-   `deploy/chart/values.yaml`, since the digest cannot exist until the binary is
-   built, then fast-forwards `dev` onto that commit.
+4. Commits the new binary's SHA-256 into `deploy/chart/values.yaml` — onto
+   `dev` for a prerelease, onto `master` for a stable release, which then also
+   merges `master` back into `dev`.
 
 ### Cutting a dev build
 
@@ -143,12 +143,15 @@ Install a dev build with the attached manifest, not with Helm:
 kubectl apply -f nodedriver-v0.8.0-dev.yaml
 ```
 
-**The chart is not installable from `dev`.** `values.yaml` there still carries
-the last *stable* release's digest, and the chart deliberately refuses to render
-against a mismatched checksum rather than leaving a driver stuck in
-`Downloading`. That is also why step 4 above is skipped for prereleases: writing
-`checksumFor: v0.8.0-dev` against a chart declaring `0.8.0` would trip that same
-guard. Helm installs come from `master`.
+Or install the chart from `dev`, naming the dev version explicitly:
+
+```bash
+helm install pve-rancher-driver ./deploy/chart --set nodeDriver.version=v0.8.0-dev
+```
+
+The prerelease records its digest into `values.yaml` on `dev`, so the checksum
+is already correct. Without that `--set` the chart refuses to render, because
+its `appVersion` claims `0.8.0` and no such release exists yet.
 
 ### Promoting to stable
 
