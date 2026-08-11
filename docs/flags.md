@@ -200,8 +200,32 @@ storage that clone fails with a Proxmox-side error naming the mismatch.
 |------|---------|-------------|
 | `pve-boot-disk-size` | `0` | Grow the cloned boot disk to this size in GB (`0` = keep the template's size). PVE can only grow a disk, never shrink it |
 | `pve-boot-disk-device` | `scsi0` | PVE config key of the boot disk grown by `pve-boot-disk-size` (`scsi0`, `virtio0`, `sata0`, ...) |
+| `pve-backup` | *(empty)* | `true`/`false` to include the boot disk in PVE backups. Empty keeps whatever the template set. See below |
 | `pve-data-disk` | *(empty)* | Data disk to attach; **repeatable**. Grammar below |
 | `pve-disk-setup-timeout` | `300` | Seconds to wait for SSH plus formatting and mounting of the data disks |
+
+### `pve-backup`
+
+Whether a VM is picked up by a PVE backup job is a property of each of its
+disks, not of the VM. `pve-backup` sets it on the boot disk; data disks carry
+their own `backup=` key on `pve-data-disk`.
+
+| Value | Effect |
+|---|---|
+| *(empty)* | Leaves the setting the clone inherited from the template |
+| `true` | Includes the boot disk, whatever the template said |
+| `false` | Excludes it |
+
+Empty is not the same as `true`. A clone inherits the template's disk
+properties, so a template built with backups switched off produces nodes with
+backups off — `true` is how you override that rather than merely restate PVE's
+default.
+
+Worth deciding deliberately for a Kubernetes node. A worker's boot disk holds
+no unique state, and backing up every node in a pool multiplies backup storage
+by the node count for something a rebuild reproduces in minutes. Control-plane
+nodes carry etcd, but Rancher's own etcd snapshots are the supported way to
+recover those.
 
 ### `pve-data-disk` grammar
 
