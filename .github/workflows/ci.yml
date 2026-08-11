@@ -1,18 +1,12 @@
 name: CI
 
-# Pull requests only. Once branch protection requires a green PR, re-running the
-# same commits on merge proves nothing, and release.yml still calls this
-# workflow as its gate — so nothing is ever published unlinted.
+# Pull requests only. Merges cannot happen without a green pull request, so
+# re-running the same commits afterwards proves nothing.
 #
 # CHECK TIERS
 # -----------
-# PR -> dev    lint, vet, tests            (fast feedback on feature work)
+# PR -> dev    lint, vet, tests   (fast feedback on feature work)
 # PR -> master the above + govulncheck + cross-compile
-# release gate everything, via `full: true` from release.yml
-#
-# The dev tier keeps `go test` deliberately. dev is where all feature work
-# lands; lint-only there means a broken test merges cleanly and surfaces at
-# release time, when the fix has to travel through another pull request.
 #
 # NOTE: there is no `paths-ignore` here. GitHub reports a skipped workflow's
 # checks as *missing* rather than passing, so filtering out chart-only pull
@@ -21,31 +15,8 @@ name: CI
 on:
   pull_request:
     branches: [master, dev]
-  workflow_call:
-    inputs:
-      full:
-        description: >-
-          Run the full tier regardless of the target branch. Set by release.yml
-          so every published artifact is gated on the complete suite.
-        type: boolean
-        default: false
-      skip-cross-compile:
-        description: >-
-          Skip the cross-compile job. Set by release.yml: goreleaser rebuilds
-          every target minutes later, so `make dist` there is pure duplicate
-          work on the critical path of a release.
-        type: boolean
-        default: false
 
-# The workflow name is part of the group on purpose.
-#
-# For a reusable workflow, github.workflow is the *calling* workflow's name, so
-# a release's gate run lands in `ci-Chart Release-...` while a pull request run
-# stays in `ci-CI-...`. Without that, the two runs share a github.ref and
-# cancel-in-progress kills one of them — visible as jobs that start and
-# immediately go grey, and at worst as a release whose gate was cancelled out
-# from under it. Superseding still works where it should: a new push to the same
-# pull request cancels the previous run.
+# A new push to the same pull request cancels the previous run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -68,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Anything that is not a pull request (the release gate) runs in full.
+          # Safety net: anything that is not a pull request runs in full.
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
@@ -132,11 +103,8 @@ jobs:
   vuln:
     name: govulncheck
     needs: changes
-    # Full tier only. github.base_ref is the pull request's target branch and is
-    # empty on the workflow_call path; inputs.full is null on the pull request
-    # path. Do not rewrite as `github.event_name == 'workflow_call'` — on the
-    # reusable-workflow path event_name reports the *caller's* event (push).
-    if: ${{ github.base_ref == 'master' || inputs.full }}
+    # Master-tier only.
+    if: ${{ github.base_ref == 'master' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -173,12 +141,8 @@ jobs:
   build:
     name: Cross-compile
     needs: [changes, lint, check]
-    # Full tier only, and skippable on top of that by release.yml. `inputs` is
-    # empty on the pull request path, so !skip-cross-compile is true there and
-    # the tier check is what gates it. Do not rewrite either half as
-    # `== false`: GitHub coerces both null and false to 0, so that form would
-    # skip the job unconditionally.
-    if: ${{ (github.base_ref == 'master' || inputs.full) && !inputs.skip-cross-compile }}
+    # Master-tier only.
+    if: ${{ github.base_ref == 'master' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
