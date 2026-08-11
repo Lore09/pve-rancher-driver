@@ -325,6 +325,7 @@ hand the machine back immediately.
 | `pve-sshkeys` | *(empty)* | Extra OpenSSH public keys, one per line. The machine's own generated key is always injected as well |
 | `pve-ssh-user` | `root` | Account the driver and Rancher log in as. **Must be a user that exists in the guest** — `debian` for Debian's cloud image, `rancher` for Leap Micro. The `root` default works with neither |
 | `pve-ssh-port` | `22` | SSH port |
+| `pve-cicustom` | *(empty)* | PVE `cicustom` value naming cloud-init snippets, e.g. `vendor=local:snippets/rancher.yaml`. See below |
 
 `pve-ciuser` and `pve-ssh-user` are the same account: cloud-init installs the SSH
 keys for `ciuser`, and that is the only account anything can subsequently log
@@ -397,6 +398,95 @@ exceeds it.
 DNS (`pve-nameservers`, `pve-searchdomain`) requires `pve-cloudinit` in either
 mode, because PVE applies `nameserver`/`searchdomain` as cloud-init options and
 would otherwise drop them silently.
+
+### `pve-cicustom`
+
+Everything above configures cloud-init through the fields PVE exposes. That
+covers identity, addressing and DNS, and nothing else: adding a package,
+trusting a private registry's CA, or setting a sysctl means rebuilding the
+template. `pve-cicustom` points PVE at a snippet file instead, so the same
+template can be shared by pools that need different guest configuration.
+
+The value is PVE's own `cicustom` property string — comma-separated
+`<type>=<volume>` pairs — and the volume must live on a storage with the
+**`snippets`** content type enabled:
+
+```
+--pve-cicustom vendor=local:snippets/rancher.yaml
+--pve-cicustom vendor=local:snippets/rancher.yaml,meta=local:snippets/meta.yaml
+```
+
+Upload the file yourself, once, to `/var/lib/vz/snippets/` on the PVE node (or
+through **Datacenter → Storage → *storage* → Snippets** in the UI). The driver
+only references it.
+
+**Use `vendor=`, not `user=`.** They are not interchangeable:
+
+| Type | Behaviour |
+|---|---|
+| `vendor` | PVE generates no vendor-data of its own, so yours is **merged** with the generated user-data. This is the one to use |
+| `meta` | Replaces the generated meta-data. Rarely needed |
+| `network` | Replaces the network config PVE renders from `ipconfig0`. **Rejected** with `pve-ip-mode=static`, which is exactly that config; allowed under `dhcp` |
+| `user` | **Rejected.** It replaces the generated user-data entirely, and that is the only thing carrying `ciuser` and the SSH key. The key is generated per machine, so no snippet written in advance can contain it, and the node would boot with nobody able to log in |
+
+A `users:` directive in your snippet will not run. Cloud-init's `users` module
+runs once per instance and PVE's generated user-data has already used it to
+create `pve-ciuser`. Create accounts with `runcmd` instead, or add keys to the
+existing user with `pve-sshkeys`.
+
+Every machine reads the snippet as it boots, so it has to be there. A missing
+file, or a storage the machine's node cannot reach, produces a guest that never
+finishes configuring. Unless the storage is shared, put the snippet on every
+node in `pve-allowed-nodes`.
+
+The API token needs no privilege beyond the ones
+[rancher-setup.md](rancher-setup.md#restricting-the-token-to-a-resource-pool)
+already grants.
+
+## Additional PVE options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `pve-extra-config` | *(empty)* | Raw PVE VM config `key=value`; **repeatable**. See below |
+
+`pve-extra-config` sets a PVE config key directly, for the options this driver
+has no flag of its own for. Keys are applied after the VM is cloned and before
+it is started, so options that only take effect at boot still apply:
+
+```
+--pve-extra-config cpu=host
+--pve-extra-config numa=1
+--pve-extra-config balloon=0
+--pve-extra-config hostpci0=0000:01:00,pcie=1
+--pve-extra-config startup=order=1,up=30
+```
+
+The full key list is `man qm.conf`, or the PVE API docs for
+`PUT /nodes/{node}/qemu/{vmid}/config` — this driver does not interpret the
+value, it forwards it.
+
+Each occurrence is **one** key, split on its first `=` only. That is what lets
+values contain commas and further `=` signs (`hostpci0` and `startup` above),
+which most PVE property strings do.
+
+**Keys the driver sets itself are rejected**, naming the flag to use instead:
+`name`, `cores`, `sockets`, `memory`, `onboot`, `tags`, `description`,
+`ipconfig0`, `nameserver`, `searchdomain`, `ciuser`, `sshkeys` and `cicustom`.
+`agent` is rejected outright — IP discovery goes through the QEMU guest agent,
+so the driver enables it on every machine.
+
+Three more are rejected only while the flag that owns them is in use, and are
+otherwise yours to set here:
+
+| Key | Reserved while |
+|---|---|
+| The NIC named by `pve-net-device` | `pve-net-bridge` is set. With no bridge, `net0=...` here is a valid way to define the NIC |
+| The device named by `pve-boot-disk-device` | `pve-boot-disk-size` is growing it |
+| A `scsi<N>` slot | A `pve-data-disk` pins it with `device=`. Data disks without one take the next free slot, so they move out of the way of a slot set here |
+
+Values are not validated — this driver forwards them. A key PVE does not
+recognise, or a value it rejects, fails provisioning and the machine is removed;
+the PVE error naming the key appears in the machine's provisioning log.
 
 ## Debugging
 
