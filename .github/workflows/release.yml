@@ -230,9 +230,10 @@ jobs:
           fi
 
           git add "$VALUES"
-          # [skip ci] keeps this from re-running the CI workflow; the path filter
-          # in chart-release.yml already prevents a release loop.
-          git commit -m "chore(chart): record ${VERSION} binary checksum [skip ci]"
+          # No [skip ci]: CI runs on pull requests only, and the marker would
+          # also suppress the checks on a promotion pull request whose head is
+          # this commit, leaving them stuck at "Expected".
+          git commit -m "chore(chart): record ${VERSION} binary checksum"
           git push origin "HEAD:$TARGET"
 
       # Bring the checksum commit into dev: fast-forward if dev has nothing of
