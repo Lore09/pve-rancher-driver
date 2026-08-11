@@ -510,6 +510,9 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 		if opts.SSHKeys != "" {
 			options = append(options, proxmox.VirtualMachineOption{Name: "sshkeys", Value: opts.SSHKeys})
 		}
+		if opts.CICustom != "" {
+			options = append(options, proxmox.VirtualMachineOption{Name: "cicustom", Value: opts.CICustom})
+		}
 	}
 	// Rewriting net<N> without an explicit macaddr= makes PVE generate a fresh
 	// MAC for the device. That is safe here only because the driver captures
@@ -520,6 +523,9 @@ func (c *Client) Configure(ctx context.Context, vmid int, opts VMOptions) error 
 			Name:  netDeviceKey(opts.NetDevice),
 			Value: buildNetValue(opts),
 		})
+	}
+	for _, extra := range opts.Extra {
+		options = append(options, proxmox.VirtualMachineOption{Name: extra.Key, Value: extra.Value})
 	}
 	if len(options) == 0 {
 		return nil
@@ -938,6 +944,24 @@ type VMOptions struct {
 	// NetFirewall toggles the PVE firewall on the NIC; nil leaves it at the
 	// PVE default.
 	NetFirewall *bool
+
+	// CICustom is PVE's `cicustom` config value, naming snippets that supply
+	// cloud-init parts (`vendor=local:snippets/rancher.yaml`). Only applied
+	// with CloudInit set, since it is meaningless without the cloud-init drive.
+	CICustom string
+
+	// Extra are raw PVE config keys passed straight through from
+	// --pve-extra-config. They are applied last, but the caller has already
+	// rejected any key the fields above own, so the order is not load-bearing.
+	Extra []ConfigOption
+}
+
+// ConfigOption is one raw PVE VM config key/value. A slice rather than a map
+// because the order the operator wrote them in is the order they are applied,
+// which keeps a failing request readable against the flags that produced it.
+type ConfigOption struct {
+	Key   string
+	Value string
 }
 
 // ---------- PVE version + permission probe ----------
