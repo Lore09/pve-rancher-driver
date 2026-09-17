@@ -86,6 +86,8 @@ type Driver struct {
 	CACertPEM        string
 	Node             string
 	AllowedNodes     string
+	HA               bool
+	HAGroup          string
 	VMID             int
 	VMIDRange        string
 	TemplateVMID     int
@@ -204,6 +206,19 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "pve-allowed-nodes",
 			EnvVar: "PVE_ALLOWED_NODES",
 			Usage:  "Comma-separated PVE node names the driver may place new VMs on, e.g. pve1,pve2. Empty considers every online node in the cluster. Ignored (and rejected) if pve-node is set. The driver picks the candidate with the most free memory; on a single-node install this has no effect",
+		},
+		// A plain BoolFlag, unlike pve-backup: "unset" and "false" mean the
+		// same thing here — no HA resource, which is what every machine pool
+		// created before this flag existed already got.
+		mcnflag.BoolFlag{
+			Name:   "pve-ha",
+			EnvVar: "PVE_HA",
+			Usage:  "Register each VM as a cluster HA resource, so the HA manager restarts it if its host fails and the CRS scheduler may rebalance it across nodes. Requires a PVE cluster with HA configured, and Sys.Console on / for the API token",
+		},
+		mcnflag.StringFlag{
+			Name:   "pve-ha-group",
+			EnvVar: "PVE_HA_GROUP",
+			Usage:  "HA group the resource joins, constraining which nodes it may run on. Requires pve-ha. Empty lets HA use every node. Note PVE deprecates HA groups in favour of HA rules",
 		},
 		mcnflag.IntFlag{
 			Name:   "pve-vmid",
@@ -482,6 +497,8 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.CACertPEM = flags.String("pve-ca-cert")
 	d.Node = flags.String("pve-node")
 	d.AllowedNodes = strings.TrimSpace(flags.String("pve-allowed-nodes"))
+	d.HA = flags.Bool("pve-ha")
+	d.HAGroup = strings.TrimSpace(flags.String("pve-ha-group"))
 	d.VMID = flags.Int("pve-vmid")
 	d.VMIDRange = strings.TrimSpace(flags.String("pve-vmid-range"))
 	d.TemplateVMID = flags.Int("pve-template-vmid")
@@ -612,6 +629,16 @@ func (d *Driver) PreCreateCheck() error {
 	if d.Node != "" && d.AllowedNodes != "" {
 		return fmt.Errorf("pve: --pve-node %q and --pve-allowed-nodes %q are mutually exclusive; --pve-node already pins a single node", d.Node, d.AllowedNodes)
 	}
+	// Same reasoning as the pve-net-* block below: silently ignoring a group
+	// would look like the driver had honoured a placement constraint it never
+	// sent.
+	if d.HAGroup != "" && !d.HA {
+		return fmt.Errorf("pve: --pve-ha-group %q requires --pve-ha; without it no HA resource is created for the group to apply to", d.HAGroup)
+	}
+	// HA group ids take the same character set as pool ids.
+	if d.HAGroup != "" && !pvePoolPattern.MatchString(d.HAGroup) {
+		return fmt.Errorf("pve: --pve-ha-group %q is not a valid PVE HA group id; use letters, digits, and _ . -", d.HAGroup)
+	}
 	if err := d.validateAddressing(); err != nil {
 		return err
 	}
@@ -682,7 +709,14 @@ func (d *Driver) PreCreateCheck() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return d.client.VerifyPermissions(ctx)
+	// Sys.Console is asked for only when HA is on: it is what the
+	// /cluster/ha endpoints require, and demanding it of everyone would fail
+	// this check for every operator who never asked for HA.
+	var extraPrivs []string
+	if d.HA {
+		extraPrivs = append(extraPrivs, "Sys.Console")
+	}
+	return d.client.VerifyPermissions(ctx, extraPrivs...)
 }
 
 // reservedConfigKeys are the PVE config keys this driver writes itself, mapped
@@ -965,6 +999,22 @@ func (d *Driver) finalizeCreate(ctx context.Context, vmName string) error {
 	if len(d.DataDisks) > 0 {
 		if err := d.setupGuestDisks(attached); err != nil {
 			return err
+		}
+	}
+
+	// Deliberately the last thing that can fail: Create's rollback destroys
+	// the VM but knows nothing about cluster-level config, so registering any
+	// earlier would let a later failure leave an HA entry behind pointing at
+	// a VMID that no longer exists — and that stale entry would then be
+	// inherited by whichever machine is given that id next.
+	if d.HA {
+		if err := d.client.AddHAResource(ctx, d.VMID, d.HAGroup); err != nil {
+			return err
+		}
+		if d.HAGroup != "" {
+			log.Infof("pve: VM %d registered as HA resource vm:%d in group %q (--pve-ha)", d.VMID, d.VMID, d.HAGroup)
+		} else {
+			log.Infof("pve: VM %d registered as HA resource vm:%d (--pve-ha)", d.VMID, d.VMID)
 		}
 	}
 
@@ -1315,6 +1365,20 @@ func (d *Driver) Remove() error {
 		return nil
 	}
 	ctx := context.Background()
+
+	// Before the force-stop, not after: while the HA resource exists the HA
+	// manager owns this guest's power state and simply restarts whatever the
+	// driver stopped, so a cluster teardown would take away every Rancher
+	// resource and leave the VMs running — the very failure the force-stop
+	// below exists to prevent. Removing the entry also keeps resources.cfg
+	// from accumulating dangling sids.
+	if d.HA {
+		if err := d.client.RemoveHAResource(ctx, d.VMID); err != nil {
+			log.Warnf("pve: removing the HA resource of VM %d failed: %v; attempting removal anyway", d.VMID, err)
+		} else {
+			log.Infof("pve: removed HA resource vm:%d before deleting the VM", d.VMID)
+		}
+	}
 
 	switch st, err := d.GetState(); {
 	case err != nil:

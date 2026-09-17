@@ -365,7 +365,7 @@ func TestCreateFlagsDeriveExpectedFieldNames(t *testing.T) {
 		"templateVmid", "dataDisk", "netBridge", "cloudinit",
 		"sshUser", "sshPort", "vmNamePrefix", "bootDiskSize",
 		"templateTag", "templateTagMatch", "cloneStorage", "cloneFormat",
-		"description", "cloudinitTimeout",
+		"description", "cloudinitTimeout", "ha", "haGroup",
 	} {
 		if !got[want] {
 			t.Errorf("no flag derives the machine-config field %q that the UI extension binds to", want)
@@ -539,6 +539,44 @@ func TestPreCreateCheckNodeAndAllowedNodesMutuallyExclusive(t *testing.T) {
 	d.AllowedNodes = "pve1,pve2"
 	if err := d.PreCreateCheck(); err != nil {
 		t.Errorf("PreCreateCheck() with only --pve-allowed-nodes set returned error: %v", err)
+	}
+}
+
+func TestPreCreateCheckHAGroup(t *testing.T) {
+	base := func() *Driver {
+		return &Driver{
+			APIUrl:         "https://pve.example:8006/api2/json",
+			APITokenID:     "rancher@pve!machine",
+			APITokenSecret: "secret",
+			TemplateVMID:   9000,
+			SkipPermCheck:  true,
+		}
+	}
+
+	d := base()
+	d.HAGroup = "prod"
+	if err := d.PreCreateCheck(); err == nil {
+		t.Fatal("PreCreateCheck() = nil, want an error for --pve-ha-group without --pve-ha")
+	}
+
+	d = base()
+	d.HA = true
+	d.HAGroup = "prod nodes"
+	if err := d.PreCreateCheck(); err == nil {
+		t.Fatal("PreCreateCheck() = nil, want an error for an HA group id containing a space")
+	}
+
+	d = base()
+	d.HA = true
+	d.HAGroup = "prod_1.a-b"
+	if err := d.PreCreateCheck(); err != nil {
+		t.Errorf("PreCreateCheck() with a valid HA group returned error: %v", err)
+	}
+
+	d = base()
+	d.HA = true
+	if err := d.PreCreateCheck(); err != nil {
+		t.Errorf("PreCreateCheck() with --pve-ha and no group returned error: %v", err)
 	}
 }
 
