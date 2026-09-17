@@ -45,6 +45,45 @@ be created in is a property of the token's ACL — a token scoped to
 | `pve-description` | *(default text)* | VM Notes field. Empty writes a line naming the machine, the template it came from and the driver. See below |
 | `pve-vm-name-prefix` | *(empty)* | Prefix for the PVE VM name, rendered as `<prefix>-<machine name>`. Empty uses the machine name unchanged. Letters, digits and inner hyphens only — PVE validates the result as a DNS name, and the whole name must fit 63 characters |
 | `pve-onboot` | `false` | Start the VM automatically when the PVE host boots |
+| `pve-ha` | `false` | Register each VM as a cluster HA resource, so HA restarts it elsewhere if its host fails and CRS may rebalance it. Needs `Sys.Console` on `/`. See below |
+| `pve-ha-group` | *(empty)* | HA group the resource joins. Requires `pve-ha`. Empty lets HA use every node. See below |
+
+### `pve-ha` and `pve-ha-group`
+
+HA membership is cluster state, not VM config: it lives in
+`/etc/pve/ha/resources.cfg`, not in the guest's own `.conf`. A template
+therefore cannot carry it, and no amount of template preparation will make a
+clone come out HA-managed — it takes an explicit call per VM, which is what
+`pve-ha` does once the machine is up.
+
+Registering is also what makes a node eligible for the **CRS** scheduler
+(Proxmox's dynamic load balancing): CRS only ever moves HA resources. The
+driver sends just the resource id and lets PVE default the rest, which means
+`state=started` and `auto-rebalance=1` — the settings CRS needs. Restart and
+relocate limits stay at PVE's defaults too; change them in Proxmox afterwards
+if you need to, the driver never rewrites an existing resource.
+
+`pve-ha-group` constrains which nodes the resource may run on. Note that
+Proxmox has deprecated HA groups in favour of HA rules; the flag stays because
+groups remain the only placement constraint available on PVE 8 and 9. Leaving
+it empty is the common case for a Rancher pool — the point of HA here is that
+any node can host the VM.
+
+Two things to know before turning it on:
+
+- **The token needs `Sys.Console` on `/`**, which the `/cluster/ha` endpoints
+  require. The driver asks for it in `PreCreateCheck` **only** when `pve-ha`
+  is set, so leaving the flag off keeps the privilege set unchanged.
+- **HA owns the guest's power state.** Stopping or restarting an HA-managed
+  node from Rancher or by hand fights the HA manager, which restarts what you
+  stopped: state `started` is a promise the CRM keeps. Use
+  `ha-manager set vm:<id> --state stopped` if you need a node down for a while.
+  Deletion is handled — the driver removes the HA resource before it stops and
+  destroys the VM, so a cluster teardown does not leave running VMs behind or
+  stale entries in `resources.cfg`.
+
+HA also needs a real cluster: on a single-node install there is nothing to fail
+over to, and PVE rejects the registration.
 
 ### How VMIDs are allocated
 

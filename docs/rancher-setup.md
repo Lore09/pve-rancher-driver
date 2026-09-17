@@ -239,6 +239,8 @@ driver flag shows up as a form field; the ones that matter first:
 | Cloud-init timeout | `pve-cloudinit-timeout` | Seconds to wait for `cloud-init status --wait` inside the guest before handing the machine to Rancher (default 300, `0` skips). This is the real readiness check that Provision delay only approximates — see [flags.md](flags.md#pve-cloudinit-timeout) |
 | Provision delay | `pve-provision-delay` | Seconds to wait after the VM is up before Rancher provisions it (default 30). Largely redundant once Cloud-init timeout is on, and can be lowered or set to 0; raise it if bootstrap still fails against a guest whose network is not ready yet — see [flags.md](flags.md#pve-provision-delay) |
 | On boot | `pve-onboot` | Autostart VM with the PVE host |
+| HA managed | `pve-ha` | Register the VM as a cluster HA resource: HA restarts it on another node if its host fails, and CRS may rebalance it. Multi-node clusters only; needs `Sys.Console` on `/`. See [flags.md](flags.md#pve-ha-and-pve-ha-group) |
+| HA group | `pve-ha-group` | Optional group constraining which nodes the resource may run on. Requires **HA managed** |
 
 One pool per role (control-plane, etcd, worker) is normal; workers are where
 data disks usually go.
@@ -417,6 +419,8 @@ pveum role add RancherPVENode -privs "VM.Allocate,VM.Audit,VM.PowerMgmt,VM.Confi
 # Replace 9000 with your template's VMID.
 pveum role add RancherPVETemplateReader -privs "VM.Audit,VM.Clone"
 
+# Add Sys.Console to this role as well if you intend to use pve-ha: the
+# /cluster/ha endpoints require it, and HA config is cluster-wide.
 pveum role add RancherPVECluster -privs "Sys.Audit,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
 
 pveum user add rancher@pve

@@ -65,7 +65,7 @@ jobs:
       - uses: actions/setup-go@v5
         if: ${{ needs.changes.outputs.go == 'true' }}
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
       # golangci-lint v2 + action v8. v1 cannot parse a `go 1.25.0` directive
       # and is no longer released, so the Go toolchain bump forced this. The
@@ -76,7 +76,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         if: ${{ needs.changes.outputs.go == 'true' }}
         with:
-          version: v2.6.2
+          version: v2.13.2
 
   check:
     name: go vet + tests
@@ -88,7 +88,7 @@ jobs:
       - uses: actions/setup-go@v5
         if: ${{ needs.changes.outputs.go == 'true' }}
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
       - name: go vet
         if: ${{ needs.changes.outputs.go == 'true' }}
@@ -112,7 +112,7 @@ jobs:
       - uses: actions/setup-go@v5
         if: ${{ needs.changes.outputs.go == 'true' }}
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
       # Pinned, not @latest: a release must not start failing because an
       # upstream tool changed under it. v1.1.4 rather than v1.1.3 — the latter's
@@ -150,7 +150,7 @@ jobs:
       - uses: actions/setup-go@v5
         if: ${{ needs.changes.outputs.go == 'true' }}
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
       - name: Build all targets + checksums
         if: ${{ needs.changes.outputs.go == 'true' }}

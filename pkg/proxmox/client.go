@@ -912,6 +912,9 @@ func IsNotFound(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "does not exist") ||
 		strings.Contains(msg, "no such vm") ||
+		// PVE's wording when an HA resource id is unknown, i.e. the entry
+		// RemoveHAResource wanted to delete is already gone.
+		strings.Contains(msg, "no such resource") ||
 		strings.Contains(msg, "not found")
 }
 
@@ -1092,7 +1095,7 @@ func (c *Client) Version(ctx context.Context) (major int, raw string, err error)
 // auth error but silent empty API responses — templated dropdowns come back
 // blank, clones fail with vague messages. Failing fast in PreCreateCheck
 // short-circuits that unhappy path.
-func (c *Client) VerifyPermissions(ctx context.Context) error {
+func (c *Client) VerifyPermissions(ctx context.Context, extra ...string) error {
 	major, _, err := c.Version(ctx)
 	if err != nil {
 		return err
@@ -1104,6 +1107,10 @@ func (c *Client) VerifyPermissions(ctx context.Context) error {
 		// here that an operator can resolve and then we'll update the map.
 		needed = requiredPrivs[9]
 	}
+	// Privileges only some configurations need are passed in rather than
+	// listed above: Sys.Console, required by the /cluster/ha endpoints, would
+	// otherwise fail this check for every operator who never asked for HA.
+	needed = append(append([]string(nil), needed...), extra...)
 
 	perms, err := c.api.Permissions(ctx, nil)
 	if err != nil {
@@ -1131,6 +1138,71 @@ func (c *Client) VerifyPermissions(ctx context.Context) error {
 				"see README \"Proxmox VE API token\" section",
 			major, strings.Join(missing, ", "),
 		)
+	}
+	return nil
+}
+
+// ---------- Cluster HA ----------
+
+// haSID is the HA resource id PVE uses for a VM: the resource type and the
+// VMID, colon-separated.
+func haSID(vmid int) string { return fmt.Sprintf("vm:%d", vmid) }
+
+// haResourceParams builds the body of a POST /cluster/ha/resources call.
+//
+// Only sid, type and the optional group are sent: every other field is left
+// at PVE's own default, and those defaults are exactly what a Rancher node
+// wants. state=started keeps the guest running (and restarts it elsewhere if
+// its host dies), and auto-rebalance=1 is what lets the CRS scheduler migrate
+// it when the cluster is unbalanced — the whole reason for registering the
+// node in the first place.
+//
+// group is deprecated upstream in favour of HA rules, but it is still the only
+// way to constrain placement on PVE 8 and 9, so it stays exposed.
+func haResourceParams(vmid int, group string) map[string]interface{} {
+	params := map[string]interface{}{
+		"sid":  haSID(vmid),
+		"type": "vm",
+	}
+	if group != "" {
+		params["group"] = group
+	}
+	return params
+}
+
+// AddHAResource registers the VM as a cluster HA resource, handing it to the
+// HA manager and with it to the CRS scheduler.
+//
+// Requires Sys.Console on / — which requiredPrivs deliberately does not list,
+// because it is only needed by callers that asked for HA.
+//
+// There is no task to wait for: the HA endpoints write
+// /etc/pve/ha/resources.cfg synchronously and return null rather than a UPID.
+func (c *Client) AddHAResource(ctx context.Context, vmid int, group string) error {
+	var res interface{}
+	if err := c.api.Post(ctx, "/cluster/ha/resources", haResourceParams(vmid, group), &res); err != nil {
+		return fmt.Errorf("proxmox: registering vm %d as an HA resource failed: %w", vmid, err)
+	}
+	return nil
+}
+
+// RemoveHAResource deletes the VM's HA resource entry. An entry that is
+// already gone counts as success, for the same reason Remove treats a missing
+// VM that way: a resource deleted by hand must not stall a machine deletion
+// forever.
+//
+// This has to happen before the VM is stopped and destroyed. While the
+// resource exists with state=started the HA manager owns the guest's power
+// state and will restart whatever the driver stopped, and destroying the VM
+// without it would leave a stale entry in resources.cfg naming a VMID that a
+// later machine can be given.
+func (c *Client) RemoveHAResource(ctx context.Context, vmid int) error {
+	var res interface{}
+	if err := c.api.Delete(ctx, "/cluster/ha/resources/"+haSID(vmid), &res); err != nil {
+		if IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("proxmox: removing the HA resource of vm %d failed: %w", vmid, err)
 	}
 	return nil
 }

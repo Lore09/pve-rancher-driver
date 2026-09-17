@@ -157,6 +157,10 @@ That is the **PVE 9** privilege set. On PVE 8 replace `VM.GuestAgent.Audit` with
 `VM.Monitor` in `RancherPVENode`, or grant both to cover either. The token
 secret is printed once — save it.
 
+Only if you plan to use `pve-ha`, add `Sys.Console` to `RancherPVECluster` —
+the `/cluster/ha` endpoints require it. It is left out above because HA is
+off by default, and the driver only demands it when the flag is set.
+
 ### Bind the roles
 
 Nothing above grants anything yet — the roles only become effective once bound.

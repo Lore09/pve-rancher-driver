@@ -39,18 +39,18 @@ func renderDiskSetupScript(disks []proxmox.AttachedDisk) string {
 		if !spec.NeedsGuestSetup() {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("\n# %s -> %s (%s, serial %s)\n", disk.Device, spec.Mount, spec.FS, spec.Label))
-		b.WriteString(fmt.Sprintf("dev=$(lsblk -ndo NAME,SERIAL | awk '$2==\"%s\"{print \"/dev/\"$1}')\n", spec.Label))
+		fmt.Fprintf(&b, "\n# %s -> %s (%s, serial %s)\n", disk.Device, spec.Mount, spec.FS, spec.Label)
+		fmt.Fprintf(&b, "dev=$(lsblk -ndo NAME,SERIAL | awk '$2==\"%s\"{print \"/dev/\"$1}')\n", spec.Label)
 		b.WriteString("if [ -z \"$dev\" ]; then\n")
-		b.WriteString(fmt.Sprintf("  echo \"pve: no block device with serial %s\" >&2\n", spec.Label))
+		fmt.Fprintf(&b, "  echo \"pve: no block device with serial %s\" >&2\n", spec.Label)
 		b.WriteString("  exit 1\n")
 		b.WriteString("fi\n")
 		b.WriteString("if ! blkid \"$dev\" >/dev/null 2>&1; then\n")
-		b.WriteString(fmt.Sprintf("  mkfs.%s -q -L %s \"$dev\"\n", spec.FS, spec.Label))
+		fmt.Fprintf(&b, "  mkfs.%s -q -L %s \"$dev\"\n", spec.FS, spec.Label)
 		b.WriteString("fi\n")
-		b.WriteString(fmt.Sprintf("mkdir -p %s\n", spec.Mount))
-		b.WriteString(fmt.Sprintf("if ! grep -qF ' %s ' /etc/fstab; then\n", spec.Mount))
-		b.WriteString(fmt.Sprintf("  echo 'LABEL=%s %s %s %s 0 2' >> /etc/fstab\n", spec.Label, spec.Mount, spec.FS, mountOptions))
+		fmt.Fprintf(&b, "mkdir -p %s\n", spec.Mount)
+		fmt.Fprintf(&b, "if ! grep -qF ' %s ' /etc/fstab; then\n", spec.Mount)
+		fmt.Fprintf(&b, "  echo 'LABEL=%s %s %s %s 0 2' >> /etc/fstab\n", spec.Label, spec.Mount, spec.FS, mountOptions)
 		b.WriteString("fi\n")
 	}
 
@@ -61,8 +61,8 @@ func renderDiskSetupScript(disks []proxmox.AttachedDisk) string {
 		if !disk.Spec.NeedsGuestSetup() {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("if ! findmnt -n %s >/dev/null; then\n", disk.Spec.Mount))
-		b.WriteString(fmt.Sprintf("  echo \"pve: %s is not mounted after mount -a\" >&2\n", disk.Spec.Mount))
+		fmt.Fprintf(&b, "if ! findmnt -n %s >/dev/null; then\n", disk.Spec.Mount)
+		fmt.Fprintf(&b, "  echo \"pve: %s is not mounted after mount -a\" >&2\n", disk.Spec.Mount)
 		b.WriteString("  exit 1\n")
 		b.WriteString("fi\n")
 	}
