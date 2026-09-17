@@ -40,7 +40,7 @@ golangci-lint run
 make test-workflows              # unit tests for the release-decision scripts
 ```
 
-The toolchain floor is **Go 1.25** (`golang.org/x/crypto` requires it) and
+The toolchain floor is **Go 1.26** (`golang.org/x/crypto` requires it) and
 golangci-lint **v2** — v1 cannot parse a `go 1.25.0` directive.
 
 ### The golden script test
@@ -217,7 +217,7 @@ which have no fixed version at all. Escaping them means replacing
 So the gate allowlists **that one module** and fails on everything else. A new
 finding in the standard library or any other dependency still breaks the build,
 which is the part worth gating on. A stdlib finding is normally fixed by the
-`go-version: "1.25"` pin picking up a newer patch release on its own.
+`go-version: "1.26"` pin picking up a newer patch release on its own.
 
 Keep the allowlist as short as it can be, and record why each entry is there.
 
