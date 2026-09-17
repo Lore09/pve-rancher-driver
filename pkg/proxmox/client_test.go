@@ -300,6 +300,7 @@ func TestIsNotFound(t *testing.T) {
 	notFound := []string{
 		"proxmox: node \"pve\" not reachable: 500 Configuration file 'nodes/pve/qemu-server/480.conf' does not exist",
 		"No such VM 480",
+		"500 no such resource 'vm:480'",
 		"vm not found",
 	}
 	for _, msg := range notFound {
@@ -327,6 +328,33 @@ func TestIsNotFound(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestHAResourceParams(t *testing.T) {
+	params := haResourceParams(480, "")
+	if got := params["sid"]; got != "vm:480" {
+		t.Errorf("haResourceParams sid = %v, want vm:480", got)
+	}
+	if got := params["type"]; got != "vm" {
+		t.Errorf("haResourceParams type = %v, want vm", got)
+	}
+	// An empty group must be absent rather than sent as "": PVE would reject
+	// the empty string, and omitting it is what "any node" means.
+	if _, ok := params["group"]; ok {
+		t.Error("haResourceParams sent an empty group; want the key omitted")
+	}
+	// state and auto-rebalance are deliberately not sent — PVE's defaults
+	// (started, rebalance allowed) are what the driver wants, and pinning
+	// them here would freeze the driver to today's defaults.
+	for _, key := range []string{"state", "auto-rebalance", "max_restart", "max_relocate"} {
+		if _, ok := params[key]; ok {
+			t.Errorf("haResourceParams sent %q; want PVE's own default", key)
+		}
+	}
+
+	if got := haResourceParams(480, "prod")["group"]; got != "prod" {
+		t.Errorf("haResourceParams group = %v, want prod", got)
+	}
+}
 
 func TestSplitTags(t *testing.T) {
 	tests := []struct {
